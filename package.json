@@ -1,0 +1,59 @@
+{
+  "name": "hex-dominion",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",
+    "dev:multiplayer": "wrangler dev --config wrangler.multiplayer.jsonc --local --port 8787",
+    "dev:edge": "npm run dev:multiplayer",
+    "dev:all": "concurrently -k -n client,relay -c cyan,magenta \"npm:dev\" \"npm:dev:multiplayer\"",
+    "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
+    "build:edge": "wrangler deploy --dry-run -c wrangler.multiplayer.jsonc --outdir dist-edge",
+    "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
+    "test": "vitest run",
+    "test:network": "vitest run tests/network",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test --project=e2e",
+    "test:visual": "playwright test --project=visual",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-edge --ignore-pattern .next --ignore-pattern .wrangler --ignore-pattern test-results --ignore-pattern docs/screenshots",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write .",
+    "verify": "npm run lint && npm run typecheck && npm run test && npm run test:e2e && npm run test:visual && npm run build && npm run build:edge",
+    "deploy:multiplayer": "wrangler deploy --config wrangler.multiplayer.jsonc",
+    "deploy:edge": "npm run deploy:multiplayer"
+  },
+  "dependencies": {
+    "next": "16.2.6",
+    "pixi.js": "^8.19.0",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "1.37.1",
+    "@playwright/test": "^1.61.1",
+    "@tailwindcss/postcss": "4.2.1",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "@vitejs/plugin-rsc": "0.5.26",
+    "@vitest/coverage-v8": "^4.1.10",
+    "concurrently": "^10.0.3",
+    "eslint": "9.39.4",
+    "eslint-config-next": "16.2.6",
+    "prettier": "^3.9.5",
+    "react-server-dom-webpack": "19.2.6",
+    "tailwindcss": "4.2.1",
+    "tsx": "^4.23.0",
+    "typescript": "5.9.3",
+    "vinext": "0.0.50",
+    "vite": "8.0.13",
+    "vitest": "^4.1.10",
+    "wrangler": "4.92.0"
+  },
+  "type": "module"
+}

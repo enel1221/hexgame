@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a reproducible gameplay or interface problem.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include secrets, room reconnect URLs, or private player data.
+  - type: input
+    id: version
+    attributes:
+      label: Version and build
+      description: Copy the version and dated build number shown on the title screen or game menu.
+      placeholder: v1.0.0 · build 20260711.42.abcdef0
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - Single-player
+        - Multiplayer
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Include the public seed and exact actions, but no reconnect token or full WebSocket URL.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Sensitive data check
+      options:
+        - label: I removed credentials, reconnect tokens, and other private data from this report.
+          required: true

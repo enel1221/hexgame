@@ -1,3 +1,4 @@
+import "pixi.js/unsafe-eval";
 import { Application, BitmapFont, BitmapText, Container, Graphics, Rectangle } from "pixi.js";
 import { axialKey, axialToPixel, neighbors, pixelToAxial } from "@/src/core/hex";
 import { BALANCE, PLAYER_COLORS, TERRAIN_COLORS } from "@/src/shared/balance";

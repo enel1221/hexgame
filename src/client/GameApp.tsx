@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { axialKey, neighbors } from "@/src/core/hex";
 import { parseEngineSnapshot } from "@/src/core/engine";
 import { BALANCE, SUPPLY_SCALE, TICKS_PER_SECOND } from "@/src/shared/balance";
+import { COMMIT_SHA, VERSION_LABEL } from "@/src/shared/version";
 import type {
   EngineSnapshot,
   DebugScenario,
@@ -1566,7 +1567,7 @@ export function GameApp() {
           </div>
         )}
         <footer className="title-footer">
-          <span>v1.0 · deterministic 10 Hz simulation</span>
+          <span data-testid="build-version">{VERSION_LABEL} · deterministic 10 Hz simulation</span>
           <span>Original procedural art · no remote assets</span>
         </footer>
       </main>
@@ -1999,6 +2000,9 @@ export function GameApp() {
             <h2>{state?.paused ? "The realm is paused" : "Game menu"}</h2>
             <p>
               Seed <b>{state?.map.seed}</b> · Tick <b>{state?.tick}</b>
+            </p>
+            <p className="build-version">
+              {VERSION_LABEL} · commit {COMMIT_SHA}
             </p>
             <div className="pause-settings">
               <button

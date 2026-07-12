@@ -1,5 +1,23 @@
 # Deployment
 
+## Automated environments
+
+GitHub Actions is the production deployment authority:
+
+| Git ref         | Game                                   | Multiplayer relay                            |
+| --------------- | -------------------------------------- | -------------------------------------------- |
+| `main`          | `https://main.hex-dominion.inkgrid.io` | `https://relay-main.hex-dominion.inkgrid.io` |
+| latest `v*` tag | `https://hex-dominion.inkgrid.io`      | `https://relay.hex-dominion.inkgrid.io`      |
+
+Every push and release tag must pass lint, typechecking, tests, production-dependency audit, and
+both Worker builds before deployment. Builds display the package/tag version plus a build number in
+the form `YYYYMMDD.<github-run>.<short-sha>`.
+
+The `preview` and `production` GitHub environments each hold `CLOUDFLARE_API_TOKEN` as a secret and
+`CLOUDFLARE_ACCOUNT_ID` as a non-secret variable. The token must be scoped to the one Cloudflare
+account and the `inkgrid.io` zone with only Workers Scripts and Workers Routes edit permissions.
+Never replace it with a global API key or an interactive Wrangler OAuth token.
+
 Hex Dominion deploys as two independently versioned Cloudflare Workers:
 
 1. The vinext game application serves the static/client assets and application shell.
@@ -61,6 +79,10 @@ npx vitest run tests/network/wrangler-relay.test.ts
 
 Before production deployment, set `ALLOWED_ORIGINS` to the exact public game origin. Same-origin requests are always accepted. Do not leave broad wildcard origins unless the relay is deliberately public.
 
+The checked-in `main` and `production` environments already contain their exact allowed origin and
+custom domain. The commands below remain useful for local/manual disaster recovery; routine changes
+must flow through GitHub Actions.
+
 For a one-off deployment with production overrides:
 
 ```bash
@@ -93,6 +115,15 @@ Build and deploy the vinext application:
 ```bash
 npm run build
 npx vinext deploy --name hex-dominion
+```
+
+For the checked-in custom-domain environments, set `CLOUDFLARE_ENV` while building so the Vite
+adapter carries the selected Worker name, image binding, and custom-domain route into its generated
+deployment configuration:
+
+```bash
+npm run deploy:main
+npm run deploy:production
 ```
 
 If the app is published through Codex Sites instead, use the Sites deployment flow for the application and deploy only the relay with the standalone Wrangler config. In either case, ensure the final game origin exactly matches the relay's `ALLOWED_ORIGINS` value.

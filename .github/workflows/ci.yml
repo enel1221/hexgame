@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 22.13.0
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit, simulation, and network tests
+        run: npm test
+      - name: Build application
+        run: npm run build
+      - name: Build multiplayer Worker
+        run: npm run build:edge
+
+  deploy:
+    name: Deploy
+    if: github.event_name == 'push'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ startsWith(github.ref, 'refs/tags/') && 'production' || 'preview' }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 22.13.0
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Select deployment target
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_date="$(date -u +%Y%m%d)"
+          short_sha="${GITHUB_SHA:0:7}"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            app_environment="production"
+            app_version="${GITHUB_REF_NAME#v}"
+            relay_url="https://relay.hex-dominion.inkgrid.io"
+          else
+            app_environment="main"
+            app_version="$(node -p 'require("./package.json").version')-main"
+            relay_url="https://relay-main.hex-dominion.inkgrid.io"
+          fi
+          {
+            echo "app_environment=$app_environment"
+            echo "app_version=$app_version"
+            echo "build_number=${build_date}.${GITHUB_RUN_NUMBER}.${short_sha}"
+            echo "relay_url=$relay_url"
+          } >> "$GITHUB_OUTPUT"
+      - name: Deploy multiplayer relay
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler deploy --config wrangler.multiplayer.jsonc --env "${{ steps.target.outputs.app_environment }}"
+      - name: Build and deploy game
+        env:
+          APP_VERSION: ${{ steps.target.outputs.app_version }}
+          BUILD_NUMBER: ${{ steps.target.outputs.build_number }}
+          COMMIT_SHA: ${{ github.sha }}
+          CLOUDFLARE_ENV: ${{ steps.target.outputs.app_environment }}
+          NEXT_PUBLIC_MULTIPLAYER_URL: ${{ steps.target.outputs.relay_url }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx vinext deploy --env "${{ steps.target.outputs.app_environment }}"
+      - name: Smoke test deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.target.outputs.app_environment }}" == "production" ]]; then
+            app_url="https://hex-dominion.inkgrid.io"
+          else
+            app_url="https://main.hex-dominion.inkgrid.io"
+          fi
+          curl --fail --silent --show-error --retry 8 --retry-all-errors --retry-delay 5 "$app_url" >/dev/null
+          curl --fail --silent --show-error --retry 8 --retry-all-errors --retry-delay 5 "${{ steps.target.outputs.relay_url }}/health" >/dev/null

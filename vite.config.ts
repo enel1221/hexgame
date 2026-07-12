@@ -2,6 +2,7 @@ import vinext from "vinext";
 import { defineConfig } from "vite";
 import hostingConfig from "./.openai/hosting.json";
 import { sites } from "./build/sites-vite-plugin";
+import packageMetadata from "./package.json";
 
 const SITE_CREATOR_PLACEHOLDER_DATABASE_ID = "00000000-0000-4000-8000-000000000000";
 
@@ -12,7 +13,6 @@ const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
 
 const localBindingConfig = {
   main: "./worker/index.ts",
-  compatibility_flags: ["nodejs_compat"],
   d1_databases: d1
     ? [
         {
@@ -39,6 +39,11 @@ export default defineConfig(async () => {
   process.env.WRANGLER_LOG_PATH ??= ".wrangler/logs";
   process.env.MINIFLARE_REGISTRY_PATH ??= ".wrangler/registry";
 
+  const buildDate = new Date().toISOString().slice(0, 10).replaceAll("-", "");
+  const appVersion = process.env.APP_VERSION?.trim() || packageMetadata.version;
+  const buildNumber = process.env.BUILD_NUMBER?.trim() || `${buildDate}.local`;
+  const commitSha = process.env.COMMIT_SHA?.trim() || "local";
+
   // Wrangler snapshots its log path while the Cloudflare plugin is imported.
   const { cloudflare } = await import("@cloudflare/vite-plugin");
 
@@ -54,5 +59,10 @@ export default defineConfig(async () => {
         config: localBindingConfig,
       }),
     ],
+    define: {
+      __APP_VERSION__: JSON.stringify(appVersion),
+      __BUILD_NUMBER__: JSON.stringify(buildNumber),
+      __COMMIT_SHA__: JSON.stringify(commitSha),
+    },
   };
 });

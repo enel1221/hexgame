@@ -1,5 +1,8 @@
 # Hex Dominion
 
+[![CI](https://github.com/enel1221/hexgame/actions/workflows/ci.yml/badge.svg)](https://github.com/enel1221/hexgame/actions/workflows/ci.yml)
+[![Security](https://github.com/enel1221/hexgame/actions/workflows/security.yml/badge.svg)](https://github.com/enel1221/hexgame/actions/workflows/security.yml)
+
 Hex Dominion is a real-time browser strategy game about expanding a local army across a seeded, procedural hex realm. One human commander faces 3–20 deterministic AI rulers on one of three connected map archetypes. Armies move as exact-count stacks, battles resolve over several seconds, and Farms, Barracks, and Turrets make captured land economically and tactically distinct.
 
 The game uses a React/vinext-on-Vite application shell, a PixiJS 8 battlefield, a pure TypeScript simulation running at 10 Hz in a Web Worker, and an optional Cloudflare Durable Object command relay for casual room-code multiplayer.
@@ -152,3 +155,12 @@ Read [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) before deploying; it covers creden
 - The MVP has no teams, alliances, diplomacy, fog of war, naval units, campaign, or ranked play.
 
 Hex Dominion is available under the [MIT License](LICENSE).
+
+## Hosted environments
+
+- `main` continuously deploys to <https://main.hex-dominion.inkgrid.io>.
+- The latest `v*` release tag deploys to <https://hex-dominion.inkgrid.io>.
+
+The title screen and in-game campaign ledger show the semantic version and a UTC-dated build
+number. Deployment credentials are stored only in protected GitHub environments. Security reports
+should use the private process in [SECURITY.md](SECURITY.md), not public issues.

@@ -73,7 +73,15 @@ async function openMultiplayer(
   await expect(page.getByTestId("title-screen")).toBeVisible();
   await page.getByTestId("player-name").fill(playerName);
   if (options.seed) await page.getByTestId("seed").fill(options.seed);
-  await page.getByTestId("multiplayer-tab").click();
+  const multiplayerTab = page.getByTestId("multiplayer-tab");
+  await expect
+    .poll(async () => {
+      if ((await multiplayerTab.getAttribute("aria-selected")) !== "true") {
+        await multiplayerTab.click();
+      }
+      return multiplayerTab.getAttribute("aria-selected");
+    })
+    .toBe("true");
   await expect(page.getByTestId("multiplayer-setup")).toBeVisible();
   await page.getByLabel("Commander").fill(playerName);
   if (options.botCount !== undefined) {

@@ -26,4 +26,52 @@
   "observability": {
     "enabled": true,
   },
+  "workers_dev": false,
+  "preview_urls": false,
+  "env": {
+    "main": {
+      "name": "hex-dominion-multiplayer-main",
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "ROOMS",
+            "class_name": "RoomDurableObject",
+          },
+        ],
+      },
+      "vars": {
+        "ALLOWED_ORIGINS": "https://main.hex-dominion.inkgrid.io",
+        "ROOM_TTL_SECONDS": "21600",
+        "COMMAND_LEAD_TICKS": "6",
+      },
+      "routes": [
+        {
+          "pattern": "relay-main.hex-dominion.inkgrid.io",
+          "custom_domain": true,
+        },
+      ],
+    },
+    "production": {
+      "name": "hex-dominion-multiplayer",
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "ROOMS",
+            "class_name": "RoomDurableObject",
+          },
+        ],
+      },
+      "vars": {
+        "ALLOWED_ORIGINS": "https://hex-dominion.inkgrid.io",
+        "ROOM_TTL_SECONDS": "21600",
+        "COMMAND_LEAD_TICKS": "6",
+      },
+      "routes": [
+        {
+          "pattern": "relay.hex-dominion.inkgrid.io",
+          "custom_domain": true,
+        },
+      ],
+    },
+  },
 }

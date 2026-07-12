@@ -11,7 +11,7 @@
     "dev:edge": "npm run dev:multiplayer",
     "dev:all": "concurrently -k -n client,relay -c cyan,magenta \"npm:dev\" \"npm:dev:multiplayer\"",
     "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
-    "build:edge": "wrangler deploy --dry-run -c wrangler.multiplayer.jsonc --outdir dist-edge",
+    "build:edge": "wrangler deploy --dry-run -c wrangler.multiplayer.jsonc --env=\"\" --outdir dist-edge",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
     "test": "vitest run",
     "test:network": "vitest run tests/network",
@@ -22,38 +22,43 @@
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
     "verify": "npm run lint && npm run typecheck && npm run test && npm run test:e2e && npm run test:visual && npm run build && npm run build:edge",
-    "deploy:multiplayer": "wrangler deploy --config wrangler.multiplayer.jsonc",
-    "deploy:edge": "npm run deploy:multiplayer"
+    "deploy:main": "CLOUDFLARE_ENV=main vinext deploy --env main",
+    "deploy:production": "CLOUDFLARE_ENV=production vinext deploy --env production",
+    "deploy:multiplayer:main": "wrangler deploy --config wrangler.multiplayer.jsonc --env main",
+    "deploy:multiplayer:production": "wrangler deploy --config wrangler.multiplayer.jsonc --env production"
   },
   "dependencies": {
-    "next": "16.2.6",
-    "pixi.js": "^8.19.0",
-    "react": "19.2.6",
-    "react-dom": "19.2.6",
-    "zod": "^4.4.3"
+    "next": "16.2.10",
+    "pixi.js": "8.19.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "zod": "4.4.3"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "1.37.1",
+    "@cloudflare/vite-plugin": "1.44.0",
     "@playwright/test": "^1.61.1",
-    "@tailwindcss/postcss": "4.2.1",
+    "@tailwindcss/postcss": "4.3.2",
     "@types/node": "22.19.19",
-    "@types/react": "19.2.14",
+    "@types/react": "19.2.17",
     "@types/react-dom": "19.2.3",
-    "@vitejs/plugin-react": "6.0.2",
-    "@vitejs/plugin-rsc": "0.5.26",
+    "@vitejs/plugin-react": "6.0.3",
+    "@vitejs/plugin-rsc": "0.5.27",
     "@vitest/coverage-v8": "^4.1.10",
     "concurrently": "^10.0.3",
     "eslint": "9.39.4",
-    "eslint-config-next": "16.2.6",
+    "eslint-config-next": "16.2.10",
     "prettier": "^3.9.5",
-    "react-server-dom-webpack": "19.2.6",
-    "tailwindcss": "4.2.1",
+    "react-server-dom-webpack": "19.2.7",
+    "tailwindcss": "4.3.2",
     "tsx": "^4.23.0",
     "typescript": "5.9.3",
     "vinext": "0.0.50",
-    "vite": "8.0.13",
+    "vite": "8.1.4",
     "vitest": "^4.1.10",
-    "wrangler": "4.92.0"
+    "wrangler": "4.110.0"
+  },
+  "overrides": {
+    "postcss": "8.5.17"
   },
   "type": "module"
 }

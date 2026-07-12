@@ -180,6 +180,13 @@ function withCors(response: Response, request: Request, env: MultiplayerEnv): Re
   headers.set("access-control-allow-methods", "GET, POST, OPTIONS");
   headers.set("access-control-allow-headers", "content-type");
   headers.set("access-control-max-age", "86400");
+  headers.set("cache-control", "no-store");
+  headers.set("cross-origin-resource-policy", "same-site");
+  headers.set("permissions-policy", "camera=(), geolocation=(), microphone=(), payment=(), usb=()");
+  headers.set("referrer-policy", "no-referrer");
+  headers.set("strict-transport-security", "max-age=31536000; includeSubDomains; preload");
+  headers.set("x-content-type-options", "nosniff");
+  headers.set("x-frame-options", "DENY");
   headers.append("vary", "origin");
   return new Response(response.body, {
     status: response.status,

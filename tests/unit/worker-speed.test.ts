@@ -1,8 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createGame } from "../../src/core";
 import type { GameCommand, MatchConfig, WorkerResponse } from "../../src/shared/types";
 import { SimulationWorkerController } from "../../src/worker";
-import { TEST_CONFIG } from "./fixtures";
+import { createRunningGame, TEST_CONFIG } from "./fixtures";
 
 function stateMessages(responses: WorkerResponse[]) {
   return responses.filter(
@@ -17,7 +16,10 @@ function makeController(config: MatchConfig = TEST_CONFIG) {
     // so prior publications do not retain the mutable engine state reference.
     postMessage: (message) => responses.push(structuredClone(message)),
   });
-  controller.handle({ type: "start", config });
+  const runningConfig = createRunningGame(config).state.config;
+  controller.handle({ type: "start", config: runningConfig });
+  controller.handle({ type: "begin-match" });
+  responses.length = 0;
   return { controller, responses };
 }
 
@@ -80,7 +82,7 @@ describe("batched fixed-step Worker scheduling", () => {
   it("matches direct-core hashes after ten 4-tick publication batches", () => {
     vi.useFakeTimers();
     const config = { ...TEST_CONFIG, seed: "batched-worker-determinism" };
-    const direct = createGame(config);
+    const direct = createRunningGame(config);
     direct.step(40);
     const { controller, responses } = makeController(config);
     controller.handle({ type: "speed", speed: 4 });
@@ -97,7 +99,7 @@ describe("batched fixed-step Worker scheduling", () => {
   it("applies a received command on the first tick of the next batch", () => {
     vi.useFakeTimers();
     const config = { ...TEST_CONFIG, seed: "batched-command-timing" };
-    const direct = createGame(config);
+    const direct = createRunningGame(config);
     const sourceId = direct.state.map.spawnClusters[0]![0]!;
     const destinationId = direct.state.map.spawnClusters[0]![1]!;
     const command: GameCommand = {

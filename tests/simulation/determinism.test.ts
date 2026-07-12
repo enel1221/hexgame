@@ -2,12 +2,12 @@ import { describe, expect, it } from "vitest";
 import type { MatchConfig } from "../../src/shared/types";
 import {
   axialKey,
-  createGame,
   importSnapshot,
   neighbors,
   replayCommands,
   stableStringify,
 } from "../../src/core";
+import { createRunningGame } from "../unit/fixtures";
 
 const CONFIG: MatchConfig = {
   seed: "determinism-suite",
@@ -21,7 +21,7 @@ const CONFIG: MatchConfig = {
   debug: false,
 };
 
-function queueOpeningMove(engine: ReturnType<typeof createGame>): void {
+function queueOpeningMove(engine: ReturnType<typeof createRunningGame>): void {
   const source = engine.state.map.tiles[engine.state.map.spawnCenters[0]!]!;
   const neutral = neighbors(source)
     .map((hex) => engine.state.map.tiles[axialKey(hex)])
@@ -41,8 +41,8 @@ function queueOpeningMove(engine: ReturnType<typeof createGame>): void {
 
 describe("deterministic replay and snapshots", () => {
   it("produces byte-equivalent state and hash for equal inputs", () => {
-    const left = createGame(CONFIG);
-    const right = createGame(CONFIG);
+    const left = createRunningGame(CONFIG);
+    const right = createRunningGame(CONFIG);
     queueOpeningMove(left);
     queueOpeningMove(right);
     left.step(240);
@@ -52,7 +52,7 @@ describe("deterministic replay and snapshots", () => {
   });
 
   it("continues identically after snapshot restore and command replay", () => {
-    const original = createGame(CONFIG);
+    const original = createRunningGame(CONFIG);
     queueOpeningMove(original);
     original.step(120);
     const restored = importSnapshot(original.exportSnapshot());
@@ -60,12 +60,16 @@ describe("deterministic replay and snapshots", () => {
     restored.step(80);
     expect(restored.state.stateHash).toBe(original.state.stateHash);
 
-    const replayed = replayCommands(CONFIG, original.commandHistory, original.state.tick);
+    const replayed = replayCommands(
+      original.state.config,
+      original.commandHistory,
+      original.state.tick,
+    );
     expect(replayed.stateHash).toBe(original.state.stateHash);
   });
 
   it("preserves accepted future commands in local save snapshots", () => {
-    const original = createGame(CONFIG);
+    const original = createRunningGame(CONFIG);
     const sourceId = original.state.map.spawnClusters[0]![0]!;
     const destinationId = original.state.map.spawnClusters[0]![1]!;
     expect(
@@ -85,17 +89,61 @@ describe("deterministic replay and snapshots", () => {
     expect(restored.commandHistory).toEqual(original.commandHistory);
   });
 
+  it("replays an atomic multi-move as one command-history record", () => {
+    const original = createRunningGame({ ...CONFIG, seed: "multi-replay" });
+    const [sourceA, sourceB, destinationA, destinationB] = original.state.map.spawnClusters[0]!;
+    expect(
+      original.submitCommand({
+        type: "multi-move",
+        playerId: 0,
+        sourceIds: [sourceB!, sourceA!],
+        destinationIds: [destinationB!, destinationA!],
+        percent: 50,
+      }).ok,
+    ).toBe(true);
+    original.step(20);
+    expect(original.commandHistory).toHaveLength(1);
+    expect(original.commandHistory[0]?.type).toBe("multi-move");
+
+    const replayed = replayCommands(
+      original.state.config,
+      original.commandHistory,
+      original.state.tick,
+    );
+    expect(replayed.stateHash).toBe(original.state.stateHash);
+  });
+
   it("never consults Math.random in map, AI, or simulation code", () => {
     const previous = Math.random;
     Math.random = () => {
       throw new Error("Math.random must not be called");
     };
     try {
-      const engine = createGame({ ...CONFIG, seed: "no-random" });
+      const engine = createRunningGame({ ...CONFIG, seed: "no-random" });
       engine.step(60);
       expect(engine.state.tick).toBe(60);
     } finally {
       Math.random = previous;
     }
+  });
+
+  it("never uses host-locale collation for authoritative AI choices", () => {
+    const original = String.prototype.localeCompare;
+    String.prototype.localeCompare = () => {
+      throw new Error("Authoritative rules must not use localeCompare");
+    };
+    try {
+      const engine = createRunningGame({ ...CONFIG, seed: "no-host-collation" });
+      engine.step(60);
+      expect(engine.state.tick).toBe(60);
+    } finally {
+      String.prototype.localeCompare = original;
+    }
+  });
+
+  it("excludes presentation-only count visibility from the rules hash", () => {
+    const hidden = createRunningGame({ ...CONFIG, fullCounts: false });
+    const visible = createRunningGame({ ...CONFIG, fullCounts: true });
+    expect(visible.state.stateHash).toBe(hidden.state.stateHash);
   });
 });

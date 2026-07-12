@@ -14,17 +14,25 @@ import {
   type PlayerSummary,
   type RoomConfig,
 } from "./protocol";
+import { stableHash } from "../core/hash";
 import {
   assignRelayOrder,
+  AI_PLACEMENT_MIN_MS,
   boundedInteger,
   compareStateHashes,
   createReconnectToken,
   currentServerTick,
   DEFAULT_COMMAND_LEAD_TICKS,
   DEFAULT_ROOM_TTL_SECONDS,
+  finalizePlacementCenters,
   hashReconnectToken,
   MAX_COMMAND_BATCH,
   MAX_MESSAGE_BYTES,
+  MIN_PLACEMENT_CENTER_DISTANCE,
+  OPENING_HANDOFF_MS,
+  PLACEMENT_DURATION_MS,
+  placementCenterDistance,
+  placementCentersPreserveDistanceFairness,
 } from "./relay";
 import {
   createWebSocketPair,
@@ -33,7 +41,7 @@ import {
   type MultiplayerEnv,
 } from "./runtime";
 
-type RoomPhase = "lobby" | "started" | "complete";
+type RoomPhase = "lobby" | "placement" | "started" | "complete";
 
 interface RoomRow {
   code: string;
@@ -50,6 +58,14 @@ interface RoomRow {
   winner_seat: number | null;
   final_tick: number | null;
   final_hash: string | null;
+  placement_started_at: number | null;
+  placement_deadline_at: number | null;
+  placement_candidates_json: string | null;
+  placement_generation_attempt: number | null;
+  placement_candidate_hash: string | null;
+  placement_final_centers_json: string | null;
+  placement_proposal_json: string | null;
+  placement_timed_out: number;
 }
 
 interface PlayerRow {
@@ -65,6 +81,8 @@ interface PlayerRow {
   last_client_sequence: number;
   rate_window_at: number;
   rate_count: number;
+  placement_center: string | null;
+  placement_locked: number;
 }
 
 interface CommandRow {
@@ -81,7 +99,7 @@ interface CheckpointRow {
   sequence: number;
   tick: number;
   state_hash: string;
-  encoding: "json" | "base64";
+  encoding: "json" | "base64" | "gzip-base64";
   payload: string;
 }
 
@@ -119,7 +137,7 @@ export class RoomDurableObject {
     sql.exec(`
       CREATE TABLE IF NOT EXISTS room (
         code TEXT PRIMARY KEY,
-        phase TEXT NOT NULL CHECK (phase IN ('lobby', 'started', 'complete')),
+        phase TEXT NOT NULL CHECK (phase IN ('lobby', 'placement', 'started', 'complete')),
         config_json TEXT NOT NULL,
         host_player_id TEXT NOT NULL,
         created_at INTEGER NOT NULL,
@@ -131,7 +149,15 @@ export class RoomDurableObject {
         last_target_tick INTEGER NOT NULL,
         winner_seat INTEGER,
         final_tick INTEGER,
-        final_hash TEXT
+        final_hash TEXT,
+        placement_started_at INTEGER,
+        placement_deadline_at INTEGER,
+        placement_candidates_json TEXT,
+        placement_generation_attempt INTEGER,
+        placement_candidate_hash TEXT,
+        placement_final_centers_json TEXT,
+        placement_proposal_json TEXT,
+        placement_timed_out INTEGER NOT NULL DEFAULT 0
       )
     `);
     const roomColumns = new Set(
@@ -146,6 +172,68 @@ export class RoomDurableObject {
     if (!roomColumns.has("final_hash")) {
       sql.exec("ALTER TABLE room ADD COLUMN final_hash TEXT");
     }
+    for (const [column, declaration] of [
+      ["placement_started_at", "INTEGER"],
+      ["placement_deadline_at", "INTEGER"],
+      ["placement_candidates_json", "TEXT"],
+      ["placement_generation_attempt", "INTEGER"],
+      ["placement_candidate_hash", "TEXT"],
+      ["placement_final_centers_json", "TEXT"],
+      ["placement_proposal_json", "TEXT"],
+      ["placement_timed_out", "INTEGER NOT NULL DEFAULT 0"],
+    ] as const) {
+      if (!roomColumns.has(column))
+        sql.exec(`ALTER TABLE room ADD COLUMN ${column} ${declaration}`);
+    }
+    const roomDefinition =
+      sql
+        .exec<{ sql: string }>(
+          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'room' LIMIT 1",
+        )
+        .toArray()[0]?.sql ?? "";
+    // Existing v1 room databases used a CHECK constraint that cannot accept the
+    // placement phase. Rooms are ephemeral, but reconnecting ones still deserve
+    // an additive in-place schema upgrade instead of a forced reset.
+    if (!roomDefinition.includes("'placement'")) {
+      sql.exec(`
+        CREATE TABLE room_v2 (
+          code TEXT PRIMARY KEY,
+          phase TEXT NOT NULL CHECK (phase IN ('lobby', 'placement', 'started', 'complete')),
+          config_json TEXT NOT NULL,
+          host_player_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          started_at INTEGER,
+          completed_at INTEGER,
+          next_seat INTEGER NOT NULL,
+          next_sequence INTEGER NOT NULL,
+          last_target_tick INTEGER NOT NULL,
+          winner_seat INTEGER,
+          final_tick INTEGER,
+          final_hash TEXT,
+          placement_started_at INTEGER,
+          placement_deadline_at INTEGER,
+          placement_candidates_json TEXT,
+          placement_generation_attempt INTEGER,
+          placement_candidate_hash TEXT,
+          placement_final_centers_json TEXT,
+          placement_proposal_json TEXT,
+          placement_timed_out INTEGER NOT NULL DEFAULT 0
+        )
+      `);
+      sql.exec(`
+        INSERT INTO room_v2
+        SELECT code, phase, config_json, host_player_id, created_at, expires_at,
+          started_at, completed_at, next_seat, next_sequence, last_target_tick,
+          winner_seat, final_tick, final_hash, placement_started_at,
+          placement_deadline_at, placement_candidates_json,
+          placement_generation_attempt, placement_candidate_hash,
+          placement_final_centers_json, placement_proposal_json, placement_timed_out
+        FROM room
+      `);
+      sql.exec("DROP TABLE room");
+      sql.exec("ALTER TABLE room_v2 RENAME TO room");
+    }
     sql.exec(`
       CREATE TABLE IF NOT EXISTS players (
         id TEXT PRIMARY KEY,
@@ -159,9 +247,23 @@ export class RoomDurableObject {
         last_seen INTEGER NOT NULL,
         last_client_sequence INTEGER NOT NULL DEFAULT 0,
         rate_window_at INTEGER NOT NULL DEFAULT 0,
-        rate_count INTEGER NOT NULL DEFAULT 0
+        rate_count INTEGER NOT NULL DEFAULT 0,
+        placement_center TEXT,
+        placement_locked INTEGER NOT NULL DEFAULT 0
       )
     `);
+    const playerColumns = new Set(
+      sql
+        .exec<{ name: string }>("PRAGMA table_info(players)")
+        .toArray()
+        .map((column) => column.name),
+    );
+    if (!playerColumns.has("placement_center")) {
+      sql.exec("ALTER TABLE players ADD COLUMN placement_center TEXT");
+    }
+    if (!playerColumns.has("placement_locked")) {
+      sql.exec("ALTER TABLE players ADD COLUMN placement_locked INTEGER NOT NULL DEFAULT 0");
+    }
     sql.exec(`
       CREATE TABLE IF NOT EXISTS commands (
         sequence INTEGER PRIMARY KEY,
@@ -181,11 +283,32 @@ export class RoomDurableObject {
         sequence INTEGER PRIMARY KEY,
         tick INTEGER NOT NULL,
         state_hash TEXT NOT NULL,
-        encoding TEXT NOT NULL CHECK (encoding IN ('json', 'base64')),
+        encoding TEXT NOT NULL CHECK (encoding IN ('json', 'base64', 'gzip-base64')),
         payload TEXT NOT NULL,
         created_at INTEGER NOT NULL
       )
     `);
+    const checkpointDefinition =
+      sql
+        .exec<{ sql: string }>(
+          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'checkpoints' LIMIT 1",
+        )
+        .toArray()[0]?.sql ?? "";
+    if (!checkpointDefinition.includes("'gzip-base64'")) {
+      sql.exec(`
+        CREATE TABLE checkpoints_v2 (
+          sequence INTEGER PRIMARY KEY,
+          tick INTEGER NOT NULL,
+          state_hash TEXT NOT NULL,
+          encoding TEXT NOT NULL CHECK (encoding IN ('json', 'base64', 'gzip-base64')),
+          payload TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        )
+      `);
+      sql.exec("INSERT INTO checkpoints_v2 SELECT * FROM checkpoints");
+      sql.exec("DROP TABLE checkpoints");
+      sql.exec("ALTER TABLE checkpoints_v2 RENAME TO checkpoints");
+    }
     sql.exec(`
       CREATE TABLE IF NOT EXISTS state_hashes (
         tick INTEGER NOT NULL,
@@ -434,6 +557,7 @@ export class RoomDurableObject {
     );
     this.refreshTtl(now);
 
+    if (this.getRoom()?.phase === "placement") this.maybeFinalizePlacement(Date.now());
     const freshRoom = this.getRoom()!;
     const freshPlayer = this.getPlayer(player.id)!;
     this.send(server, {
@@ -447,7 +571,9 @@ export class RoomDurableObject {
       serverTick: this.roomServerTick(freshRoom),
     });
     this.send(server, this.lobbyPayload(freshRoom));
-    if (freshRoom.phase !== "lobby") {
+    if (freshRoom.phase === "placement") {
+      this.send(server, this.placementPayload(freshRoom));
+    } else if (freshRoom.phase === "started" || freshRoom.phase === "complete") {
       this.send(server, this.startedPayload(freshRoom));
       this.sendSync(server, freshRoom);
       if (
@@ -545,6 +671,18 @@ export class RoomDurableObject {
       case "start":
         this.handleStart(socket, player, message.requestId);
         break;
+      case "placement-candidates":
+        this.handlePlacementCandidates(socket, player, message);
+        break;
+      case "placement-claim":
+        this.handlePlacementClaim(socket, player, message.centerId, false, message.requestId);
+        break;
+      case "placement-lock":
+        this.handlePlacementClaim(socket, player, message.centerId, true, message.requestId);
+        break;
+      case "placement-finalize":
+        this.handlePlacementFinalize(socket, message);
+        break;
       case "command":
         this.handleCommand(socket, player, message);
         break;
@@ -641,15 +779,504 @@ export class RoomDurableObject {
     }
 
     const now = Date.now();
-    this.state.storage.sql.exec(
-      "UPDATE room SET phase = 'started', started_at = ?, expires_at = ? WHERE code = ?",
-      now,
-      now + this.ttlSeconds * 1000,
-      room.code,
-    );
+    const deadline = now + PLACEMENT_DURATION_MS;
+    this.state.storage.transactionSync(() => {
+      this.state.storage.sql.exec(
+        `UPDATE room SET phase = 'placement', started_at = NULL,
+          placement_started_at = ?, placement_deadline_at = ?,
+          placement_candidates_json = NULL, placement_generation_attempt = NULL,
+          placement_candidate_hash = NULL, placement_final_centers_json = NULL,
+          placement_proposal_json = NULL, placement_timed_out = 0,
+          expires_at = ? WHERE code = ?`,
+        now,
+        deadline,
+        now + this.ttlSeconds * 1000,
+        room.code,
+      );
+      this.state.storage.sql.exec(
+        "UPDATE players SET placement_center = NULL, placement_locked = 0",
+      );
+    });
     const freshRoom = this.getRoom()!;
     this.sendAck(socket, "start", requestId);
-    this.broadcast(this.startedPayload(freshRoom));
+    this.broadcast(this.lobbyPayload(freshRoom));
+    this.broadcast(this.placementPayload(freshRoom));
+  }
+
+  private handlePlacementCandidates(
+    socket: HibernatingWebSocket,
+    player: PlayerRow,
+    message: Extract<AtomicClientMessage, { type: "placement-candidates" }>,
+  ): void {
+    const room = this.getRoom()!;
+    if (room.phase !== "placement") {
+      this.sendError(
+        socket,
+        "placement-not-running",
+        "Placement candidates are accepted only during placement",
+        true,
+        message.requestId,
+      );
+      return;
+    }
+    if (player.id !== room.host_player_id) {
+      this.sendError(
+        socket,
+        "placement-candidates-host-only",
+        "Only the room host may publish the core-validated placement candidates",
+        false,
+        message.requestId,
+      );
+      return;
+    }
+    if (
+      message.candidates.some(
+        (candidate, index) => index > 0 && message.candidates[index - 1]! >= candidate,
+      )
+    ) {
+      this.sendError(
+        socket,
+        "placement-candidate-order",
+        "Placement candidates must use the core's canonical tile-ID order",
+        false,
+        message.requestId,
+      );
+      return;
+    }
+    const expectedHash = stableHash({
+      generationAttempt: message.generationAttempt,
+      candidates: message.candidates,
+    });
+    if (message.candidateHash.toLowerCase() !== expectedHash) {
+      this.sendError(
+        socket,
+        "placement-candidate-hash",
+        "Placement candidate hash does not match the published generation and order",
+        false,
+        message.requestId,
+      );
+      return;
+    }
+    const totalParticipants = room.next_seat + this.roomConfig(room).botCount;
+    if (message.candidates.length < totalParticipants) {
+      this.sendError(
+        socket,
+        "insufficient-placement-candidates",
+        `At least ${totalParticipants} eligible centers are required`,
+        true,
+        message.requestId,
+      );
+      return;
+    }
+    if (room.placement_candidates_json !== null) {
+      const identical =
+        room.placement_generation_attempt === message.generationAttempt &&
+        room.placement_candidate_hash === message.candidateHash.toLowerCase() &&
+        room.placement_candidates_json === JSON.stringify(message.candidates);
+      if (!identical) {
+        this.sendError(
+          socket,
+          "placement-candidate-mismatch",
+          "Another client supplied a different eligible-center set",
+          false,
+          message.requestId,
+        );
+        return;
+      }
+      this.sendAck(socket, "placement-candidates", message.requestId, { duplicate: true });
+      this.maybeFinalizePlacement(Date.now());
+      return;
+    }
+
+    this.state.storage.sql.exec(
+      `UPDATE room SET placement_candidates_json = ?, placement_generation_attempt = ?,
+        placement_candidate_hash = ? WHERE code = ?`,
+      JSON.stringify(message.candidates),
+      message.generationAttempt,
+      message.candidateHash.toLowerCase(),
+      room.code,
+    );
+    this.sendAck(socket, "placement-candidates", message.requestId);
+    this.broadcast(this.placementPayload(this.getRoom()!));
+    this.maybeFinalizePlacement(Date.now());
+  }
+
+  private handlePlacementClaim(
+    socket: HibernatingWebSocket,
+    player: PlayerRow,
+    centerId: string,
+    lock: boolean,
+    requestId?: string,
+  ): void {
+    const room = this.getRoom()!;
+    if (room.phase !== "placement") {
+      this.sendError(
+        socket,
+        "placement-not-running",
+        "Spawn placement is not active",
+        true,
+        requestId,
+      );
+      return;
+    }
+    const candidates = this.placementCandidates(room);
+    if (!candidates) {
+      this.sendError(
+        socket,
+        "placement-not-ready",
+        "The generated map has not published its eligible centers yet",
+        true,
+        requestId,
+      );
+      return;
+    }
+    if (!candidates.includes(centerId)) {
+      this.sendError(
+        socket,
+        "ineligible-placement",
+        "That tile is not an eligible starting center",
+        true,
+        requestId,
+      );
+      return;
+    }
+    if (player.placement_locked === 1) {
+      if (player.placement_center === centerId && lock) {
+        this.sendAck(socket, "placement-lock", requestId, { duplicate: true });
+      } else {
+        this.sendError(
+          socket,
+          "placement-locked",
+          "A locked starting center cannot be moved",
+          true,
+          requestId,
+        );
+      }
+      return;
+    }
+    const conflict = this.rows<PlayerRow>(
+      `SELECT * FROM players
+       WHERE id <> ? AND placement_center IS NOT NULL AND left_room = 0`,
+      player.id,
+    ).find(
+      (candidate) =>
+        candidate.placement_center !== null &&
+        placementCenterDistance(candidate.placement_center, centerId) <
+          MIN_PLACEMENT_CENTER_DISTANCE,
+    );
+    if (conflict) {
+      this.sendError(
+        socket,
+        "placement-conflict",
+        "That starting area conflicts with another commander",
+        true,
+        requestId,
+      );
+      return;
+    }
+
+    try {
+      const config = this.roomConfig(room);
+      const generationAttempt = room.placement_generation_attempt ?? 0;
+      const projectionSeed =
+        generationAttempt === 0 ? config.seed : `${config.seed}:map-retry:${generationAttempt}`;
+      finalizePlacementCenters({
+        seed: projectionSeed,
+        totalParticipants: room.next_seat + config.botCount,
+        candidates,
+        selections: this.rows<PlayerRow>("SELECT * FROM players ORDER BY seat ASC").map(
+          (candidate) => ({
+            seat: candidate.seat,
+            centerId: candidate.id === player.id ? centerId : candidate.placement_center,
+          }),
+        ),
+        reservedSeats: Array.from(
+          { length: config.botCount },
+          (_, index) => room.next_seat + index,
+        ),
+      });
+    } catch {
+      this.sendError(
+        socket,
+        "placement-fairness",
+        "That center leaves no deterministic distance-balanced final allocation",
+        true,
+        requestId,
+      );
+      return;
+    }
+
+    this.state.storage.transactionSync(() => {
+      this.state.storage.sql.exec(
+        "UPDATE players SET placement_center = ?, placement_locked = ? WHERE id = ?",
+        centerId,
+        lock ? 1 : 0,
+        player.id,
+      );
+      this.state.storage.sql.exec(
+        "UPDATE room SET placement_proposal_json = NULL WHERE code = ?",
+        room.code,
+      );
+    });
+    this.sendAck(socket, lock ? "placement-lock" : "placement-claim", requestId);
+    this.broadcast(this.placementPayload(this.getRoom()!));
+    this.maybeFinalizePlacement(Date.now());
+  }
+
+  private handlePlacementFinalize(
+    socket: HibernatingWebSocket,
+    message: Extract<AtomicClientMessage, { type: "placement-finalize" }>,
+  ): void {
+    const room = this.getRoom()!;
+    if (room.phase !== "placement") {
+      this.sendError(
+        socket,
+        "placement-not-running",
+        "Final centers are accepted only during placement",
+        true,
+        message.requestId,
+      );
+      return;
+    }
+    const candidates = this.placementCandidates(room);
+    if (
+      !candidates ||
+      room.placement_generation_attempt !== message.generationAttempt ||
+      room.placement_candidate_hash !== message.candidateHash.toLowerCase()
+    ) {
+      this.sendError(
+        socket,
+        "placement-candidate-mismatch",
+        "Final centers do not match the room's generated map",
+        false,
+        message.requestId,
+      );
+      return;
+    }
+    const config = this.roomConfig(room);
+    const totalParticipants = room.next_seat + config.botCount;
+    if (message.spawnCenters.length !== totalParticipants) {
+      this.sendError(
+        socket,
+        "placement-count-mismatch",
+        `Expected ${totalParticipants} final centers`,
+        true,
+        message.requestId,
+      );
+      return;
+    }
+    const eligible = new Set(candidates);
+    if (message.spawnCenters.some((center) => !eligible.has(center))) {
+      this.sendError(
+        socket,
+        "ineligible-placement",
+        "Final placement contains an ineligible center",
+        true,
+        message.requestId,
+      );
+      return;
+    }
+    for (let left = 0; left < message.spawnCenters.length; left += 1) {
+      for (let right = left + 1; right < message.spawnCenters.length; right += 1) {
+        if (
+          placementCenterDistance(message.spawnCenters[left]!, message.spawnCenters[right]!) <
+          MIN_PLACEMENT_CENTER_DISTANCE
+        ) {
+          this.sendError(
+            socket,
+            "placement-conflict",
+            "Final starting areas violate minimum spacing",
+            true,
+            message.requestId,
+          );
+          return;
+        }
+      }
+    }
+    if (!placementCentersPreserveDistanceFairness(message.spawnCenters)) {
+      this.sendError(
+        socket,
+        "placement-fairness",
+        "Final starting areas violate nearest-distance fairness",
+        true,
+        message.requestId,
+      );
+      return;
+    }
+    const humans = this.rows<PlayerRow>("SELECT * FROM players ORDER BY seat ASC");
+    const changedHuman = humans.find(
+      (player) =>
+        player.placement_center !== null &&
+        message.spawnCenters[player.seat] !== player.placement_center,
+    );
+    if (changedHuman) {
+      this.sendError(
+        socket,
+        "placement-human-mismatch",
+        `Final center does not preserve seat ${changedHuman.seat}'s selection`,
+        false,
+        message.requestId,
+      );
+      return;
+    }
+
+    const generationAttempt = room.placement_generation_attempt ?? 0;
+    const projectionSeed =
+      generationAttempt === 0 ? config.seed : `${config.seed}:map-retry:${generationAttempt}`;
+    let expectedCenters: string[];
+    try {
+      expectedCenters = finalizePlacementCenters({
+        seed: projectionSeed,
+        totalParticipants,
+        candidates,
+        selections: humans.map((player) => ({
+          seat: player.seat,
+          centerId: player.placement_center,
+        })),
+        reservedSeats: Array.from(
+          { length: config.botCount },
+          (_, index) => room.next_seat + index,
+        ),
+      });
+    } catch {
+      this.sendError(
+        socket,
+        "placement-fairness",
+        "Final centers cannot preserve the deterministic AI reservations",
+        false,
+        message.requestId,
+      );
+      return;
+    }
+    if (expectedCenters.some((center, index) => message.spawnCenters[index] !== center)) {
+      this.sendError(
+        socket,
+        "placement-final-mismatch",
+        "Final centers differ from the room's deterministic reserved vector",
+        false,
+        message.requestId,
+      );
+      return;
+    }
+
+    const serialized = JSON.stringify(message.spawnCenters);
+    if (room.placement_proposal_json !== null && room.placement_proposal_json !== serialized) {
+      this.sendError(
+        socket,
+        "placement-final-mismatch",
+        "Another client supplied a different final center vector",
+        false,
+        message.requestId,
+      );
+      return;
+    }
+    this.state.storage.sql.exec(
+      "UPDATE room SET placement_proposal_json = ? WHERE code = ?",
+      serialized,
+      room.code,
+    );
+    this.sendAck(socket, "placement-finalize", message.requestId, {
+      duplicate: room.placement_proposal_json === serialized,
+    });
+    this.broadcast(this.placementPayload(this.getRoom()!));
+    this.maybeFinalizePlacement(Date.now());
+  }
+
+  private maybeFinalizePlacement(now: number): boolean {
+    const room = this.getRoom();
+    if (
+      !room ||
+      room.phase !== "placement" ||
+      room.placement_started_at === null ||
+      room.placement_deadline_at === null
+    ) {
+      return false;
+    }
+    const candidates = this.placementCandidates(room);
+    const timedOut = now >= room.placement_deadline_at;
+    if (!candidates) {
+      if (!timedOut) return false;
+      this.state.storage.transactionSync(() => {
+        this.state.storage.sql.exec(
+          `UPDATE room SET phase = 'lobby', started_at = NULL,
+            placement_started_at = NULL, placement_deadline_at = NULL,
+            placement_candidates_json = NULL, placement_generation_attempt = NULL,
+            placement_candidate_hash = NULL, placement_final_centers_json = NULL,
+            placement_proposal_json = NULL, placement_timed_out = 1,
+            expires_at = ? WHERE code = ?`,
+          now + this.ttlSeconds * 1000,
+          room.code,
+        );
+        this.state.storage.sql.exec(
+          "UPDATE players SET ready = 0, placement_center = NULL, placement_locked = 0",
+        );
+      });
+      const recovered = this.getRoom()!;
+      this.broadcast({
+        type: "error",
+        code: "placement-candidates-missing",
+        message:
+          "Placement timed out before the host published a validated map; the room returned to the lobby",
+        recoverable: true,
+      });
+      this.broadcast(this.lobbyPayload(recovered));
+      return true;
+    }
+    const players = this.rows<PlayerRow>("SELECT * FROM players ORDER BY seat ASC");
+    const config = this.roomConfig(room);
+    const allHumansLocked = players.every(
+      (player) => player.left_room === 0 && player.placement_locked === 1,
+    );
+    const aiReady = config.botCount === 0 || now >= room.placement_started_at + AI_PLACEMENT_MIN_MS;
+    if (!timedOut && (!allHumansLocked || !aiReady)) return false;
+
+    let spawnCenters: string[];
+    if (room.placement_proposal_json !== null) {
+      spawnCenters = JSON.parse(room.placement_proposal_json) as string[];
+    } else if (timedOut) {
+      const generationAttempt = room.placement_generation_attempt ?? 0;
+      const projectionSeed =
+        generationAttempt === 0 ? config.seed : `${config.seed}:map-retry:${generationAttempt}`;
+      spawnCenters = finalizePlacementCenters({
+        seed: projectionSeed,
+        totalParticipants: room.next_seat + config.botCount,
+        candidates,
+        selections: players.map((player) => ({
+          seat: player.seat,
+          centerId: player.placement_center,
+        })),
+        reservedSeats: Array.from(
+          { length: config.botCount },
+          (_, index) => room.next_seat + index,
+        ),
+      });
+    } else {
+      return false;
+    }
+
+    const simulationStartsAt = now + OPENING_HANDOFF_MS;
+    this.state.storage.transactionSync(() => {
+      for (const player of players) {
+        this.state.storage.sql.exec(
+          "UPDATE players SET placement_center = ?, placement_locked = 1 WHERE id = ?",
+          spawnCenters[player.seat],
+          player.id,
+        );
+      }
+      this.state.storage.sql.exec(
+        `UPDATE room SET phase = 'started', started_at = ?, last_target_tick = 0,
+          placement_final_centers_json = ?, placement_timed_out = ?, expires_at = ?
+         WHERE code = ?`,
+        simulationStartsAt,
+        JSON.stringify(spawnCenters),
+        timedOut ? 1 : 0,
+        now + this.ttlSeconds * 1000,
+        room.code,
+      );
+    });
+    const started = this.getRoom()!;
+    this.broadcast(this.startedPayload(started));
+    return true;
   }
 
   private handleCommand(
@@ -951,6 +1578,22 @@ export class RoomDurableObject {
       );
       return;
     }
+    const uncoveredCommandsAtOrBeforeCheckpoint =
+      this.rows<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM commands WHERE sequence > ? AND target_tick <= ?",
+        message.sequence,
+        message.tick,
+      )[0]?.count ?? 0;
+    if (uncoveredCommandsAtOrBeforeCheckpoint > 0) {
+      this.sendError(
+        socket,
+        "checkpoint-uncovered-command",
+        "Checkpoint tick cannot pass a command excluded from its sequence",
+        true,
+        message.requestId,
+      );
+      return;
+    }
 
     this.state.storage.transactionSync(() => {
       this.state.storage.sql.exec(
@@ -1166,6 +1809,8 @@ export class RoomDurableObject {
 
   async alarm(): Promise<void> {
     await this.ready;
+    const before = this.getRoom();
+    if (before?.phase === "placement") this.maybeFinalizePlacement(Date.now());
     const room = this.getRoom();
     if (!room) return;
     if (room.expires_at <= Date.now()) {
@@ -1232,12 +1877,30 @@ export class RoomDurableObject {
   private async scheduleAlarm(): Promise<void> {
     const room = this.getRoom();
     if (!room) return;
+    const now = Date.now();
     const pending = this.rows<{ sequence: number }>(
       "SELECT sequence FROM commands WHERE broadcasted = 0 ORDER BY sequence LIMIT 1",
     )[0];
-    const target = pending
-      ? Math.min(room.expires_at, Date.now() + BATCH_WINDOW_MS)
-      : room.expires_at;
+    const targets = [room.expires_at];
+    if (pending) targets.push(now + BATCH_WINDOW_MS);
+    if (room.phase === "placement") {
+      if (room.placement_deadline_at !== null && room.placement_deadline_at > now) {
+        targets.push(room.placement_deadline_at);
+      }
+      const players = this.rows<PlayerRow>("SELECT * FROM players ORDER BY seat ASC");
+      if (
+        room.placement_started_at !== null &&
+        room.placement_proposal_json !== null &&
+        players.every((player) => player.left_room === 0 && player.placement_locked === 1)
+      ) {
+        const aiReadyAt =
+          this.roomConfig(room).botCount === 0
+            ? now + 1
+            : room.placement_started_at + AI_PLACEMENT_MIN_MS;
+        targets.push(Math.max(now + 1, aiReadyAt));
+      }
+    }
+    const target = Math.min(...targets);
     await this.state.storage.setAlarm(target);
   }
 
@@ -1277,9 +1940,42 @@ export class RoomDurableObject {
     };
   }
 
+  private placementPayload(room: RoomRow) {
+    if (room.placement_started_at === null || room.placement_deadline_at === null) {
+      throw new Error("Placement room is missing its timing metadata");
+    }
+    const players = this.rows<PlayerRow>("SELECT * FROM players ORDER BY seat ASC");
+    return {
+      type: "placement" as const,
+      roomCode: room.code,
+      startedAt: room.placement_started_at,
+      deadlineAt: room.placement_deadline_at,
+      config: this.roomConfig(room),
+      players: players.map((player) => this.playerSummary(room, player)),
+      selections: players.map((player) => ({
+        seat: player.seat,
+        centerId: player.placement_center,
+        locked: player.placement_locked === 1,
+      })),
+      proposedCenters:
+        room.placement_proposal_json === null
+          ? null
+          : (JSON.parse(room.placement_proposal_json) as string[]),
+      generationAttempt: room.placement_generation_attempt,
+      candidateHash: room.placement_candidate_hash,
+    };
+  }
+
   private startedPayload(room: RoomRow) {
-    if (room.started_at === null) {
-      throw new Error("Started room is missing its start timestamp");
+    if (
+      room.started_at === null ||
+      room.placement_started_at === null ||
+      room.placement_deadline_at === null ||
+      room.placement_generation_attempt === null ||
+      room.placement_candidate_hash === null ||
+      room.placement_final_centers_json === null
+    ) {
+      throw new Error("Started room is missing placement metadata");
     }
     return {
       type: "started" as const,
@@ -1289,6 +1985,12 @@ export class RoomDurableObject {
       players: this.rows<PlayerRow>("SELECT * FROM players ORDER BY seat ASC").map((player) =>
         this.playerSummary(room, player),
       ),
+      spawnCenters: JSON.parse(room.placement_final_centers_json) as string[],
+      generationAttempt: room.placement_generation_attempt,
+      candidateHash: room.placement_candidate_hash,
+      placementStartedAt: room.placement_started_at,
+      placementDeadlineAt: room.placement_deadline_at,
+      timedOut: room.placement_timed_out === 1,
     };
   }
 
@@ -1338,6 +2040,15 @@ export class RoomDurableObject {
 
   private roomConfig(room: RoomRow): RoomConfig {
     return RoomConfigSchema.parse(JSON.parse(room.config_json));
+  }
+
+  private placementCandidates(room: RoomRow): string[] | null {
+    if (room.placement_candidates_json === null) return null;
+    const value = JSON.parse(room.placement_candidates_json) as unknown;
+    if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+      throw new Error("Stored placement candidates are invalid");
+    }
+    return value as string[];
   }
 
   /** Wall-clock simulation position while running; immutable final position after completion. */
@@ -1406,10 +2117,22 @@ export class RoomDurableObject {
 
   private sendAck(
     socket: HibernatingWebSocket,
-    action: "ready" | "start" | "hash" | "checkpoint" | "missing" | "leave" | "complete",
+    action:
+      | "ready"
+      | "start"
+      | "placement-candidates"
+      | "placement-claim"
+      | "placement-lock"
+      | "placement-finalize"
+      | "hash"
+      | "checkpoint"
+      | "missing"
+      | "leave"
+      | "complete",
     requestId?: string,
+    detail: { duplicate?: boolean } = {},
   ): void {
-    this.send(socket, { type: "ack", action, requestId });
+    this.send(socket, { type: "ack", action, requestId, ...detail });
   }
 
   private sendError(

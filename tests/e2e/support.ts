@@ -23,8 +23,12 @@ export interface TestTile {
   terrain: "meadow" | "muster" | "plains" | "forest" | "hills" | "water";
   structure: {
     type: "farm" | "barracks" | "turret";
-    status: "constructing" | "active" | "seized" | "repairing";
+    completedCount: number;
+    status: "active" | "seized" | "repairing" | null;
     integrity: number;
+    pendingProgressTicks: number | null;
+    rallyTargetId: string | null;
+    rallyQueuedTroops: number;
   } | null;
 }
 
@@ -41,13 +45,35 @@ export interface TestStack {
 export interface TestBattle {
   id: number;
   tileId: string;
-  actualControl: number;
+  incumbentOwner: number | null;
+  participants: Array<{
+    playerId: number | null;
+    troops: number;
+    control: number;
+    lastReinforcementTick: number;
+    reinforcementAmount: number;
+  }>;
+  actualControl?: number;
+  /** Compatibility projections for two-party visual fixtures. */
   attacker: number;
   defender: number;
 }
 
 export interface HexDominionTestApi {
   tick: number;
+  phase: "placement" | "opening" | "running" | "complete";
+  placement: {
+    elapsedTicks: number;
+    maxTicks: number | null;
+    placements: Array<{
+      playerId: number;
+      centerId: string | null;
+      locked: boolean;
+    }>;
+    candidates: string[];
+    recommendedPlacementCenter: string | null;
+    selectableCandidates: string[];
+  };
   config: {
     aiCount: number;
     archetype: MapArchetype;
@@ -57,6 +83,7 @@ export interface HexDominionTestApi {
     localPlayerId?: number;
     multiplayer?: boolean;
     debug?: boolean;
+    startingCenters?: string[];
   };
   map: {
     landCount: number;
@@ -87,12 +114,28 @@ export interface HexDominionTestApi {
   selectedTile: string | null;
   stacks: TestStack[];
   battles: TestBattle[];
+  enclosures: Array<{
+    id: number;
+    captorId: number;
+    tileIds: string[];
+    boundaryIds: string[];
+    progressTicks: number;
+  }>;
+  multi: {
+    phase: "idle" | "sources" | "targets";
+    sourceIds: string[];
+    destinationIds: string[];
+  };
   stateHash: string;
   winner: number | null;
   selectTile(tileId: string): void;
   hoverTile(tileId: string | null): void;
   cancelSelection(): void;
+  fitOverview(): void;
+  setTransientCapture(active: boolean): void;
+  captureFrame(): Promise<string>;
   getPresentation(): TestPresentation;
+  getTileClientPoint(tileId: string): { x: number; y: number } | null;
   inspectStateAt(tick: number): unknown;
   loadScenario(scenario: DebugScenario): void;
 }
@@ -105,7 +148,17 @@ export interface TestPresentation {
     displayed: number;
     ghost: number;
     pulse: number;
+    segments?: Array<{
+      playerId: number | null;
+      actual: number;
+      displayed: number;
+      troops: number;
+      turretSupportCount: number;
+    }>;
   }>;
+  captures: Array<{ tileId: string; age: number }>;
+  focusTileId: string | null;
+  keyboardTileId: string | null;
   visibleObjects: number;
 }
 
@@ -212,7 +265,7 @@ async function setRangeValue(page: Page, testId: string, value: number): Promise
   await expect(range).toHaveValue(String(value));
 }
 
-export async function startSinglePlayer(
+export async function startSinglePlayerPlacement(
   page: Page,
   options: StartMatchOptions = {},
 ): Promise<HexDominionTestApi> {
@@ -256,9 +309,50 @@ export async function startSinglePlayer(
     undefined,
     { timeout: 45_000 },
   );
-  await page.waitForFunction(() => (window.__HEX_DOMINION__?.tick ?? 0) > 0, undefined, {
-    timeout: 10_000,
-  });
+  return getTestApiSnapshot(page);
+}
+
+export async function startSinglePlayer(
+  page: Page,
+  options: StartMatchOptions = {},
+): Promise<HexDominionTestApi> {
+  let placement = await startSinglePlayerPlacement(page, options);
+  if (placement.phase === "placement") {
+    const localPlayerId = placement.config.localPlayerId ?? 0;
+    await page.waitForFunction(
+      (playerId) =>
+        window.__HEX_DOMINION__?.placement.placements.every(
+          (entry) => entry.playerId === playerId || entry.locked,
+        ),
+      localPlayerId,
+      { timeout: 10_000 },
+    );
+    placement = await getTestApiSnapshot(page);
+    const byId = new Map(placement.map.tiles.map((tile) => [tile.id, tile]));
+    const occupied = placement.placement.placements
+      .filter((entry) => entry.playerId !== localPlayerId && entry.centerId)
+      .map((entry) => byId.get(entry.centerId!))
+      .filter((tile): tile is TestTile => Boolean(tile));
+    const selectedCenter = placement.placement.recommendedPlacementCenter;
+    if (!selectedCenter) throw new Error("No stable non-conflicting placement center is available");
+    const candidate = byId.get(selectedCenter);
+    if (!candidate || !occupied.every((other) => axialDistance(candidate, other) >= 6)) {
+      throw new Error("Recommended placement conflicts with a locked center");
+    }
+    await page.evaluate((id) => window.__HEX_DOMINION__?.selectTile(id), selectedCenter);
+    await page.waitForFunction(
+      ({ playerId, id }) =>
+        window.__HEX_DOMINION__?.placement.placements[playerId]?.centerId === id,
+      { playerId: localPlayerId, id: selectedCenter },
+      { timeout: 3_000 },
+    );
+    await page.getByTestId("lock-placement").click();
+  }
+  await page.waitForFunction(
+    () => window.__HEX_DOMINION__?.phase === "running" && (window.__HEX_DOMINION__?.tick ?? 0) > 0,
+    undefined,
+    { timeout: 20_000 },
+  );
 
   return getTestApiSnapshot(page);
 }
@@ -272,7 +366,11 @@ export async function getTestApiSnapshot(page: Page): Promise<HexDominionTestApi
       "selectTile",
       "hoverTile",
       "cancelSelection",
+      "fitOverview",
+      "setTransientCapture",
+      "captureFrame",
       "getPresentation",
+      "getTileClientPoint",
       "loadScenario",
     ]) {
       delete snapshot[method];
@@ -287,6 +385,18 @@ export async function getPresentation(page: Page): Promise<TestPresentation> {
     if (!api) throw new Error("Hex Dominion debug API is unavailable");
     return api.getPresentation();
   });
+}
+
+export async function getTileClientPoint(
+  page: Page,
+  tileId: string,
+): Promise<{ x: number; y: number }> {
+  const point = await page.evaluate(
+    (id) => window.__HEX_DOMINION__?.getTileClientPoint(id),
+    tileId,
+  );
+  if (!point) throw new Error(`Tile ${tileId} has no rendered client point`);
+  return point;
 }
 
 export async function pauseSimulation(page: Page): Promise<void> {

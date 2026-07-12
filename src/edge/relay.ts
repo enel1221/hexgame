@@ -1,4 +1,10 @@
 import { ROOM_CODE_ALPHABET } from "./protocol";
+import {
+  compareProjectedCenterIds,
+  placementDistanceBalance,
+  projectPlacementCentersWithReservations,
+  projectedCenterDistance,
+} from "../core/placement/projection";
 
 export const DEFAULT_TICK_RATE = 10;
 export const DEFAULT_COMMAND_LEAD_TICKS = 6;
@@ -6,6 +12,57 @@ export const DEFAULT_ROOM_TTL_SECONDS = 6 * 60 * 60;
 // Leaves room for one compact (max 256 KiB) checkpoint plus its JSON envelope.
 export const MAX_MESSAGE_BYTES = 320 * 1024;
 export const MAX_COMMAND_BATCH = 100;
+export const PLACEMENT_DURATION_MS = 30_000;
+// Core's deterministic bot choreography completes by tick 42. Keep the room
+// in placement long enough that no visibly provisional bot can move at start.
+export const AI_PLACEMENT_MIN_MS = 5_000;
+export const OPENING_HANDOFF_MS = 1_000;
+export const MIN_PLACEMENT_CENTER_DISTANCE = 6;
+
+export interface PlacementSelectionInput {
+  seat: number;
+  centerId: string | null;
+}
+
+export function placementCenterDistance(leftId: string, rightId: string): number {
+  return projectedCenterDistance(leftId, rightId);
+}
+
+export function compareAxialIds(leftId: string, rightId: string): number {
+  return compareProjectedCenterIds(leftId, rightId);
+}
+
+export function placementCentersPreserveDistanceFairness(centers: readonly string[]): boolean {
+  return placementDistanceBalance(centers).valid;
+}
+
+/**
+ * Deterministically completes a partial human placement from a trusted list of
+ * core-validated eligible centers. Candidate order and reconnect order do not
+ * affect the result.
+ */
+export function finalizePlacementCenters(input: {
+  seed: string;
+  totalParticipants: number;
+  candidates: readonly string[];
+  selections: readonly PlacementSelectionInput[];
+  reservedSeats?: readonly number[];
+  minimumDistance?: number;
+}): string[] {
+  return projectPlacementCentersWithReservations({
+    seed: input.seed,
+    totalParticipants: input.totalParticipants,
+    candidates: input.candidates,
+    fixedCenters: input.selections
+      .filter(
+        (selection): selection is PlacementSelectionInput & { centerId: string } =>
+          selection.centerId !== null,
+      )
+      .map((selection) => ({ seat: selection.seat, centerId: selection.centerId })),
+    reservedSeats: input.reservedSeats ?? [],
+    minimumDistance: input.minimumDistance ?? MIN_PLACEMENT_CENTER_DISTANCE,
+  });
+}
 
 export function createRoomCode(randomBytes?: Uint8Array): string {
   const bytes = randomBytes ?? crypto.getRandomValues(new Uint8Array(6));

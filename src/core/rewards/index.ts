@@ -2,6 +2,18 @@ import { BALANCE, SUPPLY_SCALE } from "../../shared/balance";
 import type { GameState, StructureType, TileState } from "../../shared/types";
 import { emitEvent } from "../engine/events";
 
+export interface CapturedStructureValue {
+  type: StructureType;
+  completedCount: number;
+}
+
+export type CaptureRewardStructure = StructureType | CapturedStructureValue | null;
+
+function normalizeCapturedStructure(value: CaptureRewardStructure): CapturedStructureValue | null {
+  if (value === null) return null;
+  return typeof value === "string" ? { type: value, completedCount: 1 } : value;
+}
+
 function structureRewardMilli(type: StructureType | null): number {
   if (type === "farm") return BALANCE.farmCaptureRewardMilli;
   if (type === "barracks") return BALANCE.barracksCaptureRewardMilli;
@@ -22,12 +34,15 @@ export function grantCaptureReward(
   captorId: number,
   tile: TileState,
   previousOwner: number | null,
-  capturedStructure: StructureType | null,
+  capturedStructure: CaptureRewardStructure,
 ): number {
   if (previousOwner === null || previousOwner === captorId) return 0;
   if (!captureRewardEligibility(state, tile)) return 0;
 
-  const amount = BALANCE.captureRewardMilli + structureRewardMilli(capturedStructure);
+  const captured = normalizeCapturedStructure(capturedStructure);
+  const amount =
+    BALANCE.captureRewardMilli +
+    structureRewardMilli(captured?.type ?? null) * (captured?.completedCount ?? 0);
   const captor = state.players[captorId];
   if (!captor) return 0;
   captor.supplyMilli += amount;
@@ -44,18 +59,33 @@ export function grantCaptureReward(
 }
 
 function removeEliminatedForces(state: GameState, playerId: number): void {
+  const eliminated = state.players[playerId];
+  if (eliminated) {
+    for (const stack of state.stacks) {
+      if (stack.owner === playerId) eliminated.stats.troopsLost += stack.troops;
+    }
+  }
   state.stacks = state.stacks.filter((stack) => stack.owner !== playerId);
+
   const retainedBattles = [];
   for (const battle of state.battles) {
-    battle.waiting = battle.waiting.filter((waiting) => waiting.owner !== playerId);
-    if (battle.attacker === playerId) {
+    const removed = battle.participants.find((participant) => participant.playerId === playerId);
+    if (removed && eliminated) eliminated.stats.troopsLost += removed.troops;
+    battle.participants = battle.participants.filter(
+      (participant) => participant.playerId !== playerId,
+    );
+    if (battle.participants.length === 1) {
+      const survivor = battle.participants[0]!;
       const tile = state.map.tiles[battle.tileId];
-      if (tile) tile.troops = battle.defenderTroops;
-      continue;
+      if (tile && survivor.playerId === battle.incumbentOwner) {
+        tile.troops = Math.max(tile.troops, survivor.troops);
+        continue;
+      }
     }
-    retainedBattles.push(battle);
+    if (battle.participants.length > 0) retainedBattles.push(battle);
   }
   state.battles = retainedBattles;
+  state.enclosures = state.enclosures.filter((enclosure) => enclosure.captorId !== playerId);
 }
 
 /** Returns the reward paid, or zero if the player still owns land. */

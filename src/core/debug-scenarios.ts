@@ -10,7 +10,8 @@ import { handleStackArrival } from "./combat";
 import { createInitialState, refreshPlayerAggregates } from "./engine";
 import { emitEvent } from "./engine/events";
 import { cloneDeterministic, hashGameState } from "./hash";
-import { axialKey, distance, neighbors, parseAxialKey } from "./hex";
+import { axialKey, compareAxialKeys, distance, neighbors, parseAxialKey } from "./hex";
+import { beginMatch, computeFinalSpawnVector, finalizePlacementVector } from "./placement";
 import { checkAndRewardElimination } from "./rewards";
 
 export const DEBUG_SCENARIOS = [
@@ -50,11 +51,18 @@ function opponentId(state: GameState, localId: number): number {
  */
 function createScenarioBase(previous: GameState): GameState {
   const next = cloneDeterministic(createInitialState(previous.config));
+  if (next.phase === "placement") {
+    const centers = computeFinalSpawnVector(next);
+    const finalized = finalizePlacementVector(next, centers);
+    if (!finalized.ok) throw new Error(finalized.reason ?? "Could not finalize debug placement");
+  }
+  if (next.phase === "opening") beginMatch(next);
   next.tick = previous.tick + 1;
   next.nextEntityId = Math.max(1, previous.nextEntityId);
   next.paused = true;
   next.stacks = [];
   next.battles = [];
+  next.enclosures = [];
   next.events = [];
   next.victory = { leaderId: null, holdTicks: 0, winnerId: null, reason: null };
   return next;
@@ -80,7 +88,7 @@ function findScenarioLocation(state: GameState, playerId: number): ScenarioLocat
     const byDistance =
       distance(parseAxialKey(left), parseAxialKey(centerId)) -
       distance(parseAxialKey(right), parseAxialKey(centerId));
-    return byDistance || left.localeCompare(right);
+    return byDistance || compareAxialKeys(left, right);
   })[0];
   if (!targetId) throw new Error(`Player ${playerId} has no adjacent scenario tile`);
 
@@ -92,14 +100,24 @@ function findScenarioLocation(state: GameState, playerId: number): ScenarioLocat
   return { targetId, entryFrom };
 }
 
-function activeStructure(type: StructureType): StructureState {
+function activeStructure(
+  type: StructureType,
+  completedCount = 1,
+  overrides: Partial<StructureState> = {},
+): StructureState {
   return {
     type,
+    completedCount,
     status: "active",
     integrity: BALANCE.fullIntegrity,
-    progressTicks: 0,
+    pendingProgressTicks: null,
     seizedTicks: 0,
     productionPaused: false,
+    barracksProgressMilli: 0,
+    rallyTargetId: null,
+    rallyQueuedTroops: 0,
+    turretShotProgressMilli: 0,
+    ...overrides,
   };
 }
 
@@ -135,18 +153,31 @@ function installBattle(
   const battle: BattleState = {
     id,
     tileId: target.id,
-    defender,
-    attacker,
-    defenderTroops: options.defenderTroops,
-    attackerTroops: options.attackerTroops,
-    control: options.control,
+    incumbentOwner: defender,
+    participants: [
+      {
+        playerId: defender,
+        troops: options.defenderTroops,
+        control: 10_000 - options.control,
+        casualtyProgressMilli: 0,
+        entryFrom: target.id,
+        joinedTick: state.tick,
+        lastReinforcementTick: -1,
+        reinforcementAmount: 0,
+      },
+      {
+        playerId: attacker,
+        troops: options.attackerTroops,
+        control: options.control,
+        casualtyProgressMilli: 0,
+        entryFrom: entry.id,
+        joinedTick: state.tick,
+        lastReinforcementTick: -1,
+        reinforcementAmount: 0,
+      },
+    ].sort((left, right) => (left.playerId ?? -1) - (right.playerId ?? -1)),
     ageTicks: options.ageTicks,
     roundAccumulator: options.roundAccumulator ?? 0,
-    entryFrom: entry.id,
-    waiting: [],
-    lastReinforcementTick: -1,
-    reinforcementSide: null,
-    reinforcementAmount: 0,
   };
   state.battles = [battle];
   return battle;
@@ -168,12 +199,21 @@ function addStructures(state: GameState, playerId: number): void {
     tile.structure = null;
     tile.troops = Math.max(tile.troops, 18);
   }
-  state.map.tiles[musterId]!.structure = activeStructure("barracks");
-  state.map.tiles[meadowId]!.structure = activeStructure("farm");
-  state.map.tiles[turretId]!.structure = activeStructure("turret");
+  const rallyTargetId = cluster.find((id) => id !== musterId && id !== meadowId && id !== turretId);
+  state.map.tiles[musterId]!.structure = activeStructure("barracks", 3, {
+    barracksProgressMilli: Math.floor((BALANCE.barracks.trainTicks * BALANCE.fullIntegrity) / 2),
+    rallyTargetId: rallyTargetId ?? null,
+    rallyQueuedTroops: rallyTargetId ? 4 : 0,
+  });
+  state.map.tiles[meadowId]!.structure = activeStructure("farm", 2, {
+    pendingProgressTicks: Math.floor(BALANCE.farm.buildTicks / 2),
+  });
+  state.map.tiles[turretId]!.structure = activeStructure("turret", 99, {
+    turretShotProgressMilli: Math.floor(BALANCE.turret.shotTicks / 2) * BALANCE.fullIntegrity,
+  });
   const player = state.players[playerId]!;
   player.supplyMilli = Math.max(player.supplyMilli, 500 * 1000);
-  player.stats.structuresBuilt = Math.max(player.stats.structuresBuilt, 3);
+  player.stats.structuresBuilt = Math.max(player.stats.structuresBuilt, 104);
 }
 
 function addBattle(
@@ -228,6 +268,11 @@ function addMinimumDurationBattle(state: GameState, previous: GameState): void {
     ageTicks: 0,
     roundAccumulator: BALANCE.combatRoundTicks - 1,
   });
+  const target = state.map.tiles[battle.tileId]!;
+  target.structure = activeStructure("turret", 3, {
+    turretShotProgressMilli:
+      BALANCE.turret.shotTicks * BALANCE.fullIntegrity - 3 * BALANCE.fullIntegrity,
+  });
   emitEvent(state, {
     type: "battle-started",
     playerId: localId,
@@ -266,7 +311,7 @@ function addDevelopedCapture(state: GameState, previous: GameState): void {
   });
 }
 
-function addElimination(state: GameState): void {
+function addElimination(state: GameState, previous: GameState): void {
   const localId = localPlayerId(state);
   const enemyId = opponentId(state, localId);
   for (const tileId of state.map.landIds) {
@@ -278,7 +323,76 @@ function addElimination(state: GameState): void {
     }
   }
   state.players[enemyId]!.supplyMilli = 1_000_000;
+  const activeOpponents = state.players
+    .filter((player) => player.id !== localId && player.id !== enemyId)
+    .sort((left, right) => left.id - right.id);
+  if (activeOpponents.length >= 2) {
+    const location = findScenarioLocation(state, localId);
+    const battle = installBattle(state, previous, location, localId, activeOpponents[0]!.id, {
+      attackerTroops: 6,
+      defenderTroops: 8,
+      control: 5_000,
+      ageTicks: 0,
+    });
+    state.map.tiles[battle.tileId]!.terrain = "plains";
+    battle.participants.push({
+      playerId: activeOpponents[1]!.id,
+      troops: 20,
+      control: 5_000,
+      casualtyProgressMilli: 0,
+      entryFrom: location.entryFrom,
+      joinedTick: state.tick,
+      lastReinforcementTick: -1,
+      reinforcementAmount: 0,
+    });
+    battle.participants.sort((left, right) => (left.playerId ?? -1) - (right.playerId ?? -1));
+  }
   checkAndRewardElimination(state, enemyId, localId);
+}
+
+function compareTileIds(state: GameState, left: string, right: string): number {
+  const leftTile = state.map.tiles[left]!;
+  const rightTile = state.map.tiles[right]!;
+  return leftTile.q - rightTile.q || leftTile.r - rightTile.r;
+}
+
+function addEnclosureFixture(state: GameState, playerId: number): void {
+  const excluded = new Set(state.map.spawnClusters[playerId] ?? []);
+  const targetId = [...state.map.landIds]
+    .sort((left, right) => compareTileIds(state, left, right))
+    .find((id) => {
+      if (excluded.has(id)) return false;
+      const adjacent = neighbors(state.map.tiles[id]!).map(axialKey);
+      return adjacent.every((neighborId) => {
+        const tile = state.map.tiles[neighborId];
+        return !excluded.has(neighborId) && Boolean(tile && tile.terrain !== "water");
+      });
+    });
+  if (!targetId) throw new Error("Interior-build scenario needs an enclosed pocket fixture");
+  const target = state.map.tiles[targetId]!;
+  const boundaryIds = neighbors(target)
+    .map(axialKey)
+    .sort((left, right) => compareTileIds(state, left, right));
+  target.owner = opponentId(state, playerId);
+  target.troops = 6;
+  target.terrain = "meadow";
+  target.structure = activeStructure("farm", 2, {
+    pendingProgressTicks: Math.floor(BALANCE.farm.buildTicks / 2),
+  });
+  for (const boundaryId of boundaryIds) {
+    const boundary = state.map.tiles[boundaryId]!;
+    boundary.owner = playerId;
+    boundary.troops = Math.max(boundary.troops, 8);
+  }
+  state.enclosures = [
+    {
+      id: state.nextEntityId++,
+      captorId: playerId,
+      tileIds: [targetId],
+      boundaryIds,
+      progressTicks: BALANCE.encirclementTicks - 1,
+    },
+  ];
 }
 
 function addInteriorBuildTile(state: GameState, playerId: number): void {
@@ -296,6 +410,7 @@ function addInteriorBuildTile(state: GameState, playerId: number): void {
   if (!enclosed) throw new Error("Spawn center is not enclosed by owned land");
   center.structure = null;
   state.players[playerId]!.supplyMilli = Math.max(state.players[playerId]!.supplyMilli, 500 * 1000);
+  addEnclosureFixture(state, playerId);
 }
 
 function addCapturedTile(state: GameState): void {
@@ -352,6 +467,7 @@ function addCompletedMatch(state: GameState, winnerId: number): void {
     winnerId,
     reason: "sole-survivor",
   };
+  state.phase = "complete";
   emitEvent(state, {
     type: "victory",
     playerId: winnerId,
@@ -395,7 +511,7 @@ export function createDebugScenario(state: GameState, scenario: DebugScenario): 
       addDevelopedCapture(next, state);
       break;
     case "elimination":
-      addElimination(next);
+      addElimination(next, state);
       break;
     case "interior-build":
       addInteriorBuildTile(next, localId);

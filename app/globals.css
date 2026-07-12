@@ -1250,6 +1250,159 @@ kbd {
   );
 }
 
+.placement-panel {
+  position: absolute;
+  z-index: 18;
+  right: 16px;
+  top: 82px;
+  width: min(380px, calc(100vw - 28px));
+  border: 1px solid rgba(225, 198, 128, 0.62);
+  background: linear-gradient(180deg, rgba(15, 27, 31, 0.97), rgba(7, 16, 21, 0.96));
+  box-shadow:
+    0 22px 60px #000c,
+    inset 0 1px #fff1;
+  backdrop-filter: blur(16px);
+}
+.placement-panel > header {
+  padding: 15px 17px 12px;
+  border-bottom: 1px solid rgba(221, 195, 137, 0.18);
+}
+.placement-panel > header > span,
+.placement-panel h1,
+.placement-panel p {
+  display: block;
+  margin: 0;
+}
+.placement-panel > header > span {
+  color: #bfa45f;
+  font-size: 7px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.placement-panel h1 {
+  margin-top: 3px;
+  font-family: var(--serif);
+  font-size: 23px;
+}
+.placement-panel p {
+  margin-top: 4px;
+  color: #839293;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.placement-roster {
+  max-height: min(42vh, 330px);
+  padding: 6px 10px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.placement-roster > div {
+  min-height: 34px;
+  display: grid;
+  grid-template-columns: 9px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 3px;
+  border-bottom: 1px solid rgba(221, 195, 137, 0.09);
+}
+.placement-roster i {
+  width: 8px;
+  height: 21px;
+  opacity: 0.48;
+}
+.placement-roster .is-locked i {
+  opacity: 1;
+}
+.placement-roster strong,
+.placement-roster small {
+  display: block;
+}
+.placement-roster strong {
+  font-family: var(--serif);
+  font-size: 11px;
+}
+.placement-roster small {
+  color: #68797b;
+  font-size: 8px;
+}
+.placement-roster b {
+  color: #8c7c52;
+  font-size: 8px;
+  letter-spacing: 0.08em;
+}
+.placement-roster .is-locked b {
+  color: #cbd993;
+}
+.placement-panel > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 13px;
+  border-top: 1px solid rgba(221, 195, 137, 0.18);
+  color: #778789;
+  font-size: 9px;
+}
+.placement-panel > footer button {
+  min-width: 112px;
+  min-height: 38px;
+  padding: 9px 13px;
+  border: 1px solid #d1b466;
+  background: #4a452e;
+  color: #f1d995;
+  font-family: var(--serif);
+}
+.placement-panel > footer button:disabled {
+  border-color: #4a5758;
+  background: #172326;
+  color: #657476;
+}
+.opening-banner {
+  position: absolute;
+  z-index: 18;
+  left: 50%;
+  top: 46%;
+  translate: -50% -50%;
+  min-width: 280px;
+  padding: 14px 26px;
+  border-block: 1px solid #d1b466;
+  background: rgba(7, 16, 21, 0.86);
+  text-align: center;
+  pointer-events: none;
+  animation: openingRise 1s ease both;
+}
+.opening-banner span,
+.opening-banner strong {
+  display: block;
+}
+.opening-banner span {
+  color: #a9945c;
+  font-size: 7px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+.opening-banner strong {
+  margin-top: 3px;
+  font-family: var(--serif);
+  font-size: 20px;
+}
+@keyframes openingRise {
+  0% {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  30%,
+  75% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+}
+
 .hud-top {
   position: absolute;
   z-index: 10;
@@ -1797,6 +1950,7 @@ kbd {
 }
 .structure-status {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   margin: 0 10px 10px;
@@ -1827,6 +1981,20 @@ kbd {
   color: #a9c6c0;
   font-size: 7px;
   text-transform: uppercase;
+}
+.rally-actions {
+  width: 100%;
+  display: flex;
+  gap: 5px;
+}
+.rally-actions button {
+  flex: 1;
+  min-height: 34px;
+  font-size: 8px;
+}
+.rally-actions button.is-active {
+  border-color: #d2b66c;
+  color: #f0d992;
 }
 .structure-progress {
   display: block;
@@ -1929,6 +2097,84 @@ kbd {
   font-size: 6px;
   font-style: normal;
   white-space: nowrap;
+}
+.send-control button.multi-launch {
+  width: 76px;
+  color: #b8c8c6;
+  font-size: 8px;
+}
+.multi-launch kbd {
+  margin-left: 3px;
+  color: #71817f;
+  font-size: 6px;
+}
+.multi-panel {
+  position: absolute;
+  z-index: 12;
+  left: 50%;
+  bottom: 103px;
+  width: min(570px, calc(100vw - 24px));
+  translate: -50% 0;
+  padding: 9px 11px;
+  border: 1px solid #c9aa61;
+  background: rgba(9, 20, 24, 0.96);
+  box-shadow: 0 14px 38px #000a;
+  backdrop-filter: blur(12px);
+}
+.multi-panel header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.multi-panel header span {
+  color: #c8ac63;
+  font-size: 8px;
+  letter-spacing: 0.1em;
+}
+.multi-panel header strong {
+  font-family: var(--serif);
+  font-size: 11px;
+}
+.multi-panel p {
+  margin: 5px 0 7px;
+  color: #829191;
+  font-size: 9px;
+  line-height: 1.45;
+}
+.multi-panel > div {
+  display: grid;
+  grid-template-columns: 1.25fr 1.25fr 0.7fr 0.7fr;
+  gap: 5px;
+}
+.multi-panel button,
+.rally-tooltip button {
+  min-height: 36px;
+  padding: 7px 8px;
+  border: 1px solid #53696a;
+  background: #16272b;
+  color: #a9c2be;
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+@media (pointer: coarse) {
+  .placement-panel > footer button,
+  .multi-panel button,
+  .rally-actions button,
+  .rally-tooltip button {
+    min-height: 44px;
+  }
+  .placement-roster > div {
+    min-height: 42px;
+  }
+}
+.multi-panel button.is-active {
+  border-color: #d0b264;
+  color: #f0d992;
+}
+.multi-panel button:disabled {
+  opacity: 0.4;
 }
 .dock-divider {
   width: 1px;
@@ -2683,6 +2929,15 @@ kbd {
     overflow-x: auto;
     justify-content: flex-start;
   }
+  .placement-panel {
+    right: auto;
+    left: 50%;
+    top: 68px;
+    translate: -50% 0;
+  }
+  .multi-panel {
+    bottom: 104px;
+  }
   .send-control button {
     width: 39px;
   }
@@ -2778,6 +3033,32 @@ kbd {
   }
   .command-dock {
     height: 78px;
+  }
+  .placement-panel {
+    top: 62px;
+  }
+  .placement-panel > header {
+    padding: 10px 12px 8px;
+  }
+  .placement-panel h1 {
+    font-size: 19px;
+  }
+  .placement-roster {
+    max-height: 43vh;
+  }
+  .placement-panel > footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .multi-panel {
+    bottom: 94px;
+  }
+  .multi-panel header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .multi-panel > div {
+    grid-template-columns: 1fr 1fr;
   }
   .build-control > button span:last-child {
     display: none;

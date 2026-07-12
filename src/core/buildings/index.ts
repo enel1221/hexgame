@@ -1,6 +1,8 @@
 import { BALANCE } from "../../shared/balance";
 import type { GameState, StructureState, StructureType, TileState } from "../../shared/types";
 import { emitEvent } from "../engine/events";
+import { findPath } from "../hex/pathfinding";
+import { dispatchExactMovingStack } from "../movement";
 
 export interface BuildingRule {
   costMilli: number;
@@ -24,20 +26,55 @@ export interface PlacementResult {
   reason?: string;
 }
 
+export interface CapturedStructure {
+  type: StructureType;
+  completedCount: number;
+}
+
+export function createEmptyStructureStack(type: StructureType): StructureState {
+  return {
+    type,
+    completedCount: 0,
+    status: null,
+    integrity: 0,
+    pendingProgressTicks: 0,
+    seizedTicks: 0,
+    productionPaused: false,
+    barracksProgressMilli: 0,
+    rallyTargetId: null,
+    rallyQueuedTroops: 0,
+    turretShotProgressMilli: 0,
+  };
+}
+
 export function canPlaceStructure(
   state: GameState,
   playerId: number,
   tileId: string,
   type: StructureType,
 ): PlacementResult {
+  if (state.phase !== "running") return { ok: false, reason: "Match is not running" };
   const player = state.players[playerId];
   const tile = state.map.tiles[tileId];
   if (!player || player.eliminated) return { ok: false, reason: "Player is eliminated" };
   if (!tile || tile.terrain === "water") return { ok: false, reason: "Tile is not playable land" };
   if (tile.owner !== playerId) return { ok: false, reason: "Tile is not owned by player" };
-  if (tile.structure) return { ok: false, reason: "Tile already has a structure" };
   if (state.battles.some((battle) => battle.tileId === tileId)) {
     return { ok: false, reason: "Cannot build on a contested tile" };
+  }
+  const structure = tile.structure;
+  if (structure) {
+    if (structure.type !== type)
+      return { ok: false, reason: "Tile has a different structure type" };
+    if (structure.pendingProgressTicks !== null) {
+      return { ok: false, reason: "A structure copy is already under construction" };
+    }
+    if (structure.completedCount >= BALANCE.maxStructureCount) {
+      return { ok: false, reason: `Structure stack is capped at ${BALANCE.maxStructureCount}` };
+    }
+    if (structure.status === "seized") {
+      return { ok: false, reason: "Seized structures must reactivate before expanding" };
+    }
   }
   if (type === "farm" && tile.terrain !== "meadow") {
     return { ok: false, reason: "Farms require Fertile Meadow" };
@@ -61,19 +98,14 @@ export function startConstruction(
   if (!validation.ok) return validation;
 
   state.players[playerId]!.supplyMilli -= BUILDING_RULES[type].costMilli;
-  state.map.tiles[tileId]!.structure = {
-    type,
-    status: "constructing",
-    integrity: 0,
-    progressTicks: 0,
-    seizedTicks: 0,
-    productionPaused: false,
-  };
+  const tile = state.map.tiles[tileId]!;
+  if (tile.structure) tile.structure.pendingProgressTicks = 0;
+  else tile.structure = createEmptyStructureStack(type);
   emitEvent(state, {
     type: "construction-started",
     playerId,
     tileId,
-    message: `${state.players[playerId]!.name} began a ${type}`,
+    message: `${state.players[playerId]!.name} began ${type} x${tile.structure.completedCount + 1}`,
   });
   return { ok: true };
 }
@@ -83,9 +115,10 @@ export function cancelConstruction(
   playerId: number,
   tileId: string,
 ): PlacementResult {
+  if (state.phase !== "running") return { ok: false, reason: "Match is not running" };
   const tile = state.map.tiles[tileId];
   if (!tile || tile.owner !== playerId) return { ok: false, reason: "Tile is not owned by player" };
-  if (!tile.structure || tile.structure.status !== "constructing") {
+  if (!tile.structure || tile.structure.pendingProgressTicks === null) {
     return { ok: false, reason: "No construction to cancel" };
   }
   if (state.battles.some((battle) => battle.tileId === tileId)) {
@@ -96,7 +129,8 @@ export function cancelConstruction(
     (BUILDING_RULES[tile.structure.type].costMilli * BALANCE.cancelRefundPermille) / 1000,
   );
   state.players[playerId]!.supplyMilli += refund;
-  tile.structure = null;
+  if (tile.structure.completedCount === 0) tile.structure = null;
+  else tile.structure.pendingProgressTicks = null;
   return { ok: true };
 }
 
@@ -105,61 +139,138 @@ export function toggleBarracksProduction(
   playerId: number,
   tileId: string,
 ): PlacementResult {
+  if (state.phase !== "running") return { ok: false, reason: "Match is not running" };
   const tile = state.map.tiles[tileId];
   if (!tile || tile.owner !== playerId) return { ok: false, reason: "Tile is not owned by player" };
   if (!tile.structure || tile.structure.type !== "barracks") {
     return { ok: false, reason: "Tile has no Barracks" };
   }
-  if (tile.structure.status === "constructing" || tile.structure.status === "seized") {
+  if (!isStructureOperational(tile.structure)) {
     return { ok: false, reason: "Barracks is not operational" };
   }
   tile.structure.productionPaused = !tile.structure.productionPaused;
   return { ok: true };
 }
 
+export function canSetBarracksRally(
+  state: GameState,
+  playerId: number,
+  tileId: string,
+  destinationId: string,
+): PlacementResult {
+  if (state.phase !== "running") return { ok: false, reason: "Match is not running" };
+  const tile = state.map.tiles[tileId];
+  const destination = state.map.tiles[destinationId];
+  if (!tile || tile.owner !== playerId) return { ok: false, reason: "Tile is not owned by player" };
+  if (
+    !tile.structure ||
+    tile.structure.type !== "barracks" ||
+    !isStructureOperational(tile.structure)
+  ) {
+    return { ok: false, reason: "Tile has no operational Barracks" };
+  }
+  if (!destination || destination.terrain === "water" || destinationId === tileId) {
+    return { ok: false, reason: "Rally destination is not playable land" };
+  }
+  if (!findPath(state.map, tileId, destinationId, playerId, true)) {
+    return { ok: false, reason: "Rally destination is unreachable" };
+  }
+  return { ok: true };
+}
+
+export function setBarracksRally(
+  state: GameState,
+  playerId: number,
+  tileId: string,
+  destinationId: string,
+): PlacementResult {
+  const validation = canSetBarracksRally(state, playerId, tileId, destinationId);
+  if (!validation.ok) return validation;
+  const tile = state.map.tiles[tileId]!;
+  tile.structure!.rallyTargetId = destinationId;
+  emitEvent(state, {
+    type: "rally-set",
+    playerId,
+    tileId,
+    message: `Barracks rally set to ${destinationId}`,
+  });
+  return { ok: true };
+}
+
+export function clearBarracksRally(
+  state: GameState,
+  playerId: number,
+  tileId: string,
+): PlacementResult {
+  if (state.phase !== "running") return { ok: false, reason: "Match is not running" };
+  const tile = state.map.tiles[tileId];
+  if (!tile || tile.owner !== playerId) return { ok: false, reason: "Tile is not owned by player" };
+  if (!tile.structure || tile.structure.type !== "barracks") {
+    return { ok: false, reason: "Tile has no Barracks" };
+  }
+  tile.structure.rallyTargetId = null;
+  tile.structure.rallyQueuedTroops = 0;
+  emitEvent(state, {
+    type: "rally-cleared",
+    playerId,
+    tileId,
+    message: "Barracks rally cleared",
+  });
+  return { ok: true };
+}
+
 export function isStructureOperational(structure: StructureState | null): boolean {
-  return structure?.status === "active" || structure?.status === "repairing";
+  return Boolean(
+    structure &&
+    structure.completedCount > 0 &&
+    (structure.status === "active" || structure.status === "repairing"),
+  );
 }
 
 export function structureIntegrityPermille(structure: StructureState | null): number {
   return isStructureOperational(structure) ? structure!.integrity : 0;
 }
 
-/** Applies capture damage. Unfinished structures are destroyed without reward. */
-export function seizeStructure(tile: TileState): StructureType | null {
+/** Applies capture damage, destroying only the pending copy. */
+export function seizeStructure(tile: TileState): CapturedStructure | null {
   const structure = tile.structure;
   if (!structure) return null;
-  if (structure.status === "constructing") {
+  structure.pendingProgressTicks = null;
+  if (structure.completedCount === 0) {
     tile.structure = null;
     return null;
   }
 
+  const captured = { type: structure.type, completedCount: structure.completedCount };
   structure.status = "seized";
   structure.integrity = BALANCE.seizedIntegrity;
-  structure.progressTicks = 0;
   structure.seizedTicks = 0;
   structure.productionPaused = false;
-  return structure.type;
+  structure.barracksProgressMilli = 0;
+  structure.rallyTargetId = null;
+  structure.rallyQueuedTroops = 0;
+  structure.turretShotProgressMilli = 0;
+  return captured;
 }
 
 function tickConstruction(state: GameState, tile: TileState, structure: StructureState): void {
+  if (structure.pendingProgressTicks === null) return;
   if (state.battles.some((battle) => battle.tileId === tile.id)) return;
-  structure.progressTicks += 1;
+  structure.pendingProgressTicks += 1;
   const required = BUILDING_RULES[structure.type].buildTicks;
-  structure.integrity = Math.min(
-    BALANCE.fullIntegrity,
-    Math.floor((structure.progressTicks * BALANCE.fullIntegrity) / required),
-  );
-  if (structure.progressTicks < required) return;
+  if (structure.pendingProgressTicks < required) return;
 
-  structure.status = "active";
-  structure.integrity = BALANCE.fullIntegrity;
-  structure.progressTicks = 0;
+  structure.completedCount += 1;
+  structure.pendingProgressTicks = null;
+  if (structure.status === null) {
+    structure.status = "active";
+    structure.integrity = BALANCE.fullIntegrity;
+  }
   emitEvent(state, {
     type: "construction-complete",
     playerId: tile.owner ?? undefined,
     tileId: tile.id,
-    message: `${structure.type} completed`,
+    message: `${structure.type} x${structure.completedCount} completed`,
   });
   const owner = tile.owner === null ? undefined : state.players[tile.owner];
   if (owner) owner.stats.structuresBuilt += 1;
@@ -169,7 +280,6 @@ function tickSeizure(structure: StructureState): void {
   structure.seizedTicks += 1;
   if (structure.seizedTicks < BALANCE.seizedTicks) return;
   structure.status = "repairing";
-  structure.progressTicks = 0;
   structure.seizedTicks = 0;
 }
 
@@ -187,28 +297,82 @@ function tickRepair(structure: StructureState): void {
   structure.seizedTicks = 0;
 }
 
+export function barracksRallyPath(
+  state: GameState,
+  tile: TileState,
+  structure: StructureState,
+): string[] | null {
+  if (tile.owner === null || !structure.rallyTargetId) return null;
+  return findPath(state.map, tile.id, structure.rallyTargetId, tile.owner, true);
+}
+
+export function isBarracksRallyBlocked(
+  state: GameState,
+  tile: TileState,
+  structure: StructureState,
+): boolean {
+  return structure.rallyTargetId !== null && barracksRallyPath(state, tile, structure) === null;
+}
+
 function tickBarracks(state: GameState, tile: TileState, structure: StructureState): void {
-  if (tile.owner === null || structure.productionPaused) return;
+  if (tile.owner === null) return;
+  structure.rallyQueuedTroops = Math.min(structure.rallyQueuedTroops, tile.troops);
   if (state.battles.some((battle) => battle.tileId === tile.id)) return;
-  if (tile.troops >= BALANCE.barracks.localTarget) {
-    structure.progressTicks = 0;
+  const player = state.players[tile.owner];
+  if (!player) return;
+  const rallyPath = barracksRallyPath(state, tile, structure);
+  const hasRally = structure.rallyTargetId !== null;
+  if (rallyPath && structure.rallyTargetId && structure.rallyQueuedTroops > 0) {
+    const queued = structure.rallyQueuedTroops;
+    tile.troops -= queued;
+    structure.rallyQueuedTroops = 0;
+    dispatchExactMovingStack(
+      state,
+      tile.owner,
+      tile.id,
+      structure.rallyTargetId,
+      queued,
+      rallyPath,
+    );
     return;
   }
-  const player = state.players[tile.owner];
-  if (!player || player.supplyMilli < BALANCE.barracks.troopCostMilli) return;
+  if (structure.productionPaused) return;
+  if (!hasRally && tile.troops >= BALANCE.barracks.localTarget) {
+    structure.barracksProgressMilli = 0;
+    return;
+  }
 
-  // Repairing Barracks train in proportion to integrity without fractional state.
-  const advances =
-    structure.status === "active" ||
-    (state.tick * structure.integrity) % BALANCE.fullIntegrity < structure.integrity;
-  if (!advances) return;
-  structure.progressTicks += 1;
-  if (structure.progressTicks < BALANCE.barracks.trainTicks) return;
+  structure.barracksProgressMilli += structure.integrity;
+  const cycle = BALANCE.barracks.trainTicks * BALANCE.fullIntegrity;
+  if (structure.barracksProgressMilli < cycle) return;
 
-  structure.progressTicks = 0;
-  player.supplyMilli -= BALANCE.barracks.troopCostMilli;
-  tile.troops += 1;
-  player.stats.troopsTrained += 1;
+  const affordable = Math.floor(player.supplyMilli / BALANCE.barracks.troopCostMilli);
+  const localSpace = Math.max(0, BALANCE.barracks.localTarget - tile.troops);
+  const capacity = rallyPath
+    ? structure.completedCount
+    : Math.min(structure.completedCount, localSpace);
+  const trained = Math.min(capacity, affordable);
+  if (trained <= 0) {
+    structure.barracksProgressMilli = cycle;
+    return;
+  }
+
+  structure.barracksProgressMilli -= cycle;
+  player.supplyMilli -= trained * BALANCE.barracks.troopCostMilli;
+  player.stats.troopsTrained += trained;
+  if (rallyPath && structure.rallyTargetId) {
+    dispatchExactMovingStack(
+      state,
+      tile.owner,
+      tile.id,
+      structure.rallyTargetId,
+      trained,
+      rallyPath,
+    );
+  } else {
+    tile.troops += trained;
+    if (hasRally) structure.rallyQueuedTroops += trained;
+  }
 }
 
 export function tickStructures(state: GameState): void {
@@ -217,14 +381,12 @@ export function tickStructures(state: GameState): void {
     const structure = tile.structure;
     if (!structure) continue;
 
-    if (structure.status === "constructing") {
-      tickConstruction(state, tile, structure);
-      continue;
-    } else if (structure.status === "seized") {
+    tickConstruction(state, tile, structure);
+    if (structure.status === "seized") {
       tickSeizure(structure);
       continue;
-    } else if (structure.status === "repairing") tickRepair(structure);
-
+    }
+    if (structure.status === "repairing") tickRepair(structure);
     if (structure.type === "barracks" && isStructureOperational(structure)) {
       tickBarracks(state, tile, structure);
     }

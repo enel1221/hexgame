@@ -2,12 +2,15 @@ import { describe, expect, it } from "vitest";
 import { BALANCE } from "../../src/shared/balance";
 import type { WorkerResponse } from "../../src/shared/types";
 import {
+  DEBUG_SCENARIOS,
+  battlePresentation,
   cloneDeterministic,
   createDebugScenario,
   createGame,
   hashGameState,
   axialKey,
   neighbors,
+  parseEngineSnapshot,
   stepGame,
 } from "../../src/core";
 import { SimulationWorkerController } from "../../src/worker";
@@ -25,6 +28,17 @@ function expectValidHash(state: ReturnType<typeof createDebugScenario>): void {
 }
 
 describe("deterministic debug scenarios", () => {
+  it.each(DEBUG_SCENARIOS)("produces a strict snapshot-valid %s fixture", (scenario) => {
+    const state = createDebugScenario(createGame(DEBUG_CONFIG).state, scenario);
+    state.stateHash = hashGameState(state);
+    const parsed = parseEngineSnapshot({
+      state,
+      commandHistory: [],
+      pendingCommands: [],
+    });
+    expect(parsed.state).toEqual(state);
+  });
+
   it("rejects production matches and never mutates its input", () => {
     const production = createGame(TEST_CONFIG).state;
     expect(() => createDebugScenario(production, "battle")).toThrow(/debug match/i);
@@ -48,9 +62,26 @@ describe("deterministic debug scenarios", () => {
     ]);
     expect(structures.every((tile) => tile.owner === 0)).toBe(true);
     expect(structures.every((tile) => tile.structure!.status === "active")).toBe(true);
-    expect(structures.find((tile) => tile.structure!.type === "farm")!.terrain).toBe("meadow");
-    expect(structures.find((tile) => tile.structure!.type === "barracks")!.terrain).toBe("muster");
+    const farm = structures.find((tile) => tile.structure!.type === "farm")!;
+    const barracks = structures.find((tile) => tile.structure!.type === "barracks")!;
+    const turret = structures.find((tile) => tile.structure!.type === "turret")!;
+    expect(farm.terrain).toBe("meadow");
+    expect(farm.structure).toMatchObject({
+      completedCount: 2,
+      pendingProgressTicks: Math.floor(BALANCE.farm.buildTicks / 2),
+    });
+    expect(barracks.terrain).toBe("muster");
+    expect(barracks.structure).toMatchObject({
+      completedCount: 3,
+      barracksProgressMilli: Math.floor((BALANCE.barracks.trainTicks * BALANCE.fullIntegrity) / 2),
+      rallyTargetId: expect.any(String),
+    });
+    expect(turret.structure).toMatchObject({
+      completedCount: 99,
+      turretShotProgressMilli: Math.floor(BALANCE.turret.shotTicks / 2) * BALANCE.fullIntegrity,
+    });
     expect(state.players[0]!.supplyMilli).toBeGreaterThanOrEqual(500_000);
+    expect(state.players[0]!.stats.structuresBuilt).toBeGreaterThanOrEqual(104);
     expectValidHash(state);
   });
 
@@ -58,21 +89,26 @@ describe("deterministic debug scenarios", () => {
     const initial = createGame(DEBUG_CONFIG).state;
     const battleState = createDebugScenario(initial, "battle");
     const battle = battleState.battles[0]!;
+    const attacker = battle.participants.find((participant) => participant.playerId === 0)!;
+    const defender = battle.participants.find(
+      (participant) => participant.playerId === battle.incumbentOwner,
+    )!;
     expect(battleState.battles).toHaveLength(1);
-    expect(battle.control).toBe(5_000);
+    expect(battle.participants).toHaveLength(2);
+    expect(attacker.control).toBe(5_000);
     expect(battle.ageTicks).toBe(0);
-    expect(battle.attackerTroops).toBe(battle.defenderTroops);
+    expect(attacker.troops).toBe(defender.troops);
     expect(battleState.map.tiles[battle.tileId]!.troops).toBe(0);
     expectValidHash(battleState);
 
     const reinforced = createDebugScenario(battleState, "reinforcement");
     const shifted = reinforced.battles[0]!;
+    const shiftedAttacker = shifted.participants.find((participant) => participant.playerId === 0)!;
     expect(shifted.id).toBe(battle.id);
-    expect(shifted.reinforcementSide).toBe("attacker");
-    expect(shifted.reinforcementAmount).toBe(40);
-    expect(shifted.lastReinforcementTick).toBe(reinforced.tick);
-    expect(shifted.control).toBe(5_800);
-    expect(shifted.attackerTroops).toBe(96);
+    expect(shiftedAttacker.reinforcementAmount).toBe(40);
+    expect(shiftedAttacker.lastReinforcementTick).toBe(reinforced.tick);
+    expect(shiftedAttacker.control).toBe(5_800);
+    expect(shiftedAttacker.troops).toBe(96);
     expect(reinforced.events.at(-1)?.type).toBe("reinforcement");
     expectValidHash(reinforced);
   });
@@ -80,23 +116,55 @@ describe("deterministic debug scenarios", () => {
   it("creates a control-ready battle that cannot resolve before 35 ticks", () => {
     const prepared = createDebugScenario(createGame(DEBUG_CONFIG).state, "battle-minimum");
     const battle = prepared.battles[0]!;
-    expect(battle).toMatchObject({ control: 9_900, ageTicks: 0, attackerTroops: 96 });
+    const attackerId = battle.participants.find(
+      (participant) => participant.playerId !== battle.incumbentOwner,
+    )!.playerId;
+    expect(battle).toMatchObject({ ageTicks: 0 });
+    expect(
+      battle.participants.find((participant) => participant.playerId === attackerId),
+    ).toMatchObject({
+      control: 9_900,
+      troops: 96,
+    });
+    expect(prepared.map.tiles[battle.tileId]!.structure).toMatchObject({
+      type: "turret",
+      completedCount: 3,
+      status: "active",
+    });
+    expect(
+      battlePresentation(prepared, battle).find(
+        (participant) => participant.playerId === battle.incumbentOwner,
+      ),
+    ).toMatchObject({ turretSupportCount: 3, incumbent: true });
 
     let running = cloneDeterministic(prepared);
     running.paused = false;
     running.stateHash = hashGameState(running);
     const startingTick = running.tick;
-    for (let tick = 0; tick < BALANCE.minimumBattleTicks - 1; tick += 1) {
+    running = stepGame(running);
+    expect(running.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "turret-volley",
+          sourceTileId: battle.tileId,
+          amount: 1,
+        }),
+      ]),
+    );
+    for (let tick = 1; tick < BALANCE.minimumBattleTicks - 1; tick += 1) {
       running = stepGame(running);
     }
     expect(running.tick - startingTick).toBe(34);
     expect(running.battles).toHaveLength(1);
-    expect(running.battles[0]!.control).toBe(10_000);
+    expect(
+      running.battles[0]!.participants.find((participant) => participant.playerId === attackerId)!
+        .control,
+    ).toBe(10_000);
 
     running = stepGame(running);
     expect(running.tick - startingTick).toBe(BALANCE.minimumBattleTicks);
     expect(running.battles).toHaveLength(0);
-    expect(running.map.tiles[battle.tileId]!.owner).toBe(battle.attacker);
+    expect(running.map.tiles[battle.tileId]!.owner).toBe(attackerId);
     expectValidHash(running);
   });
 
@@ -104,15 +172,20 @@ describe("deterministic debug scenarios", () => {
     const initial = createGame(DEBUG_CONFIG).state;
     const before = createDebugScenario(initial, "capture-before");
     const battle = before.battles[0]!;
+    const attackerId = battle.participants.find(
+      (participant) => participant.playerId !== battle.incumbentOwner,
+    )!.playerId;
     expect(battle.ageTicks).toBe(BALANCE.minimumBattleTicks - 1);
-    expect(battle.control).toBe(9_900);
+    expect(
+      battle.participants.find((participant) => participant.playerId === attackerId)!.control,
+    ).toBe(9_900);
 
     const advancing = cloneDeterministic(before);
     advancing.paused = false;
     advancing.stateHash = hashGameState(advancing);
     const resolved = stepGame(advancing);
     expect(resolved.battles).toHaveLength(0);
-    expect(resolved.map.tiles[battle.tileId]!.owner).toBe(battle.attacker);
+    expect(resolved.map.tiles[battle.tileId]!.owner).toBe(attackerId);
 
     const after = createDebugScenario(before, "capture");
     const capture = after.events.find((event) => event.type === "capture")!;
@@ -175,6 +248,17 @@ describe("deterministic debug scenarios", () => {
       playerId: 0,
       amount: expectedReward,
     });
+    expect(eliminated.battles).toHaveLength(1);
+    expect(
+      eliminated.battles[0]!.participants.map(({ playerId, troops }) => ({ playerId, troops })),
+    ).toEqual([
+      { playerId: 0, troops: 6 },
+      { playerId: 2, troops: 8 },
+      { playerId: 3, troops: 20 },
+    ]);
+    expect(
+      eliminated.battles[0]!.participants.every((participant) => participant.control === 5_000),
+    ).toBe(true);
     expectValidHash(eliminated);
 
     const interior = createDebugScenario(createGame(DEBUG_CONFIG).state, "interior-build");
@@ -185,8 +269,47 @@ describe("deterministic debug scenarios", () => {
     expect(
       neighbors(center).every((adjacent) => interior.map.tiles[axialKey(adjacent)]?.owner === 0),
     ).toBe(true);
+    expect(interior.enclosures).toHaveLength(1);
+    const enclosure = interior.enclosures[0]!;
+    expect(enclosure).toMatchObject({
+      captorId: 0,
+      progressTicks: BALANCE.encirclementTicks - 1,
+      tileIds: [expect.any(String)],
+    });
+    expect(enclosure.boundaryIds).toHaveLength(6);
+    expect(enclosure.boundaryIds.every((tileId) => interior.map.tiles[tileId]!.owner === 0)).toBe(
+      true,
+    );
+    const trappedId = enclosure.tileIds[0]!;
+    expect(interior.map.tiles[trappedId]).toMatchObject({
+      owner: 1,
+      troops: 6,
+      terrain: "meadow",
+      structure: {
+        type: "farm",
+        completedCount: 2,
+        pendingProgressTicks: Math.floor(BALANCE.farm.buildTicks / 2),
+      },
+    });
     expect(interior.players[0]!.supplyMilli).toBeGreaterThanOrEqual(500_000);
     expectValidHash(interior);
+
+    const completing = cloneDeterministic(interior);
+    completing.paused = false;
+    completing.stateHash = hashGameState(completing);
+    const enclosed = stepGame(completing);
+    expect(enclosed.enclosures).toHaveLength(0);
+    expect(enclosed.map.tiles[trappedId]).toMatchObject({ owner: 0, troops: 0 });
+    expect(enclosed.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "encirclement-complete",
+          playerId: 0,
+          tileIds: [trappedId],
+        }),
+      ]),
+    );
+    expectValidHash(enclosed);
   });
 
   it.each([
@@ -220,11 +343,16 @@ describe("deterministic debug scenarios", () => {
 
     controller.handle({ type: "start", config: DEBUG_CONFIG });
     controller.handle({ type: "debug-scenario", scenario: "structures" });
+    controller.handle({ type: "debug-scenario", scenario: "interior-build" });
     controller.dispose();
     expect(responses.at(-1)).toEqual(
       expect.objectContaining({
         type: "state",
-        state: expect.objectContaining({ paused: true, battles: [] }),
+        state: expect.objectContaining({
+          paused: true,
+          battles: [],
+          enclosures: [expect.objectContaining({ captorId: 0 })],
+        }),
       }),
     );
   });

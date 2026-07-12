@@ -80,7 +80,9 @@ export class AudioDirector {
     }
     const defendedByTurret = state.battles.some((battle) => {
       const structure = state.map.tiles[battle.tileId]?.structure;
-      return structure?.type === "turret" && structure.status !== "constructing";
+      return (
+        structure?.type === "turret" && structure.completedCount > 0 && structure.status !== null
+      );
     });
     if (defendedByTurret && state.tick - this.lastTurretTick >= 26) {
       this.lastTurretTick = state.tick;

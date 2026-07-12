@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   axialKey,
   aiDecisionInterval,
+  applySpawnAllocations,
+  chooseDefaultSpawnCenters,
   cloneDeterministic,
   createGame,
   decideAiCommands,
@@ -17,14 +19,24 @@ import type {
   StructureType,
   TileState,
 } from "../../src/shared/types";
+import { BALANCE } from "../../src/shared/balance";
 import { TEST_CONFIG } from "./fixtures";
 
 function makeState(difficulty: Difficulty = "normal"): GameState {
-  return createGame({
+  const state = createGame({
     ...TEST_CONFIG,
     difficulty,
     seed: `ai-scenario-${difficulty}`,
   }).state;
+  const centers = chooseDefaultSpawnCenters(
+    state.map,
+    state.players.length,
+    `${state.config.seed}:tests`,
+  );
+  applySpawnAllocations(state.map, centers, `${state.config.seed}:tests`);
+  state.config.startingCenters = centers;
+  state.phase = "running";
+  return state;
 }
 
 function landStar(state: GameState, neighborCount: number): [TileState, ...TileState[]] {
@@ -55,11 +67,16 @@ function clearBoard(state: GameState): void {
 function activeStructure(type: StructureType): NonNullable<TileState["structure"]> {
   return {
     type,
+    completedCount: 1,
     status: "active",
     integrity: 1_000,
-    progressTicks: 0,
+    pendingProgressTicks: null,
     seizedTicks: 0,
     productionPaused: false,
+    barracksProgressMilli: 0,
+    rallyTargetId: null,
+    rallyQueuedTroops: 0,
+    turretShotProgressMilli: 0,
   };
 }
 
@@ -83,7 +100,7 @@ describe("deterministic AI", () => {
   it("uses difficulty for legal decision cadence without rule-breaking bonuses", () => {
     expect(aiDecisionInterval("easy")).toBeGreaterThan(aiDecisionInterval("normal"));
     expect(aiDecisionInterval("normal")).toBeGreaterThan(aiDecisionInterval("hard"));
-    const state = createGame({ ...TEST_CONFIG, seed: "ai-legal", difficulty: "hard" }).state;
+    const state = makeState("hard");
     const supplyBefore = state.players[1]!.supplyMilli;
     const commands = decideAiCommands(state, 1);
     expect(commands.length).toBeGreaterThan(0);
@@ -183,18 +200,31 @@ describe("deterministic AI", () => {
     const battle: BattleState = {
       id: 91,
       tileId: target.id,
-      defender: 0,
-      attacker: 1,
-      defenderTroops: 18,
-      attackerTroops: 3,
-      control: 3_000,
+      incumbentOwner: 0,
+      participants: [
+        {
+          playerId: 0,
+          troops: 18,
+          control: 7_000,
+          casualtyProgressMilli: 0,
+          entryFrom: target.id,
+          joinedTick: 80,
+          lastReinforcementTick: -1,
+          reinforcementAmount: 0,
+        },
+        {
+          playerId: 1,
+          troops: 3,
+          control: 3_000,
+          casualtyProgressMilli: 0,
+          entryFrom: source.id,
+          joinedTick: 80,
+          lastReinforcementTick: -1,
+          reinforcementAmount: 0,
+        },
+      ],
       ageTicks: 20,
       roundAccumulator: 0,
-      entryFrom: source.id,
-      waiting: [],
-      lastReinforcementTick: -1,
-      reinforcementSide: null,
-      reinforcementAmount: 0,
     };
     state.battles.push(battle);
 
@@ -218,22 +248,109 @@ describe("deterministic AI", () => {
     state.battles.push({
       id: 92,
       tileId: target.id,
-      defender: 0,
-      attacker: 1,
-      defenderTroops: 3,
-      attackerTroops: 24,
-      control: 8_000,
+      incumbentOwner: 0,
+      participants: [
+        {
+          playerId: 0,
+          troops: 3,
+          control: 2_000,
+          casualtyProgressMilli: 0,
+          entryFrom: target.id,
+          joinedTick: 80,
+          lastReinforcementTick: -1,
+          reinforcementAmount: 0,
+        },
+        {
+          playerId: 1,
+          troops: 24,
+          control: 8_000,
+          casualtyProgressMilli: 0,
+          entryFrom: source.id,
+          joinedTick: 80,
+          lastReinforcementTick: state.tick,
+          reinforcementAmount: 8,
+        },
+      ],
       ageTicks: 20,
       roundAccumulator: 0,
-      entryFrom: source.id,
-      waiting: [],
-      lastReinforcementTick: state.tick,
-      reinforcementSide: "attacker",
-      reinforcementAmount: 8,
     });
 
     const moves = decideAiCommands(state, 1).filter((command) => command.type === "move");
     expect(moves).toEqual([]);
+  });
+
+  it("deliberately enters a favorable third-party battle as its own faction", () => {
+    const state = makeState("hard");
+    const [source, target] = landStar(state, 1);
+    clearBoard(state);
+    source.terrain = "plains";
+    source.owner = 1;
+    source.troops = 40;
+    target.terrain = "plains";
+    target.owner = 0;
+    target.troops = 4;
+    state.battles.push({
+      id: 93,
+      tileId: target.id,
+      incumbentOwner: 0,
+      participants: [
+        {
+          playerId: 0,
+          troops: 4,
+          control: 5_000,
+          casualtyProgressMilli: 0,
+          entryFrom: target.id,
+          joinedTick: 0,
+          lastReinforcementTick: -1,
+          reinforcementAmount: 0,
+        },
+        {
+          playerId: 2,
+          troops: 3,
+          control: 5_000,
+          casualtyProgressMilli: 0,
+          entryFrom: source.id,
+          joinedTick: 0,
+          lastReinforcementTick: -1,
+          reinforcementAmount: 0,
+        },
+      ],
+      ageTicks: 10,
+      roundAccumulator: 0,
+    });
+
+    const move = moveFrom(decideAiCommands(state, 1));
+    expect(move.destinationId).toBe(target.id);
+    expect(state.battles[0]!.participants.some((participant) => participant.playerId === 1)).toBe(
+      false,
+    );
+    expect(validateCommand(state, move).ok).toBe(true);
+  });
+
+  it("prioritizes a legal breakout from a nearly consumed enclosure", () => {
+    const state = makeState();
+    const [source, boundary] = landStar(state, 1);
+    clearBoard(state);
+    source.terrain = "plains";
+    source.owner = 1;
+    source.troops = 30;
+    boundary.terrain = "plains";
+    boundary.owner = 0;
+    boundary.troops = 3;
+    state.enclosures = [
+      {
+        id: 94,
+        captorId: 0,
+        tileIds: [source.id],
+        boundaryIds: [boundary.id],
+        progressTicks: BALANCE.encirclementTicks - 1,
+      },
+    ];
+
+    const move = moveFrom(decideAiCommands(state, 1));
+    expect(move).toMatchObject({ sourceId: source.id, destinationId: boundary.id });
+    expect(state.players[1]!.aiMode).toBe("breakout");
+    expect(validateCommand(state, move).ok).toBe(true);
   });
 
   it("defends developed territory from an adjacent threat", () => {

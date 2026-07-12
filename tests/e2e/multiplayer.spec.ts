@@ -96,12 +96,65 @@ async function waitForRunningMatch(page: Page): Promise<void> {
     () =>
       Boolean(
         window.__HEX_DOMINION__?.config.multiplayer &&
+        window.__HEX_DOMINION__?.phase === "running" &&
         window.__HEX_DOMINION__.stateHash &&
         window.__HEX_DOMINION__.tick > 0,
       ),
     undefined,
     { timeout: 45_000 },
   );
+}
+
+async function chooseAndLockRoomPlacement(page: Page): Promise<string> {
+  await expect(page.getByTestId("game-screen")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByTestId("placement-panel")).toBeVisible({ timeout: 30_000 });
+  let selected: string | null = null;
+  for (let attempt = 0; attempt < 50 && !selected; attempt += 1) {
+    const candidate = await page.evaluate(() => {
+      const api = window.__HEX_DOMINION__;
+      if (!api || api.phase !== "placement") return null;
+      const localPlayerId = api.config.localPlayerId ?? 0;
+      const byId = new Map(api.map.tiles.map((tile) => [tile.id, tile]));
+      const occupied = api.placement.placements
+        .filter((entry) => entry.playerId !== localPlayerId && entry.centerId)
+        .map((entry) => byId.get(entry.centerId!))
+        .filter(Boolean);
+      const distance = (left: { q: number; r: number }, right: { q: number; r: number }) =>
+        Math.max(
+          Math.abs(left.q - right.q),
+          Math.abs(left.r - right.r),
+          Math.abs(left.q + left.r - right.q - right.r),
+        );
+      return (
+        [api.placement.recommendedPlacementCenter, ...api.placement.selectableCandidates].find(
+          (id): id is string => {
+            if (!id) return false;
+            const center = byId.get(id)!;
+            return occupied.every((other) => other && distance(center, other) >= 6);
+          },
+        ) ?? null
+      );
+    });
+    if (!candidate) {
+      await page.waitForTimeout(100);
+      continue;
+    }
+    await page.evaluate((id) => window.__HEX_DOMINION__?.selectTile(id), candidate);
+    await page.waitForTimeout(120);
+    selected = await page.evaluate((id) => {
+      const api = window.__HEX_DOMINION__;
+      const localPlayerId = api?.config.localPlayerId ?? 0;
+      return api?.placement.placements[localPlayerId]?.centerId === id ? id : null;
+    }, candidate);
+  }
+  if (!selected) throw new Error("Could not claim a room placement center");
+  await page.getByTestId("lock-placement").click();
+  await page.waitForFunction(() => {
+    const api = window.__HEX_DOMINION__;
+    const localPlayerId = api?.config.localPlayerId ?? 0;
+    return api?.placement.placements[localPlayerId]?.locked === true;
+  });
+  return selected;
 }
 
 async function sampleClient(page: Page): Promise<ClientSample> {
@@ -261,6 +314,22 @@ test("two browser contexts synchronize commands and reconnect the same guest sea
     await expect(host.page.locator(".room-roster")).toContainText(/Guest Warden[\s\S]*READY/);
     await expect(host.page.getByTestId("start-room")).toBeEnabled({ timeout: 10_000 });
     await host.page.getByTestId("start-room").click();
+
+    await Promise.all([
+      expect(host.page.getByTestId("placement-panel")).toBeVisible({ timeout: 30_000 }),
+      expect(guest.page.getByTestId("placement-panel")).toBeVisible({ timeout: 30_000 }),
+    ]);
+    await expect(host.page.locator(".placement-roster")).toContainText("Guest Warden");
+    const hostCenter = await chooseAndLockRoomPlacement(host.page);
+    await guest.page.waitForFunction(
+      (centerId) =>
+        window.__HEX_DOMINION__?.placement.placements.some(
+          (entry) => entry.centerId === centerId && entry.locked,
+        ),
+      hostCenter,
+    );
+    const guestCenter = await chooseAndLockRoomPlacement(guest.page);
+    expect(guestCenter).not.toBe(hostCenter);
 
     await Promise.all([waitForRunningMatch(host.page), waitForRunningMatch(guest.page)]);
     const initial = await waitForAlignedClients(host.page, guest.page);

@@ -44,6 +44,7 @@ export function hashGameState(state: GameState): string {
     "graphics",
     "sound",
     "colorPatterns",
+    "fullCounts",
     "debug",
     "localPlayerId",
     "playerName",

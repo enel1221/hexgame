@@ -1,11 +1,26 @@
 import { describe, expect, it } from "vitest";
 import { BALANCE } from "../../src/shared/balance";
-import { checkAndRewardElimination, createGame, grantCaptureReward } from "../../src/core";
+import {
+  applySpawnAllocations,
+  checkAndRewardElimination,
+  chooseDefaultSpawnCenters,
+  createGame,
+  grantCaptureReward,
+} from "../../src/core";
 import type { StructureType } from "../../src/shared/types";
 import { TEST_CONFIG } from "./fixtures";
 
-function rewardState(seed: string) {
+function runningState(seed: string) {
   const state = createGame({ ...TEST_CONFIG, seed }).state;
+  const centers = chooseDefaultSpawnCenters(state.map, state.players.length, `${seed}:tests`);
+  applySpawnAllocations(state.map, centers, `${seed}:tests`);
+  state.config.startingCenters = centers;
+  state.phase = "running";
+  return state;
+}
+
+function rewardState(seed: string) {
+  const state = runningState(seed);
   const tile = state.map.tiles[state.map.spawnClusters[1]![0]!]!;
   tile.owner = 1;
   tile.controlledSinceTick = 0;
@@ -37,6 +52,15 @@ describe("capture and elimination rewards", () => {
     expect(grantCaptureReward(state, 0, tile, 1, null)).toBe(0);
   });
 
+  it("multiplies the uncapped structure bonus by every completed captured copy", () => {
+    const { state, tile } = rewardState("reward-x99");
+    const expected = BALANCE.captureRewardMilli + BALANCE.turretCaptureRewardMilli * 99;
+    expect(grantCaptureReward(state, 0, tile, 1, { type: "turret", completedCount: 99 })).toBe(
+      expected,
+    );
+    expect(state.events.at(-1)).toMatchObject({ type: "reward", amount: expected });
+  });
+
   it("prevents reward ping-pong until the full cooldown elapses", () => {
     const { state, tile } = rewardState("reward-cooldown");
     expect(grantCaptureReward(state, 0, tile, 1, null)).toBe(BALANCE.captureRewardMilli);
@@ -47,7 +71,7 @@ describe("capture and elimination rewards", () => {
   });
 
   it("attributes elimination and caps the stored-Supply transfer", () => {
-    const state = createGame({ ...TEST_CONFIG, seed: "elimination-reward" }).state;
+    const state = runningState("elimination-reward");
     for (const tileId of state.map.landIds) {
       if (state.map.tiles[tileId]!.owner === 1) state.map.tiles[tileId]!.owner = 0;
     }
@@ -67,7 +91,7 @@ describe("capture and elimination rewards", () => {
   });
 
   it("does not eliminate a ruler who still owns land", () => {
-    const state = createGame({ ...TEST_CONFIG, seed: "not-eliminated" }).state;
+    const state = runningState("not-eliminated");
     expect(checkAndRewardElimination(state, 1, 0)).toBe(0);
     expect(state.players[1]!.eliminated).toBe(false);
   });

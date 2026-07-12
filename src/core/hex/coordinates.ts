@@ -44,6 +44,13 @@ export function parseAxialKey(id: string): Axial {
   return { q: Number(match[1]), r: Number(match[2]) };
 }
 
+/** Stable numeric ordering for authoritative tile IDs; never uses host collation. */
+export function compareAxialKeys(leftId: string, rightId: string): number {
+  const left = parseAxialKey(leftId);
+  const right = parseAxialKey(rightId);
+  return left.q - right.q || left.r - right.r;
+}
+
 export function equalAxial(left: Axial, right: Axial): boolean {
   return left.q === right.q && left.r === right.r;
 }

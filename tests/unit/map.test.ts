@@ -95,7 +95,8 @@ describe.each(MAP_ARCHETYPES)("%s generation invariants", (archetype) => {
         type: "barracks",
         status: "active",
         integrity: BALANCE.fullIntegrity,
-        progressTicks: 0,
+        completedCount: 1,
+        pendingProgressTicks: null,
       });
       const nearbyMeadows = map.landIds.filter(
         (id) => map.tiles[id]!.terrain === "meadow" && distance(center, parseAxialKey(id)) <= 2,

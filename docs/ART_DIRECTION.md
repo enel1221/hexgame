@@ -96,15 +96,13 @@ The battlefield battle indicator is a designed, camera-anchored PixiJS object wi
 
 1. dark clipped frame with brass outline;
 2. inset dark track;
-3. defender-color left field;
-4. attacker-color right field;
-5. delayed reinforcement trail between ghost and main seams;
-6. bright central seam marker;
-7. side pennants in the two ruler colors;
-8. exact defender/attacker counts;
-9. reinforcement halo and temporary `+N` count.
+3. one canonical color/pattern segment per active faction;
+4. eased segment boundaries and a subtle delayed reinforcement trail;
+5. compact incumbent and Turret-support markers;
+6. exact participant counts where space permits;
+7. reinforcement halo and temporary `+N` count.
 
-New battles initialize all seams at 50/50. The main seam eases toward authoritative control; the ghost seam intentionally lags after reinforcement, making the size and direction of the impact visible. This must not be restyled as a generic HTML progress element.
+Segment targets are authoritative effective-power shares whose integer widths total exactly 10,000. A late third or fourth faction appears as its own smoothly expanding segment, never as part of a fake coalition. Small segments move detail into hover and the semantic tile inspector rather than rendering illegible labels. This must not be restyled as a generic HTML progress element.
 
 ## UI and responsive composition
 

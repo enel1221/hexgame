@@ -7,11 +7,16 @@ import type {
   StructureType,
   TileState,
 } from "../../shared/types";
-import { axialKey, distance, neighbors } from "../hex";
+import { axialKey, compareAxialKeys, distance, neighbors } from "../hex";
 import { findPath } from "../hex/pathfinding";
 import { SeededRng } from "../rng";
 import { validateCommand } from "../commands";
-import { attackerEffectivePower, defenderEffectivePower } from "../combat";
+import {
+  attackerEffectivePower,
+  battlePresentation,
+  defenderEffectivePower,
+  getBattleParticipant,
+} from "../combat";
 
 interface AiTuning {
   intervalTicks: number;
@@ -158,8 +163,21 @@ function decisionProfile(state: GameState, playerId: number, tuning: AiTuning): 
 }
 
 function battleLossDistance(battle: GameState["battles"][number], playerId: number): number {
-  // Attackers lose at 0 control; defenders lose at 10,000 control.
-  return battle.defender === playerId ? 10_000 - battle.control : battle.control;
+  return getBattleParticipant(battle, playerId)?.control ?? 0;
+}
+
+function strategicBattlePower(
+  state: GameState,
+  battle: GameState["battles"][number],
+  playerId: number | null,
+): number {
+  const presentation = battlePresentation(state, battle).find(
+    (participant) => participant.playerId === playerId,
+  );
+  if (!presentation) return 0;
+  // Adjacent support causes real casualties instead of virtual soldiers. This
+  // small heuristic premium lets AI account for it without altering rules.
+  return presentation.effectivePower + presentation.turretSupportCount * 500;
 }
 
 function chooseReinforcement(
@@ -174,19 +192,21 @@ function chooseReinforcement(
         ? tuning.intervalTicks * 2
         : tuning.intervalTicks;
   const battles = state.battles
-    .filter((battle) => battle.attacker === playerId || battle.defender === playerId)
-    .filter((battle) => state.tick - battle.lastReinforcementTick >= reactionGapTicks)
+    .filter((battle) => getBattleParticipant(battle, playerId))
     .filter((battle) => {
-      const tile = state.map.tiles[battle.tileId]!;
-      const isDefender = battle.defender === playerId;
-      const ownPower = isDefender
-        ? defenderEffectivePower(tile, battle.defenderTroops)
-        : attackerEffectivePower(battle.attackerTroops);
-      const enemyPower = isDefender
-        ? attackerEffectivePower(battle.attackerTroops)
-        : defenderEffectivePower(tile, battle.defenderTroops);
-      const losingControl = isDefender ? battle.control >= 5_500 : battle.control <= 4_500;
-      return ownPower <= enemyPower || losingControl;
+      const participant = getBattleParticipant(battle, playerId)!;
+      return state.tick - participant.lastReinforcementTick >= reactionGapTicks;
+    })
+    .filter((battle) => {
+      const participant = getBattleParticipant(battle, playerId)!;
+      const ownPower = strategicBattlePower(state, battle, playerId);
+      const strongestEnemy = Math.max(
+        0,
+        ...battle.participants
+          .filter((candidate) => candidate.playerId !== playerId)
+          .map((candidate) => strategicBattlePower(state, battle, candidate.playerId)),
+      );
+      return ownPower <= strongestEnemy || participant.control <= 4_500;
     })
     .sort((left, right) => {
       const leftUrgency = battleLossDistance(left, playerId);
@@ -197,7 +217,7 @@ function chooseReinforcement(
 
   const sources = ownedTiles(state, playerId)
     .filter((tile) => tile.troops > tuning.reserveTroops + 1)
-    .sort((left, right) => right.troops - left.troops || left.id.localeCompare(right.id))
+    .sort((left, right) => right.troops - left.troops || compareAxialKeys(left.id, right.id))
     .slice(0, tuning.candidateLimit);
 
   for (const battle of battles) {
@@ -208,13 +228,21 @@ function chooseReinforcement(
       if (!path) continue;
       const percent: SendPercent = source.troops >= 12 ? 50 : 75;
       const sent = movingTroopsForPercent(source.troops, percent);
-      const isDefender = battle.defender === playerId;
-      const projectedPower = isDefender
-        ? defenderEffectivePower(target, battle.defenderTroops + sent)
-        : attackerEffectivePower(battle.attackerTroops + sent);
-      const enemyPower = isDefender
-        ? attackerEffectivePower(battle.attackerTroops)
-        : defenderEffectivePower(target, battle.defenderTroops);
+      const participant = getBattleParticipant(battle, playerId)!;
+      const projectedOrganicPower =
+        participant.playerId === battle.incumbentOwner
+          ? defenderEffectivePower(target, participant.troops + sent)
+          : attackerEffectivePower(participant.troops + sent);
+      const ownSupport =
+        battlePresentation(state, battle).find((entry) => entry.playerId === playerId)
+          ?.turretSupportCount ?? 0;
+      const projectedPower = projectedOrganicPower + ownSupport * 500;
+      const enemyPower = Math.max(
+        0,
+        ...battle.participants
+          .filter((candidate) => candidate.playerId !== playerId)
+          .map((candidate) => strategicBattlePower(state, battle, candidate.playerId)),
+      );
       // Do not drain the realm into a battle a single reinforcement cannot
       // plausibly recover. Hard accepts a riskier rescue than Easy.
       const recoveryPermille =
@@ -250,13 +278,13 @@ function chooseDevelopedTileDefense(
     .sort(
       (left, right) =>
         right.threat - right.tile.troops - (left.threat - left.tile.troops) ||
-        left.tile.id.localeCompare(right.tile.id),
+        compareAxialKeys(left.tile.id, right.tile.id),
     );
   if (threatened.length === 0) return null;
 
   const sources = ownedTiles(state, playerId)
     .filter((tile) => tile.troops > tuning.reserveTroops + 2)
-    .sort((left, right) => right.troops - left.troops || left.id.localeCompare(right.id))
+    .sort((left, right) => right.troops - left.troops || compareAxialKeys(left.id, right.id))
     .slice(0, tuning.candidateLimit);
   for (const target of threatened) {
     for (const source of sources) {
@@ -269,6 +297,88 @@ function chooseDevelopedTileDefense(
         percent: 50,
       };
       if (validateCommand(state, command).ok) return command;
+    }
+  }
+  return null;
+}
+
+interface EnclosureDecision {
+  command: GameCommand;
+  mode: "breakout" | "encircle";
+}
+
+function chooseEnclosureResponse(
+  state: GameState,
+  playerId: number,
+  tuning: AiDecisionProfile,
+): EnclosureDecision | null {
+  const trapped = state.enclosures
+    .filter((enclosure) =>
+      enclosure.tileIds.some((tileId) => state.map.tiles[tileId]?.owner === playerId),
+    )
+    .sort(
+      (left, right) =>
+        right.progressTicks - left.progressTicks ||
+        left.captorId - right.captorId ||
+        left.id - right.id,
+    );
+  for (const enclosure of trapped) {
+    const pocket = new Set(enclosure.tileIds);
+    const sources = ownedTiles(state, playerId)
+      .filter((tile) => pocket.has(tile.id) && tile.troops > tuning.reserveTroops + 1)
+      .sort((left, right) => right.troops - left.troops || compareAxialKeys(left.id, right.id))
+      .slice(0, tuning.candidateLimit);
+    const targets = enclosure.boundaryIds
+      .map((tileId) => state.map.tiles[tileId])
+      .filter((tile): tile is TileState => Boolean(tile))
+      .sort((left, right) => left.troops - right.troops || compareAxialKeys(left.id, right.id));
+    for (const source of sources) {
+      for (const target of targets) {
+        const command: GameCommand = {
+          type: "move",
+          playerId,
+          sourceId: source.id,
+          destinationId: target.id,
+          percent: tuning.sendPercent,
+        };
+        if (validateCommand(state, command).ok) return { command, mode: "breakout" };
+      }
+    }
+  }
+
+  const closing = state.enclosures
+    .filter(
+      (enclosure) =>
+        enclosure.captorId === playerId &&
+        enclosure.progressTicks * 3 >= BALANCE.encirclementTicks * 2,
+    )
+    .sort((left, right) => right.progressTicks - left.progressTicks || left.id - right.id);
+  for (const enclosure of closing) {
+    const boundary = enclosure.boundaryIds
+      .map((tileId) => state.map.tiles[tileId])
+      .filter(
+        (tile): tile is TileState =>
+          Boolean(tile) &&
+          tile!.owner === playerId &&
+          !state.battles.some((battle) => battle.tileId === tile!.id),
+      )
+      .sort((left, right) => left.troops - right.troops || compareAxialKeys(left.id, right.id));
+    const sources = ownedTiles(state, playerId)
+      .filter((tile) => tile.troops > tuning.reserveTroops + 3)
+      .sort((left, right) => right.troops - left.troops || compareAxialKeys(left.id, right.id))
+      .slice(0, tuning.candidateLimit);
+    for (const target of boundary.slice(0, 6)) {
+      for (const source of sources) {
+        if (source.id === target.id || source.troops <= target.troops + 2) continue;
+        const command: GameCommand = {
+          type: "move",
+          playerId,
+          sourceId: source.id,
+          destinationId: target.id,
+          percent: 50,
+        };
+        if (validateCommand(state, command).ok) return { command, mode: "encircle" };
+      }
     }
   }
   return null;
@@ -291,9 +401,9 @@ function targetValue(
   if (target.terrain === "meadow") score += 140;
   else if (target.terrain === "muster") score += 175;
   else if (target.terrain === "hills") score += 35;
-  if (target.structure?.type === "farm") score += 180;
-  else if (target.structure?.type === "barracks") score += 280;
-  else if (target.structure?.type === "turret") score += 120;
+  if (target.structure?.type === "farm") score += 180 * target.structure.completedCount;
+  else if (target.structure?.type === "barracks") score += 280 * target.structure.completedCount;
+  else if (target.structure?.type === "turret") score += 120 * target.structure.completedCount;
   if (target.owner !== null) {
     const opponent = state.players[target.owner];
     if (opponent?.tileCount === 1) score += 800;
@@ -369,7 +479,7 @@ function chooseAttackOrExpansion(
         !excludedSources.has(tile.id) &&
         isFrontier(state, tile, playerId),
     )
-    .sort((left, right) => right.troops - left.troops || left.id.localeCompare(right.id))
+    .sort((left, right) => right.troops - left.troops || compareAxialKeys(left.id, right.id))
     .slice(0, tuning.candidateLimit);
   const focusOpponentId = chooseFocusOpponent(state, playerId, sources);
   const choices: AttackChoice[] = [];
@@ -379,18 +489,26 @@ function chooseAttackOrExpansion(
     if (sent <= 0) continue;
     for (const target of adjacentTiles(state, source)) {
       if (target.owner === playerId) continue;
-      // Reinforcement policy owns contested tiles. Treating an active battle
-      // as a fresh attack would bypass its urgency and reaction-gap checks.
-      if (state.battles.some((battle) => battle.tileId === target.id)) continue;
-      const requiredPower = Math.floor(
-        (defenderEffectivePower(target, target.troops) * tuning.attackRatioPermille) / 1000,
-      );
+      const battle = state.battles.find((candidate) => candidate.tileId === target.id);
+      // Existing participants are owned by reinforcement policy. A new faction
+      // may deliberately enter a favorable free-for-all immediately.
+      if (battle && getBattleParticipant(battle, playerId)) continue;
+      const defenderPower = battle
+        ? Math.max(
+            0,
+            ...battle.participants.map((participant) =>
+              strategicBattlePower(state, battle, participant.playerId),
+            ),
+          )
+        : defenderEffectivePower(target, target.troops);
+      const requiredPower = Math.floor((defenderPower * tuning.attackRatioPermille) / 1000);
       if (sent * 1000 < requiredPower) continue;
       choices.push({
         source,
         target,
         score:
           targetValue(state, playerId, target, tuning.pressureLevel, focusOpponentId) +
+          (battle ? 220 + battle.participants.length * 45 : 0) +
           Math.min(180, (sent - target.troops) * 20) +
           rng.int(tuning.jitter + 1),
       });
@@ -400,8 +518,8 @@ function chooseAttackOrExpansion(
   choices.sort(
     (left, right) =>
       right.score - left.score ||
-      left.target.id.localeCompare(right.target.id) ||
-      left.source.id.localeCompare(right.source.id),
+      compareAxialKeys(left.target.id, right.target.id) ||
+      compareAxialKeys(left.source.id, right.source.id),
   );
   const choice = choices[0];
   if (!choice) return null;
@@ -432,13 +550,13 @@ function chooseMobilization(
       (tile) =>
         !isFrontier(state, tile, playerId) && tile.troops > Math.max(5, tuning.reserveTroops + 2),
     )
-    .sort((left, right) => right.troops - left.troops || left.id.localeCompare(right.id))
+    .sort((left, right) => right.troops - left.troops || compareAxialKeys(left.id, right.id))
     .slice(0, tuning.candidateLimit);
 
   for (const source of sources) {
     const targets = [...frontier].sort(
       (left, right) =>
-        distance(source, left) - distance(source, right) || left.id.localeCompare(right.id),
+        distance(source, left) - distance(source, right) || compareAxialKeys(left.id, right.id),
     );
     for (const target of targets.slice(0, 5)) {
       const command: GameCommand = {
@@ -455,7 +573,20 @@ function chooseMobilization(
 }
 
 function countStructures(state: GameState, playerId: number, type: StructureType): number {
-  return ownedTiles(state, playerId).filter((tile) => tile.structure?.type === type).length;
+  return ownedTiles(state, playerId).reduce(
+    (count, tile) => count + (tile.structure?.type === type ? tile.structure.completedCount : 0),
+    0,
+  );
+}
+
+function canDevelopAs(tile: TileState, type: StructureType): boolean {
+  if (!tile.structure) return true;
+  return (
+    tile.structure.type === type &&
+    tile.structure.pendingProgressTicks === null &&
+    tile.structure.completedCount < BALANCE.maxStructureCount &&
+    tile.structure.status !== "seized"
+  );
 }
 
 function chooseBuild(state: GameState, playerId: number): GameCommand | null {
@@ -472,19 +603,22 @@ function chooseBuild(state: GameState, playerId: number): GameCommand | null {
     {
       type: "farm",
       desired: farms < desiredFarms && player.supplyMilli >= BALANCE.farm.costMilli + 10_000,
-      tiles: owned.filter((tile) => tile.terrain === "meadow" && !tile.structure),
+      tiles: owned.filter((tile) => tile.terrain === "meadow" && canDevelopAs(tile, "farm")),
     },
     {
       type: "barracks",
       desired:
         barracks < desiredBarracks && player.supplyMilli >= BALANCE.barracks.costMilli + 15_000,
-      tiles: owned.filter((tile) => tile.terrain === "muster" && !tile.structure),
+      tiles: owned.filter((tile) => tile.terrain === "muster" && canDevelopAs(tile, "barracks")),
     },
     {
       type: "turret",
       desired: turrets < desiredTurrets && player.supplyMilli >= BALANCE.turret.costMilli + 20_000,
       tiles: owned.filter(
-        (tile) => !tile.structure && isFrontier(state, tile, playerId) && tile.terrain !== "meadow",
+        (tile) =>
+          canDevelopAs(tile, "turret") &&
+          isFrontier(state, tile, playerId) &&
+          tile.terrain !== "meadow",
       ),
     },
   ];
@@ -492,13 +626,15 @@ function chooseBuild(state: GameState, playerId: number): GameCommand | null {
   for (const option of options) {
     if (!option.desired) continue;
     option.tiles.sort((left, right) => {
+      const spreadDifference = Number(Boolean(left.structure)) - Number(Boolean(right.structure));
+      if (spreadDifference !== 0) return spreadDifference;
       const leftThreat = adjacentTiles(state, left).filter(
         (tile) => tile.owner !== null && tile.owner !== playerId,
       ).length;
       const rightThreat = adjacentTiles(state, right).filter(
         (tile) => tile.owner !== null && tile.owner !== playerId,
       ).length;
-      return rightThreat - leftThreat || left.id.localeCompare(right.id);
+      return rightThreat - leftThreat || compareAxialKeys(left.id, right.id);
     });
     for (const tile of option.tiles) {
       const command: GameCommand = {
@@ -532,15 +668,18 @@ export function decideAiCommands(state: GameState, playerId: number): GameComman
     (state.tick + player.id * 7) / AI_TUNING[state.config.difficulty].intervalTicks,
   );
 
-  const reinforce = chooseReinforcement(state, playerId, tuning);
-  const defend = reinforce ? null : chooseDevelopedTileDefense(state, playerId, tuning);
+  const enclosure = chooseEnclosureResponse(state, playerId, tuning);
+  const reinforce = enclosure ? null : chooseReinforcement(state, playerId, tuning);
+  const defend =
+    reinforce || enclosure ? null : chooseDevelopedTileDefense(state, playerId, tuning);
   // Periodic logistics prevents productive interior Barracks from becoming
   // stranded while a bot keeps finding small attacks on a distant front.
   const mobilize =
-    !reinforce && !defend && decisionNumber % 4 === 0
+    !enclosure && !reinforce && !defend && decisionNumber % 4 === 0
       ? chooseMobilization(state, playerId, tuning)
       : null;
   const move =
+    enclosure?.command ??
     reinforce ??
     defend ??
     mobilize ??
@@ -548,8 +687,9 @@ export function decideAiCommands(state: GameState, playerId: number): GameComman
     chooseMobilization(state, playerId, tuning);
   if (move) {
     output.push(move);
-    player.aiMode =
-      reinforce || move.type !== "move"
+    player.aiMode = enclosure
+      ? enclosure.mode
+      : reinforce || move.type !== "move"
         ? "reinforce"
         : defend
           ? "defend"

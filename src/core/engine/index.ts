@@ -9,10 +9,19 @@ import type {
 import { collectAiCommands } from "../ai";
 import { applyCommand, type CommandResult } from "../commands";
 import { tickCombat } from "../combat";
+import { tickEncirclements } from "../encirclement";
 import { tickEconomy } from "../economy";
 import { cloneDeterministic, hashGameState } from "../hash";
-import { generateMap } from "../map";
+import { generateNeutralMap } from "../map";
 import { tickMovement } from "../movement";
+import {
+  beginMatch as beginPlacementMatch,
+  createPlacementState,
+  evaluatePlacement,
+  finalizePlacements,
+  finalizePlacementVector,
+  initializeAiPlacements,
+} from "../placement";
 import { hashSeed } from "../rng";
 import { tickStructures } from "../buildings";
 import { tickVictory } from "../victory";
@@ -100,12 +109,10 @@ export function refreshPlayerAggregates(state: GameState): void {
     if (state.players[stack.owner]) troops[stack.owner] += stack.troops;
   }
   for (const battle of state.battles) {
-    if (state.players[battle.attacker]) troops[battle.attacker] += battle.attackerTroops;
-    if (battle.defender !== null && state.players[battle.defender]) {
-      troops[battle.defender] += battle.defenderTroops;
-    }
-    for (const waiting of battle.waiting) {
-      if (state.players[waiting.owner]) troops[waiting.owner] += waiting.troops;
+    for (const participant of battle.participants) {
+      if (participant.playerId !== null && state.players[participant.playerId]) {
+        troops[participant.playerId] += participant.troops;
+      }
     }
   }
   for (const player of state.players) {
@@ -148,25 +155,44 @@ export function createInitialState(config: MatchConfig): GameState {
     ...config,
     ...(config.multiplayer ? { humanSeats: sortedHumanSeats } : {}),
   });
-  const map = generateMap({ seed: config.seed, archetype: config.archetype, totalPlayers });
+  const map = generateNeutralMap({ seed: config.seed, archetype: config.archetype, totalPlayers });
   const humanSeatSet = new Set(sortedHumanSeats);
   const players = Array.from({ length: totalPlayers }, (_, id) =>
     emptyPlayer(normalizedConfig, id, humanSeatSet),
   );
   const state: GameState = {
-    version: 1,
+    version: 2,
     config: normalizedConfig,
+    phase: "placement",
+    placement: createPlacementState(normalizedConfig, players),
     tick: 0,
     map,
     players,
     stacks: [],
     battles: [],
+    enclosures: [],
     events: [],
     nextEntityId: 1,
     victory: { leaderId: null, holdTicks: 0, winnerId: null, reason: null },
     stateHash: "",
     paused: false,
   };
+  if (config.startingCenters) {
+    if (config.startingCenters.length !== players.length) {
+      throw new Error("startingCenters must contain one center per participant");
+    }
+    state.placement.placements = config.startingCenters.map((centerId, playerId) => ({
+      playerId,
+      centerId,
+      locked: true,
+      relocationCount: 0,
+      aiTargetRelocations: 0,
+      nextAiActionTick: null,
+    }));
+    finalizePlacements(state);
+  } else {
+    initializeAiPlacements(state);
+  }
   refreshPlayerAggregates(state);
   state.stateHash = hashGameState(state);
   return state;
@@ -188,7 +214,34 @@ export function advanceGameState(
   commands: readonly GameCommand[] = [],
   hooks: TickHooks = {},
 ): AdvanceResult {
-  if (state.paused || state.victory.winnerId !== null) {
+  if (state.phase === "complete" || state.victory.winnerId !== null) {
+    state.stateHash = hashGameState(state);
+    return { state, acceptedCommands: [] };
+  }
+
+  if (state.phase === "opening") {
+    state.stateHash = hashGameState(state);
+    return { state, acceptedCommands: [] };
+  }
+
+  if (state.phase === "placement") {
+    state.placement.elapsedTicks += 1;
+    const acceptedCommands: GameCommand[] = [];
+    for (const command of commands) {
+      if (
+        command.scheduledTick !== undefined &&
+        command.scheduledTick > state.placement.elapsedTicks
+      ) {
+        continue;
+      }
+      if (applyCommand(state, command).ok) acceptedCommands.push(command);
+    }
+    evaluatePlacement(state);
+    state.stateHash = hashGameState(state);
+    return { state, acceptedCommands };
+  }
+
+  if (state.paused) {
     state.stateHash = hashGameState(state);
     return { state, acceptedCommands: [] };
   }
@@ -205,10 +258,12 @@ export function advanceGameState(
   hooks.afterAi?.();
   tickMovement(state);
   tickCombat(state);
+  tickEncirclements(state);
   tickStructures(state);
   tickEconomy(state);
   refreshPlayerAggregates(state);
   tickVictory(state);
+  if (state.victory.winnerId !== null) state.phase = "complete";
   state.stateHash = hashGameState(state);
   return { state, acceptedCommands };
 }
@@ -260,14 +315,26 @@ export class GameEngine {
     if (requestedTick !== undefined && !Number.isInteger(requestedTick)) {
       return { ok: false, reason: "scheduledTick must be an integer" };
     }
-    const scheduledTick = Math.max(this.current.tick + 1, requestedTick ?? this.current.tick + 1);
+    const clockTick =
+      this.current.phase === "placement" ? this.current.placement.elapsedTicks : this.current.tick;
+    const scheduledTick = Math.max(clockTick + 1, requestedTick ?? clockTick + 1);
     this.pendingCommands.push({ ...cloneDeterministic(command), scheduledTick });
     return { ok: true };
   }
 
   tick(hooks: TickHooks = {}): GameState {
-    if (this.current.paused || this.current.victory.winnerId !== null) return this.current;
-    const targetTick = this.current.tick + 1;
+    if (
+      this.current.phase === "complete" ||
+      this.current.phase === "opening" ||
+      this.current.victory.winnerId !== null ||
+      (this.current.phase === "running" && this.current.paused)
+    ) {
+      return this.current;
+    }
+    const targetTick =
+      this.current.phase === "placement"
+        ? this.current.placement.elapsedTicks + 1
+        : this.current.tick + 1;
     const due: GameCommand[] = [];
     for (let index = this.pendingCommands.length - 1; index >= 0; index -= 1) {
       const command = this.pendingCommands[index]!;
@@ -289,8 +356,21 @@ export class GameEngine {
   }
 
   setPaused(paused: boolean): void {
+    if (this.current.phase !== "running") return;
     this.current.paused = paused;
     this.current.stateHash = hashGameState(this.current);
+  }
+
+  beginMatch(): CommandResult {
+    const result = beginPlacementMatch(this.current);
+    this.current.stateHash = hashGameState(this.current);
+    return result;
+  }
+
+  finalizePlacement(centers: readonly string[]): CommandResult {
+    const result = finalizePlacementVector(this.current, centers);
+    this.current.stateHash = hashGameState(this.current);
+    return result;
   }
 
   exportSnapshot(): EngineSnapshot {
@@ -331,7 +411,16 @@ export function replayCommands(
   throughTick: number,
 ): GameState {
   const engine = createGame(config);
-  for (const command of commands) engine.submitCommand(command);
+  if (engine.state.phase === "opening") engine.beginMatch();
+  for (const command of commands) {
+    if (
+      config.startingCenters &&
+      (command.type === "choose-spawn" || command.type === "lock-spawn")
+    ) {
+      continue;
+    }
+    engine.submitCommand(command);
+  }
   engine.step(throughTick);
   return engine.state;
 }

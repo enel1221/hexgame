@@ -24,18 +24,21 @@ flowchart LR
 
 ## Fixed-step simulation
 
-The simulation rate is ten ticks per second (`TICKS_PER_SECOND = 10`). A tick executes in a stable order:
+The simulation rate is ten ticks per second (`TICKS_PER_SECOND = 10`). Placement has its own deterministic `elapsedTicks` clock while the ordinary match tick remains 0. During that pre-match phase only spawn claims, locks, deterministic AI relocations, and timeout allocation may change authoritative state; economy, movement, construction, combat, AI gameplay, victory, and the ordinary simulation tick do not advance. The presentation-only opening handoff leaves the state in `opening` until the client has focused the local center and shown the center-then-ring claim animation.
+
+Once the phase is `running`, a tick executes in a stable order:
 
 1. increment the integer tick;
 2. apply due player commands in submission/relay order;
 3. evaluate due deterministic AI rulers and apply their legal commands;
 4. advance moving stacks;
-5. advance battles;
-6. advance construction, repair, and Barracks training;
-7. settle economy when the tick reaches a whole simulation second;
-8. refresh player tile/troop aggregates;
-9. evaluate victory;
-10. compute the stable state hash.
+5. advance N-faction battles and collect/apply aggregate Turret volleys from a pre-application snapshot;
+6. detect, advance, reset, or complete encirclements;
+7. advance construction, repair, and aggregate Barracks training/rally dispatch;
+8. settle economy when the tick reaches a whole simulation second;
+9. refresh player tile/troop/structure aggregates;
+10. evaluate victory;
+11. compute the stable state hash.
 
 Pause prevents the tick from advancing. The 1x, 2x, and 4x controls change only how frequently the Worker requests ticks; movement, construction, economy, combat, AI, and victory all continue to use tick counts.
 
@@ -43,11 +46,13 @@ The Worker timer is a scheduling mechanism, not a rules input. Core code does no
 
 ## Commands and validation
 
-The shared `GameCommand` union contains move, build, cancel-build, and toggle-Barracks commands. Human UI, AI, replay, and multiplayer all pass through `validateCommand`/`applyCommand`.
+The shared `GameCommand` union contains spawn choice/lock, move, atomic multi-move, build/add-copy, cancel-build, toggle-Barracks, and set/clear-rally commands. Human UI, AI, replay, and multiplayer all pass through `validateCommand`/`applyCommand`.
 
 A `GameEngine` schedules submitted commands no earlier than the next tick. Multiplayer can supply a future `scheduledTick`; the room relay replaces client timing with its ordered target tick. Invalid commands do not mutate state. Accepted commands enter `commandHistory`, which supports deterministic replay from a matching configuration.
 
-Movement paths may cross owned land and make at most one final hostile step. A route cut during travel is recalculated from the current owned tile; if no legal route remains, the stack returns to its last owned position.
+Movement paths may cross owned land and make at most one final hostile step. A route cut during travel is recalculated from the current owned tile; if no legal route remains, the stack returns to its last owned position. Multi-move validation uses the same pure planner as the UI preview: it canonicalizes at most 64 sources and 16 destinations, computes all contributions, equal destination quotas, paths, and a bounded minimum-cost allocation from one pre-mutation state, and mutates nothing unless the complete plan is feasible. One multi-move remains one scheduled command and one history entry even when its plan creates several aggregate moving stacks.
+
+Barracks rally validation uses the ordinary movement reachability rule. One stack has one retained destination. A completed cycle produces one affordable aggregate batch, dispatches only newly trained troops, and marks a retained rally blocked when no current legal route exists.
 
 ## Determinism
 
@@ -56,22 +61,24 @@ The deterministic contract is:
 - integer ticks and fixed-point Supply (`1 Supply = 1,000 milli-Supply`);
 - JSON-compatible state with no class instances inside snapshots;
 - xmur3 string hashing plus a Mulberry32-style integer PRNG in `src/core/rng.ts`;
-- seed-derived streams for map generation, decoration, spawn troop distribution, and each AI ruler;
+- seed-derived streams for map generation, decoration, spawn eligibility, spawn troop distribution, deterministic AI placement, and each gameplay AI ruler;
 - no `Math.random()` in deterministic modules;
 - lexicographically sorted object keys before hashing;
 - a two-lane, 16-hex-character state hash;
-- no graphics, sound, color-pattern, or debug preferences in the rules hash;
+- no graphics, sound, color-pattern, full-count, local-seat, player-name, or debug preferences in the rules hash;
 - no wall-clock, browser layout, or renderer interpolation in rules decisions.
 
-Map generation retries with `seed:map-retry:<attempt>` and accepts only a fairness report that satisfies connectivity, terrain, spawn-cluster, distance, and expansion checks. The requested seed remains the public map seed; `generationAttempt` records which deterministic retry succeeded.
+Map generation retries with `seed:map-retry:<attempt>` and accepts only a fairness report that satisfies connectivity and terrain distribution checks. Bot seats are reserved from one seed-derived vector shared by the core and relay, so their two/three visible relocations can finish and lock without depending on human or reconnect timing. The faint placement overlay cheaply previews centers with a complete padded footprint, no current/reserved collision, and exact nearest-distance balance whenever every other seat is already fixed. Authoritative selection then uses the shared bounded projection: human choices and reserved bot seats remain fixed, missing human seats choose a distance-balanced farthest completion, and a seeded rank breaks only exact ties. The core applies that vector to a cloned neutral map and runs the complete fairness report before it accepts the choice or finalizes. Terrain swaps that guarantee two nearby Meadows and one Muster Ground therefore happen deterministically only after a valid canonical center set is known. The requested seed remains the public map seed; `generationAttempt` records which deterministic retry succeeded, and `config.startingCenters` records the immutable final placement input.
 
 ## State snapshots and resume
 
-`EngineSnapshot` contains a versioned `GameState`, accepted command history, and commands that the Worker accepted but scheduled after the snapshot tick. Export and import deep-clone through the same JSON-compatible representation and recompute the state hash. A restored Worker therefore continues from the stored tick without dropping an order that was still pending.
+`EngineSnapshot` contains a versioned `GameState`, accepted command history, and commands that the Worker accepted but scheduled after the snapshot tick. Export and import deep-clone through the same JSON-compatible representation and recompute the state hash. A restored Worker therefore continues from the stored placement/match tick without dropping an order that was still pending.
 
-Single-player requests and writes the complete Worker snapshot every 150 ticks (15 simulation seconds) and immediately after entering pause. Resume validates the complete versioned shape, cross-references, participant/entity bounds, command payloads, and stored deterministic hash. Invalid JSON, tampered data, and malformed version-1 saves are removed with a recoverable message rather than replacing the live engine.
+Version 2 stores aggregate structure stacks, battle participants, placement state, and encirclement records. The parser still strictly validates and hash-checks a valid version-1 snapshot before migrating it: a completed legacy structure becomes count 1, a constructing structure becomes one pending copy, and a legacy binary battle becomes a canonical participant array. Migration never silently drops a malformed save.
 
-In multiplayer, the host periodically publishes a size-bounded JSON checkpoint tagged with the latest applied relay sequence. Checkpoints intentionally clear `pendingCommands`: commands after that applied sequence remain owned by the ordered relay log and would otherwise be applied twice. A reconnect restores the checkpoint, deduplicates and queues subsequent relay commands, requests additional pages when necessary, then tells the Worker to catch up to `serverTick` (or the recorded final tick) before normal real-time ticking continues. See [MULTIPLAYER.md](MULTIPLAYER.md).
+Single-player requests and writes the complete Worker snapshot every 150 ticks (15 simulation seconds) and immediately after entering pause. Resume validates the complete versioned shape, cross-references, participant/entity bounds, command payloads, and stored deterministic hash. Invalid JSON, tampered data, and malformed saves are removed with a recoverable message rather than replacing the live engine.
+
+In multiplayer, the host periodically publishes a size-bounded checkpoint tagged with the latest applied relay sequence. Plain JSON remains readable for backward compatibility; version-2 clients gzip and base64-encode the envelope so a 21-player map fits the relay limit. Checkpoints intentionally clear `pendingCommands`: commands after that applied sequence remain owned by the ordered relay log and would otherwise be applied twice. The relay rejects a checkpoint whose tick has already passed any command excluded by its sequence, so the restore base can never strand an uncovered order. A reconnect decodes and strictly validates the checkpoint, deduplicates and queues subsequent relay commands, requests additional pages when necessary, then tells the Worker to catch up to `serverTick` (or the recorded final tick) before normal real-time ticking continues. See [MULTIPLAYER.md](MULTIPLAYER.md).
 
 ## Debug acceptance fixtures
 
@@ -85,11 +92,13 @@ The Worker sends authoritative state at tick boundaries. Rendering fills the 100
 - PixiJS derives a smoothstep position between adjacent axial tile centers;
 - the visible stack container eases toward each new target position;
 - soldier limbs use frame-time animation only for presentation;
-- battle state exposes exact attacker/defender counts and integer control from 0–10,000;
-- the battle bar maintains `actual`, an eased main seam, and a slower delayed ghost seam for reinforcement impact;
+- battle state exposes one canonical participant per active faction, exact counts, and integer control shares totaling 10,000;
+- the battle bar eases one color/pattern segment per participant and keeps late entrants/reinforcements visually readable without inventing a coalition;
 - battle presentation adds paired fighters, strike animation, particles, and a brief bright impact segment without changing combat state;
 - ownership changes create a directional edge-wipe before the displayed border/tint commits;
 - capture and reward events create short world-space labels over the affected tile.
+- placement footprints, locks, rally paths, Multi rings/numbered targets/route fans, Turret support, and enclosure perimeters are presentation layers over authoritative state;
+- x2–x99 structure badges and aggregate volley effects never create one retained object or projectile per copy.
 
 Static terrain geometry is drawn when a map first arrives. Ownership is retained and redrawn only when a capture wipe completes instead of on every state tick. Labels, structures, stacks, and battles are updated in retained PixiJS layers. HUD panels remain semantic HTML/CSS for accessibility and responsive layout.
 
@@ -99,7 +108,7 @@ If the browser loses its WebGL context, the renderer prevents permanent disposal
 
 AI uses the same legal command path as the human. Difficulty changes decision interval, candidate cap, reserve, attack-confidence threshold, send percentage, and seeded score jitter; it does not change economy or combat rules.
 
-Evaluation is staggered by player ID: `(tick + playerId * 7) % interval === 0`. Easy, Normal, and Hard evaluate every 30, 20, and 10 ticks respectively. Candidate sets are capped at 14, 28, and 48. Each due ruler considers reinforcement first, then expansion/attack, then interior mobilization, and separately evaluates development. This staggering and pruning bound the 20-AI case without making decisions depend on available CPU time.
+Evaluation is staggered by player ID: `(tick + playerId * 7) % interval === 0`. Easy, Normal, and Hard evaluate every 30, 20, and 10 ticks respectively. Candidate sets are capped at 14, 28, and 48. Each due ruler considers participant-aware reinforcement and favorable third-party entry, enclosure breakout/ring defense, expansion/attack, interior mobilization, rallying, and development. Structure evaluation counts completed copies while preferring useful geographic spread before extreme stacks. This staggering and pruning bound the 20-AI case without making decisions depend on available CPU time.
 
 ## Performance approach
 
@@ -109,6 +118,7 @@ Evaluation is staggered by player ID: `(tick + playerId * 7) % interval === 0`. 
 - Garrison, structure, stack, and battle objects are reused by stable IDs and destroyed when no longer present.
 - Repeated troop labels use `BitmapText`.
 - A moving stack renders only 3–6 representative soldiers regardless of troop count.
+- A tile keeps one aggregate structure object through x99; a Barracks cycle creates at most one batch, and a Turret stack keeps one shot accumulator and at most one volley effect.
 - Low zoom hides non-border garrison labels unless selected.
 - Graphics quality changes deterministic decorative density, not game information.
 - State events are capped at the most recent 24.
@@ -118,6 +128,6 @@ Evaluation is staggered by player ID: `(tick + playerId * 7) % interval === 0`. 
 
 ## Multiplayer boundary
 
-The Durable Object orders commands and persists compact recovery data, but every browser runs the deterministic core. Applied relay-sequence tracking, checkpoint restoration, and Worker catch-up keep reconnects aligned without making the edge service run ticks. Each multiplayer Worker retains a base plus four recent 50-tick rollback points: if a relay batch arrives after its authoritative target tick was already published, the Worker restores the latest pre-target point, inserts accepted and pending commands in relay receipt order, and deterministically replays to its prior tick. This prevents independent browser timer phases from silently clamping the same order to different ticks.
+The Durable Object orders commands and persists compact recovery data, but every browser runs the deterministic core. Applied relay-sequence tracking, checkpoint restoration, and Worker catch-up keep reconnects aligned without making the edge service run ticks. The client serializes asynchronous checkpoint decoding with subsequent relay frames. Each multiplayer Worker buffers sequence gaps and retains a base plus four recent 50-tick rollback points: if a relay batch arrives after its authoritative target tick was already published, the Worker restores the latest pre-target point once the contiguous prefix is available, inserts accepted and pending commands in exact relay-sequence order, and deterministically replays to its prior tick. Checkpoints carry the exact highest contiguous sequence actually applied. This prevents independent browser timer phases or out-of-order delivery from silently clamping, skipping, or reordering the same command.
 
 This keeps idle rooms inexpensive and hibernation-compatible. It also means the casual alpha is not authoritative: state hashes detect divergence but cannot prove honesty. Protocol, storage, TTL, reconnection, and migration details live in [MULTIPLAYER.md](MULTIPLAYER.md) and [DEPLOYMENT.md](DEPLOYMENT.md).

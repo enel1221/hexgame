@@ -1,7 +1,9 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { BALANCE } from "../../src/shared/balance";
 import {
+  getPresentation,
   getTestApiSnapshot,
+  getTileClientPoint,
   issueFriendlyMove,
   issueHostileBattle,
   loadDebugScenario,
@@ -10,7 +12,15 @@ import {
   reinforceBattle,
   resumeSimulation,
   startSinglePlayer,
+  startSinglePlayerPlacement,
 } from "./support";
+
+async function inspectDebugTile(page: Page, tileId: string): Promise<void> {
+  await page.evaluate(() => window.__HEX_DOMINION__?.cancelSelection());
+  await page.waitForFunction(() => window.__HEX_DOMINION__?.selectedTile === null);
+  await page.evaluate((id) => window.__HEX_DOMINION__?.selectTile(id), tileId);
+  await page.waitForFunction((id) => window.__HEX_DOMINION__?.selectedTile === id, tileId);
+}
 
 test.describe("Hex Dominion browser flows", () => {
   test("title setup exposes the supported configuration without dead controls", async ({
@@ -45,6 +55,103 @@ test.describe("Hex Dominion browser flows", () => {
     await page.getByTestId("single-tab").click();
     await expect(page.getByRole("radiogroup", { name: "Map archetype" })).toBeVisible();
 
+    await health.assertHealthy();
+  });
+
+  test("keeps tick zero neutral while placement relocates, locks, and hands off the opening", async ({
+    page,
+  }) => {
+    const health = observeBrowserHealth(page);
+    let placement = await startSinglePlayerPlacement(page, {
+      aiCount: 3,
+      seed: "E2E-PLACEMENT",
+      playerName: "Placement Warden",
+    });
+    const localPlayerId = placement.config.localPlayerId ?? 0;
+    expect(placement.phase).toBe("placement");
+    expect(placement.tick).toBe(0);
+    expect(placement.map.tiles.every((tile) => tile.owner === null)).toBe(true);
+    await expect(page.getByTestId("placement-panel")).toBeVisible();
+    await expect(page.locator(".placement-roster > div")).toHaveCount(4);
+
+    await page.waitForFunction(
+      (playerId) =>
+        window.__HEX_DOMINION__?.placement.placements.every(
+          (entry) => entry.playerId === playerId || entry.locked,
+        ),
+      localPlayerId,
+      { timeout: 8_000 },
+    );
+    placement = await getTestApiSnapshot(page);
+    const byId = new Map(placement.map.tiles.map((tile) => [tile.id, tile]));
+    const occupied = placement.placement.placements
+      .filter((entry) => entry.playerId !== localPlayerId)
+      .map((entry) => byId.get(entry.centerId!))
+      .filter(Boolean);
+    const distance = (left: { q: number; r: number }, right: { q: number; r: number }) =>
+      Math.max(
+        Math.abs(left.q - right.q),
+        Math.abs(left.r - right.r),
+        Math.abs(left.q + left.r - right.q - right.r),
+      );
+    const choices = placement.placement.selectableCandidates.filter((id) => {
+      const candidate = byId.get(id)!;
+      return occupied.every((other) => other && distance(candidate, other) >= 6);
+    });
+    expect(choices.length).toBeGreaterThan(1);
+    const clickableChoices: string[] = [];
+    for (const centerId of choices) {
+      const point = await getTileClientPoint(page, centerId);
+      const hitsCanvas = await page.evaluate(
+        ({ x, y }) => document.elementFromPoint(x, y)?.classList.contains("game-canvas") ?? false,
+        point,
+      );
+      if (hitsCanvas) clickableChoices.push(centerId);
+      if (clickableChoices.length === 2) break;
+    }
+    expect(clickableChoices).toHaveLength(2);
+    for (const centerId of clickableChoices) {
+      const point = await getTileClientPoint(page, centerId);
+      await page.mouse.click(point.x, point.y);
+      await page.waitForFunction(
+        ({ playerId, id }) =>
+          window.__HEX_DOMINION__?.placement.placements[playerId]?.centerId === id,
+        { playerId: localPlayerId, id: centerId },
+      );
+    }
+    expect((await getTestApiSnapshot(page)).tick).toBe(0);
+    await expect(page.getByTestId("lock-placement")).toBeEnabled();
+    await page.getByTestId("lock-placement").click();
+    await expect(page.getByTestId("opening-banner")).toBeVisible({ timeout: 3_000 });
+    await page.waitForFunction(
+      ({ centerId, playerId }) => {
+        const api = window.__HEX_DOMINION__;
+        if (!api || api.phase !== "opening") return false;
+        const cluster = new Set(api.map.spawnClusters[playerId] ?? []);
+        const localCaptures = api
+          .getPresentation()
+          .captures.filter((capture) => cluster.has(capture.tileId));
+        const center = localCaptures.find((capture) => capture.tileId === centerId);
+        const ring = localCaptures.filter((capture) => capture.tileId !== centerId);
+        return (
+          api.getPresentation().focusTileId === centerId &&
+          localCaptures.length === 7 &&
+          Boolean(center && ring.length === 6 && ring.every((capture) => center.age > capture.age))
+        );
+      },
+      { centerId: clickableChoices[1]!, playerId: localPlayerId },
+      { timeout: 900 },
+    );
+    const openingPresentation = await getPresentation(page);
+    expect(openingPresentation.focusTileId).toBe(clickableChoices[1]);
+    await page.waitForFunction(
+      () => window.__HEX_DOMINION__?.phase === "running" && window.__HEX_DOMINION__.tick > 0,
+      undefined,
+      { timeout: 5_000 },
+    );
+    expect((await getTestApiSnapshot(page)).config.startingCenters?.[localPlayerId]).toBe(
+      clickableChoices[1],
+    );
     await health.assertHealthy();
   });
 
@@ -171,7 +278,241 @@ test.describe("Hex Dominion browser flows", () => {
     await health.assertHealthy();
   });
 
-  test("hostile combat starts at 50/50 and reinforcement creates a delayed seam", async ({
+  test("submits one desktop Shift Multi order and cancels safely on lost focus", async ({
+    page,
+  }) => {
+    const health = observeBrowserHealth(page);
+    const opening = await startSinglePlayer(page, {
+      aiCount: 3,
+      seed: "E2E-MULTI-SHIFT",
+      playerName: "Column Warden",
+    });
+    const localPlayerId = opening.config.localPlayerId ?? 0;
+    const owned = opening.map.tiles.filter(
+      (tile) => tile.owner === localPlayerId && tile.troops > 1,
+    );
+    const localStacksBefore = opening.stacks.filter(
+      (stack) => stack.owner === localPlayerId,
+    ).length;
+    expect(owned.length).toBeGreaterThanOrEqual(3);
+
+    await page.keyboard.down("Shift");
+    await page.waitForFunction(() => window.__HEX_DOMINION__?.multi.phase === "sources");
+    const firstSourcePoint = await getTileClientPoint(page, owned[0]!.id);
+    await page.mouse.click(firstSourcePoint.x, firstSourcePoint.y);
+    await page.waitForFunction(
+      (id) => window.__HEX_DOMINION__?.multi.sourceIds.includes(id),
+      owned[0]!.id,
+    );
+    await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+    await page.keyboard.up("Shift");
+    await page.waitForFunction(() => window.__HEX_DOMINION__?.multi.phase === "idle");
+    expect(
+      (await getTestApiSnapshot(page)).stacks.filter((stack) => stack.owner === localPlayerId),
+    ).toHaveLength(localStacksBefore);
+
+    await page.keyboard.down("Shift");
+    await page.waitForFunction(() => window.__HEX_DOMINION__?.multi.phase === "sources");
+    const cancelPoint = await getTileClientPoint(page, owned[1]!.id);
+    await page.locator("canvas.game-canvas").dispatchEvent("pointerdown", {
+      pointerId: 73,
+      pointerType: "mouse",
+      clientX: cancelPoint.x,
+      clientY: cancelPoint.y,
+      button: 0,
+    });
+    await page.locator("canvas.game-canvas").dispatchEvent("pointercancel", {
+      pointerId: 73,
+      pointerType: "mouse",
+      clientX: cancelPoint.x,
+      clientY: cancelPoint.y,
+      button: 0,
+    });
+    await page.keyboard.up("Shift");
+    await page.waitForFunction(() => window.__HEX_DOMINION__?.multi.phase === "idle");
+
+    await page.keyboard.down("Shift");
+    await page.waitForFunction(() => window.__HEX_DOMINION__?.multi.phase === "sources");
+    for (const source of owned.slice(0, 2)) {
+      const point = await getTileClientPoint(page, source.id);
+      await page.mouse.click(point.x, point.y);
+      await page.waitForFunction(
+        (id) => window.__HEX_DOMINION__?.multi.sourceIds.includes(id),
+        source.id,
+      );
+    }
+    await page.keyboard.up("Shift");
+    await page.waitForFunction(() => window.__HEX_DOMINION__?.multi.phase === "targets");
+    const targetPoint = await getTileClientPoint(page, owned[2]!.id);
+    await page.mouse.click(targetPoint.x, targetPoint.y);
+    await page.waitForFunction(
+      (playerId) =>
+        window.__HEX_DOMINION__?.multi.phase === "idle" &&
+        (window.__HEX_DOMINION__?.stacks.some((stack) => stack.owner === playerId) ?? false),
+      localPlayerId,
+    );
+    const issued = await getTestApiSnapshot(page);
+    const localStacks = issued.stacks.filter((stack) => stack.owner === localPlayerId);
+    expect(localStacks.length).toBeGreaterThan(localStacksBefore);
+    expect(localStacks.reduce((sum, stack) => sum + stack.troops, 0)).toBeGreaterThan(0);
+    await health.assertHealthy();
+  });
+
+  test("operates Multi end to end with the keyboard hex cursor", async ({ page }) => {
+    const health = observeBrowserHealth(page);
+    const opening = await startSinglePlayer(page, {
+      aiCount: 3,
+      seed: "E2E-MULTI-KEYBOARD",
+      playerName: "Keyboard Warden",
+    });
+    const localPlayerId = opening.config.localPlayerId ?? 0;
+    const centerId = opening.map.spawnClusters[localPlayerId]![0]!;
+    const canvas = page.locator("canvas.game-canvas");
+
+    await page.getByRole("button", { name: "Start Multi movement selection" }).click();
+    await canvas.focus();
+    await expect(canvas).toHaveAttribute("tabindex", "0");
+    await expect(canvas).toHaveAttribute("aria-label", /arrow keys.*Enter or Space/i);
+    await canvas.press("Enter");
+    await page.waitForFunction(
+      (id) => window.__HEX_DOMINION__?.multi.sourceIds.includes(id),
+      centerId,
+    );
+
+    await canvas.press("ArrowRight");
+    const neighborId = (await getPresentation(page)).keyboardTileId;
+    expect(neighborId).toBeTruthy();
+    if (!neighborId) throw new Error("Keyboard navigation did not select a neighboring tile");
+    expect(neighborId).not.toBe(centerId);
+    await canvas.press("Enter");
+    await page.waitForFunction(
+      (id) => window.__HEX_DOMINION__?.multi.sourceIds.includes(id),
+      neighborId,
+    );
+
+    await page.getByRole("button", { name: "Choose Targets" }).click();
+    await canvas.focus();
+    await canvas.press("Enter");
+    await page.waitForFunction(
+      (id) =>
+        window.__HEX_DOMINION__?.multi.destinationIds.includes(id) &&
+        !window.__HEX_DOMINION__?.multi.sourceIds.includes(id),
+      neighborId,
+    );
+    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await page.waitForFunction(
+      (playerId) => window.__HEX_DOMINION__?.stacks.some((stack) => stack.owner === playerId),
+      localPlayerId,
+    );
+    await health.assertHealthy();
+  });
+
+  test("touch Multi controls stage multiple targets before explicit Send", async ({ page }) => {
+    const health = observeBrowserHealth(page);
+    await page.setViewportSize({ width: 520, height: 820 });
+    const opening = await startSinglePlayer(page, {
+      aiCount: 3,
+      seed: "E2E-MULTI-TOUCH",
+      playerName: "Touch Warden",
+      graphics: "low",
+    });
+    const localPlayerId = opening.config.localPlayerId ?? 0;
+    const owned = opening.map.tiles.filter(
+      (tile) => tile.owner === localPlayerId && tile.troops > 1,
+    );
+    expect(owned.length).toBeGreaterThanOrEqual(4);
+
+    await page.getByRole("button", { name: "Start Multi movement selection" }).click();
+    const canvas = page.locator("canvas.game-canvas");
+    const canvasBounds = await canvas.boundingBox();
+    if (!canvasBounds) throw new Error("Battlefield canvas has no bounds");
+    const pinchY = canvasBounds.y + canvasBounds.height / 2;
+    const pinchLeft = canvasBounds.x + canvasBounds.width / 2 - 36;
+    const pinchRight = canvasBounds.x + canvasBounds.width / 2 + 36;
+    await canvas.dispatchEvent("pointerdown", {
+      pointerId: 91,
+      pointerType: "touch",
+      clientX: pinchLeft,
+      clientY: pinchY,
+      button: 0,
+    });
+    await canvas.dispatchEvent("pointerdown", {
+      pointerId: 92,
+      pointerType: "touch",
+      clientX: pinchRight,
+      clientY: pinchY,
+      button: 0,
+    });
+    await canvas.dispatchEvent("pointermove", {
+      pointerId: 92,
+      pointerType: "touch",
+      clientX: pinchRight + 24,
+      clientY: pinchY,
+      button: 0,
+    });
+    for (const [id, x] of [
+      [91, pinchLeft],
+      [92, pinchRight + 24],
+    ] as const) {
+      await canvas.dispatchEvent("pointerup", {
+        pointerId: id,
+        pointerType: "touch",
+        clientX: x,
+        clientY: pinchY,
+        button: 0,
+      });
+    }
+    expect((await getTestApiSnapshot(page)).multi).toMatchObject({
+      phase: "sources",
+      sourceIds: [],
+      destinationIds: [],
+    });
+    let pointerId = 100;
+    const tapTile = async (tileId: string) => {
+      const point = await getTileClientPoint(page, tileId);
+      pointerId += 1;
+      await canvas.dispatchEvent("pointerdown", {
+        pointerId,
+        pointerType: "touch",
+        clientX: point.x,
+        clientY: point.y,
+        button: 0,
+      });
+      await canvas.dispatchEvent("pointerup", {
+        pointerId,
+        pointerType: "touch",
+        clientX: point.x,
+        clientY: point.y,
+        button: 0,
+      });
+    };
+    for (const source of owned.slice(0, 2)) {
+      await tapTile(source.id);
+      await page.waitForFunction(
+        (id) => window.__HEX_DOMINION__?.multi.sourceIds.includes(id),
+        source.id,
+      );
+    }
+    await page.getByRole("button", { name: "Choose Targets" }).click();
+    for (const target of owned.slice(2, 4)) {
+      await tapTile(target.id);
+      await page.waitForFunction(
+        (id) => window.__HEX_DOMINION__?.multi.destinationIds.includes(id),
+        target.id,
+      );
+    }
+    await expect(page.getByTestId("multi-panel")).toContainText("2 sources · 2 targets");
+    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await page.waitForFunction(
+      (playerId) =>
+        window.__HEX_DOMINION__?.multi.phase === "idle" &&
+        (window.__HEX_DOMINION__?.stacks.some((stack) => stack.owner === playerId) ?? false),
+      localPlayerId,
+    );
+    await health.assertHealthy();
+  });
+
+  test("live hostile combat exposes normalized factions and a delayed reinforcement seam", async ({
     page,
   }) => {
     const health = observeBrowserHealth(page);
@@ -185,9 +526,10 @@ test.describe("Hex Dominion browser flows", () => {
     const observed = await issueHostileBattle(page);
     expect(observed.battle.attacker).toBeGreaterThan(0);
     expect(observed.battle.defender).toBeGreaterThan(0);
-    expect(observed.presentation.actual).toBe(0.5);
-    expect(observed.presentation.displayed).toBeCloseTo(0.5, 2);
-    expect(observed.presentation.ghost).toBeCloseTo(0.5, 2);
+    const segments = observed.presentation.segments ?? [];
+    expect(segments.length).toBeGreaterThanOrEqual(2);
+    expect(segments.reduce((total, segment) => total + segment.actual, 0)).toBeCloseTo(1, 4);
+    expect(segments.every((segment) => segment.troops > 0)).toBe(true);
     await expect(page.getByTestId("debug-overlay")).toContainText(/BATTLES\s+[1-9]/);
 
     const reinforced = await reinforceBattle(page, observed.battle);
@@ -219,6 +561,26 @@ test.describe("Hex Dominion browser flows", () => {
         .sort(),
     ).toEqual(["barracks", "farm", "turret"]);
 
+    const structureTiles = structures.map.tiles.filter(
+      (tile) => tile.owner === localPlayerId && tile.structure,
+    );
+    for (const tile of structureTiles) {
+      await inspectDebugTile(page, tile.id);
+      const progress = page.getByTestId("structure-progress-text");
+      if (tile.structure!.type === "farm") {
+        await expect(progress).toHaveText("Construction 50%");
+      } else if (tile.structure!.type === "barracks") {
+        await expect(progress).toHaveText("Barracks production cycle 50%");
+        await expect(page.getByTestId("rally-queued-status")).toHaveText("4 trained troops queued");
+      } else {
+        await expect(progress).toHaveText("Turret volley accumulator 50%");
+        await expect(page.getByTestId("turret-support-status")).toHaveText(
+          "Turret x99 ready; no eligible nearby battle",
+        );
+      }
+      await expect(page.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "50");
+    }
+
     const battle = await loadDebugScenario(page, "battle");
     expect(battle.battles).toHaveLength(1);
     expect(battle.battles[0]).toMatchObject({
@@ -226,6 +588,27 @@ test.describe("Hex Dominion browser flows", () => {
       attacker: 56,
       defender: 56,
     });
+    await inspectDebugTile(page, battle.battles[0]!.tileId);
+    const battleRoster = page.getByTestId("battle-participant-roster");
+    await expect(battleRoster.getByRole("listitem")).toHaveCount(2);
+    for (const participant of battle.battles[0]!.participants) {
+      const row = page.getByTestId(`battle-participant-${participant.playerId ?? "neutral"}`);
+      const name =
+        participant.playerId === null
+          ? "Neutral defenders"
+          : battle.players.find((player) => player.id === participant.playerId)!.name;
+      await expect(row).toContainText(name);
+      await expect(row).toContainText(`${participant.troops} troops`);
+      await expect(row).toContainText(/\d+\.\d{2}% effective share/);
+      if (participant.playerId === battle.battles[0]!.incumbentOwner) {
+        await expect(row).toContainText("incumbent");
+      }
+    }
+    const displayedShares = (await battleRoster.getByRole("listitem").allTextContents()).map(
+      (text) => Number(text.match(/([\d.]+)% effective share/)?.[1]),
+    );
+    expect(displayedShares.every(Number.isFinite)).toBe(true);
+    expect(displayedShares.reduce((total, share) => total + share, 0)).toBeCloseTo(100, 2);
     await page.waitForFunction((battleId) => {
       const seam = window.__HEX_DOMINION__
         ?.getPresentation()
@@ -373,8 +756,6 @@ test.describe("Hex Dominion browser flows", () => {
         expect.objectContaining({ type: "structure-seized", tileId: developedBattle.tileId }),
       ]),
     );
-    await expect(page.locator(".event-feed")).toContainText("+9 Supply for hostile capture");
-
     const elimination = await loadDebugScenario(page, "elimination");
     const defeated = elimination.players.find((player) => player.id !== localPlayerId)!;
     const eliminator = elimination.players.find((player) => player.id === localPlayerId)!;
@@ -393,6 +774,11 @@ test.describe("Hex Dominion browser flows", () => {
       playerId: localPlayerId,
       amount: eliminationReward,
     });
+    expect(elimination.battles[0]?.participants).toHaveLength(3);
+    await inspectDebugTile(page, elimination.battles[0]!.tileId);
+    await expect(page.getByTestId("battle-participant-roster").getByRole("listitem")).toHaveCount(
+      3,
+    );
     await expect(page.locator(".event-feed")).toContainText(/eliminated/i);
     await health.assertHealthy();
   });
@@ -424,7 +810,7 @@ test.describe("Hex Dominion browser flows", () => {
       api.selectTile(tileId);
     }, invalid!.id);
     await expect(page.getByRole("alert")).toContainText(
-      /Farms require a Fertile Meadow|already contains a structure/,
+      /Farms require (?:a )?Fertile Meadow|already contains a structure/,
     );
     await expect(page.getByRole("alert")).toBeHidden({ timeout: 4_000 });
     await health.assertHealthy();
@@ -447,7 +833,7 @@ test.describe("Hex Dominion browser flows", () => {
     await barracks.click();
     await expect(barracks).toHaveAttribute("aria-pressed", "true");
     await page.evaluate((tileId) => window.__HEX_DOMINION__?.selectTile(tileId), invalid!.id);
-    await expect(page.getByRole("alert")).toContainText("Barracks require a Muster Ground");
+    await expect(page.getByRole("alert")).toContainText(/Barracks require (?:a )?Muster Ground/);
     await expect(page.getByRole("alert")).toBeHidden({ timeout: 4_000 });
     await health.assertHealthy();
   });
@@ -461,6 +847,16 @@ test.describe("Hex Dominion browser flows", () => {
     });
     const fixture = await loadDebugScenario(page, "interior-build");
     const localPlayerId = fixture.config.localPlayerId ?? 0;
+    const enclosure = fixture.enclosures[0]!;
+    await inspectDebugTile(page, enclosure.tileIds[0]!);
+    const enclosureStatus = page.getByTestId("enclosure-status");
+    await expect(enclosureStatus).toContainText(
+      `Encirclement by ${fixture.players.find((player) => player.id === enclosure.captorId)!.name}`,
+    );
+    await expect(enclosureStatus).toContainText("1-tile pocket · 1 tick · 0.1 seconds remaining");
+    await expect(page.getByTestId(`enclosure-summary-${enclosure.id}`)).toContainText(
+      "1 tick · 0.1s",
+    );
     const byCoordinate = new Map(fixture.map.tiles.map((tile) => [`${tile.q},${tile.r}`, tile]));
     const directions = [
       [1, 0],
@@ -496,7 +892,9 @@ test.describe("Hex Dominion browser flows", () => {
     const built = await getTestApiSnapshot(page);
     expect(built.map.tiles.find((tile) => tile.id === interior!.id)?.structure).toMatchObject({
       type: "turret",
-      status: "constructing",
+      completedCount: 0,
+      status: null,
+      pendingProgressTicks: expect.any(Number),
     });
     const supplyAfter = built.players.find((player) => player.id === localPlayerId)!.supplyMilli;
     expect(supplyAfter).toBeLessThan(supplyBefore);
@@ -520,10 +918,14 @@ test.describe("Hex Dominion browser flows", () => {
       const tile = snapshot.map.tiles.find(
         (candidate) =>
           candidate.owner === localPlayerId &&
-          !candidate.structure &&
+          (!candidate.structure ||
+            (candidate.structure.type === fixture.type &&
+              candidate.structure.pendingProgressTicks === null &&
+              candidate.structure.completedCount < BALANCE.maxStructureCount)) &&
           (fixture.terrain === null || candidate.terrain === fixture.terrain),
       );
       expect(tile, `${fixture.seed} should expose legal ${fixture.type} terrain`).toBeDefined();
+      const completedBefore = tile!.structure?.completedCount ?? 0;
 
       const supplyBefore = Number.parseFloat(await page.getByTestId("supply").innerText());
       const build = page.getByTestId(`build-${fixture.type}`);
@@ -531,17 +933,25 @@ test.describe("Hex Dominion browser flows", () => {
       await expect(build).toHaveAttribute("aria-pressed", "true");
       await page.evaluate((tileId) => window.__HEX_DOMINION__?.selectTile(tileId), tile!.id);
       await page.waitForFunction(
-        ({ tileId, type }) =>
-          window.__HEX_DOMINION__?.map.tiles.find((candidate) => candidate.id === tileId)?.structure
-            ?.type === type,
-        { tileId: tile!.id, type: fixture.type },
+        ({ tileId, type, completedCount }) => {
+          const structure = window.__HEX_DOMINION__?.map.tiles.find(
+            (candidate) => candidate.id === tileId,
+          )?.structure;
+          return (
+            structure?.type === type &&
+            structure.completedCount === completedCount &&
+            structure.pendingProgressTicks !== null
+          );
+        },
+        { tileId: tile!.id, type: fixture.type, completedCount: completedBefore },
         { timeout: 3_000 },
       );
 
       const after = await getTestApiSnapshot(page);
       const structure = after.map.tiles.find((candidate) => candidate.id === tile!.id)?.structure;
       expect(structure?.type).toBe(fixture.type);
-      expect(["constructing", "active"]).toContain(structure?.status);
+      expect(structure?.completedCount).toBe(completedBefore);
+      expect(structure?.pendingProgressTicks).not.toBeNull();
       const supplyAfter = Number.parseFloat(await page.getByTestId("supply").innerText());
       expect(supplyAfter).toBeLessThanOrEqual(supplyBefore - fixture.cost + 0.5);
       await health.assertHealthy();

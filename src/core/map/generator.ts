@@ -383,23 +383,32 @@ function landInRadius(land: ReadonlySet<string>, centerId: string, radius: numbe
     .filter((id) => land.has(id));
 }
 
-function chooseSpawnCenters(
-  landIds: readonly string[],
+export function isEligibleSpawnCenter(map: GeneratedMap, centerId: string): boolean {
+  const center = map.tiles[centerId];
+  if (!center || center.terrain === "water") return false;
+  const required = spiral(center, BALANCE.spawnPaddingRadius).map(axialKey);
+  return required.every((id) => {
+    const tile = map.tiles[id];
+    return tile !== undefined && tile.terrain !== "water";
+  });
+}
+
+export function eligibleSpawnCenters(map: GeneratedMap): string[] {
+  return map.landIds.filter((id) => isEligibleSpawnCenter(map, id)).sort(compareIds);
+}
+
+export function chooseDefaultSpawnCenters(
+  map: GeneratedMap,
   totalPlayers: number,
   seed: string,
 ): string[] {
-  const land = new Set(landIds);
-  const candidateMetrics = landIds
-    .filter((id) => neighbors(parseAxialKey(id)).every((adjacent) => land.has(axialKey(adjacent))))
-    .map((id) => ({
-      id,
-      nearby: landInRadius(land, id, 3).length,
-      rank: hashSeed(`${seed}:spawn-rank:${id}`),
-    }));
-  let candidates = candidateMetrics.filter((candidate) => candidate.nearby >= 27);
-  if (candidates.length < totalPlayers * 2) {
-    candidates = candidateMetrics.filter((candidate) => candidate.nearby >= 22);
-  }
+  const land = new Set(map.landIds);
+  const candidateMetrics = eligibleSpawnCenters(map).map((id) => ({
+    id,
+    nearby: landInRadius(land, id, 3).length,
+    rank: hashSeed(`${seed}:spawn-rank:${id}`),
+  }));
+  const candidates = candidateMetrics;
   if (candidates.length < totalPlayers) {
     throw new Error(`Only ${candidates.length} safe spawn centers fit ${totalPlayers} players`);
   }
@@ -429,7 +438,7 @@ function chooseSpawnCenters(
           Math.min(minimum, distance(parseAxialKey(candidate.id), parseAxialKey(id))),
         Number.POSITIVE_INFINITY,
       );
-      if (nearest < 3) continue;
+      if (nearest < BALANCE.minimumSpawnDistance) continue;
       if (
         nearest > bestDistance ||
         (nearest === bestDistance &&
@@ -477,9 +486,30 @@ function forceTerrain(
   tile.terrain = terrain;
 }
 
-function createAndInitializeSpawns(map: GeneratedMap, totalPlayers: number, seed: string): void {
+export function applySpawnAllocations(
+  map: GeneratedMap,
+  centers: readonly string[],
+  seed: string,
+): void {
+  const totalPlayers = centers.length;
   const land = new Set(map.landIds);
-  const centers = chooseSpawnCenters(map.landIds, totalPlayers, seed);
+  if (totalPlayers < 2 || totalPlayers > 21) {
+    throw new Error("Spawn allocation requires 2 through 21 centers");
+  }
+  if (new Set(centers).size !== centers.length) throw new Error("Spawn centers contain duplicates");
+  if (centers.some((id) => !isEligibleSpawnCenter(map, id))) {
+    throw new Error("Spawn center lacks required shoreline or map-edge padding");
+  }
+  for (let left = 0; left < centers.length; left += 1) {
+    for (let right = left + 1; right < centers.length; right += 1) {
+      if (
+        distance(parseAxialKey(centers[left]!), parseAxialKey(centers[right]!)) <
+        BALANCE.minimumSpawnDistance
+      ) {
+        throw new Error("Spawn centers violate minimum spacing");
+      }
+    }
+  }
   const clusters = centers.map((centerId) => [
     centerId,
     ...neighbors(parseAxialKey(centerId)).map(axialKey),
@@ -548,15 +578,20 @@ function createAndInitializeSpawns(map: GeneratedMap, totalPlayers: number, seed
     }
     map.tiles[cluster[0]!]!.structure = {
       type: "barracks",
+      completedCount: 1,
       status: "active",
       integrity: BALANCE.fullIntegrity,
-      progressTicks: 0,
+      pendingProgressTicks: null,
       seizedTicks: 0,
       productionPaused: false,
+      barracksProgressMilli: 0,
+      rallyTargetId: null,
+      rallyQueuedTroops: 0,
+      turretShotProgressMilli: 0,
     };
   }
 
-  map.spawnCenters = centers;
+  map.spawnCenters = [...centers];
   map.spawnClusters = clusters;
 }
 
@@ -578,7 +613,7 @@ function buildAttempt(options: NormalizedOptions, attempt: number): GeneratedMap
       r: cell.r,
       terrain: land.has(cell.id) ? "plains" : "water",
       owner: null,
-      troops: 0,
+      troops: land.has(cell.id) ? 1 : 0,
       structure: null,
       controlledSinceTick: 0,
       lastRewardTick: 0,
@@ -600,7 +635,6 @@ function buildAttempt(options: NormalizedOptions, attempt: number): GeneratedMap
     spawnClusters: [],
     generationAttempt: attempt,
   };
-  createAndInitializeSpawns(map, options.totalPlayers, generationSeed);
   return map;
 }
 
@@ -615,9 +649,9 @@ export function generateMapOnce(
   return buildAttempt(options, attempt);
 }
 
-export function generateMap(config: MatchMapConfig): GeneratedMap;
-export function generateMap(options: MapGenerationOptions): GeneratedMap;
-export function generateMap(input: MatchMapConfig | MapGenerationOptions): GeneratedMap {
+export function generateNeutralMap(config: MatchMapConfig): GeneratedMap;
+export function generateNeutralMap(options: MapGenerationOptions): GeneratedMap;
+export function generateNeutralMap(input: MatchMapConfig | MapGenerationOptions): GeneratedMap {
   const options = normalizeOptions(input);
   let lastReport: MapFairnessReport | null = null;
   let lastError: Error | null = null;
@@ -625,9 +659,13 @@ export function generateMap(input: MatchMapConfig | MapGenerationOptions): Gener
   for (let attempt = 0; attempt < options.maxAttempts; attempt += 1) {
     try {
       const map = buildAttempt(options, attempt);
-      const report = analyzeMapFairness(map, options.totalPlayers);
+      const generationSeed = deriveGenerationSeed(options.seed, attempt);
+      const centers = chooseDefaultSpawnCenters(map, options.totalPlayers, generationSeed);
+      const allocated = JSON.parse(JSON.stringify(map)) as GeneratedMap;
+      applySpawnAllocations(allocated, centers, generationSeed);
+      const report = analyzeMapFairness(allocated, options.totalPlayers);
       lastReport = report;
-      const acceptedByHook = options.fairnessValidator?.(report, map, attempt) ?? true;
+      const acceptedByHook = options.fairnessValidator?.(report, allocated, attempt) ?? true;
       if (report.valid && acceptedByHook) return map;
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
@@ -638,4 +676,16 @@ export function generateMap(input: MatchMapConfig | MapGenerationOptions): Gener
   throw new Error(
     `Map generation failed fairness checks after ${options.maxAttempts} attempts: ${detail}`,
   );
+}
+
+/** Backward-compatible allocated map helper; placement uses generateNeutralMap. */
+export function generateMap(config: MatchMapConfig): GeneratedMap;
+export function generateMap(options: MapGenerationOptions): GeneratedMap;
+export function generateMap(input: MatchMapConfig | MapGenerationOptions): GeneratedMap {
+  const options = normalizeOptions(input);
+  const map = generateNeutralMap(input);
+  const generationSeed = deriveGenerationSeed(map.seed, map.generationAttempt);
+  const centers = chooseDefaultSpawnCenters(map, options.totalPlayers, generationSeed);
+  applySpawnAllocations(map, centers, generationSeed);
+  return map;
 }

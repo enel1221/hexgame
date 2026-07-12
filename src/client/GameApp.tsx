@@ -1,8 +1,19 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { axialKey, neighbors } from "@/src/core/hex";
+import { axialKey, findPath, neighbors } from "@/src/core/hex";
 import { parseEngineSnapshot } from "@/src/core/engine";
+import { stableHash } from "@/src/core/hash";
+import { eligibleSpawnCenters } from "@/src/core/map";
+import { planMultiMove, troopsForPercent, type MultiMovePlan } from "@/src/core/movement";
+import {
+  computeFinalSpawnVector,
+  validateSpawnChoice,
+  validateSpawnChoicePreview,
+} from "@/src/core/placement";
+import { calculateIncomeMilliPerSecond } from "@/src/core/economy";
+import { canPlaceStructure, isBarracksRallyBlocked } from "@/src/core/buildings";
+import { battlePresentation } from "@/src/core/combat";
 import { BALANCE, SUPPLY_SCALE, TICKS_PER_SECOND } from "@/src/shared/balance";
 import { COMMIT_SHA, VERSION_LABEL } from "@/src/shared/version";
 import type {
@@ -20,11 +31,19 @@ import type {
   WorkerResponse,
 } from "@/src/shared/types";
 import { AudioDirector } from "./audio/AudioDirector";
+import { OrderedAsyncQueue } from "./asyncQueue";
+import { placementCatchUpTick } from "./placementClock";
+import { placementPresentationSignature } from "./placementSignature";
 import type { GameRenderer } from "./render/GameRenderer";
 import type { RendererContextStatus } from "./render/contextRecovery";
 import type { MultiplayerClient, RoomIdentity } from "@/src/edge/client";
 import type { PlayerSummary, ServerMessage } from "@/src/edge/protocol";
 import { LOCAL_SAVE_KEY, readLocalSnapshot } from "./saves";
+import {
+  decodeCheckpointPayload,
+  encodeCheckpoint,
+  localizeCheckpointForRecipient,
+} from "./checkpoints";
 
 type Screen = "menu" | "match";
 type SetupTab = "single" | "multiplayer";
@@ -45,6 +64,8 @@ interface DebugRoute {
   sourceId: string;
   destinationId: string;
 }
+
+type MultiPhase = "idle" | "sources" | "targets";
 
 const MAPS: Array<{ id: MapArchetype; name: string; subtitle: string; description: string }> = [
   {
@@ -137,69 +158,14 @@ function createSeed(): string {
   return `${values[0]!.toString(36)}-${values[1]!.toString(36)}`.toUpperCase().slice(0, 15);
 }
 
-function findClientPath(
-  state: GameState,
-  sourceId: string,
-  destinationId: string,
-  owner: number,
-): string[] | null {
-  if (sourceId === destinationId) return [sourceId];
-  const destination = state.map.tiles[destinationId];
-  if (!destination || destination.terrain === "water") return null;
-  const queue = [sourceId];
-  const parent = new Map<string, string | null>([[sourceId, null]]);
-  while (queue.length > 0) {
-    const currentId = queue.shift()!;
-    const current = state.map.tiles[currentId]!;
-    for (const neighbor of neighbors(current)) {
-      const nextId = axialKey(neighbor);
-      if (parent.has(nextId)) continue;
-      const next = state.map.tiles[nextId];
-      if (!next || next.terrain === "water") continue;
-      const finalStep = nextId === destinationId;
-      if (!finalStep && next.owner !== owner) continue;
-      if (finalStep && destination.owner !== owner && current.owner !== owner) continue;
-      parent.set(nextId, currentId);
-      if (finalStep) {
-        const path = [destinationId];
-        let cursor: string | null = currentId;
-        while (cursor) {
-          path.push(cursor);
-          cursor = parent.get(cursor) ?? null;
-        }
-        return path.reverse();
-      }
-      queue.push(nextId);
-    }
-  }
-  return null;
-}
-
 function structureReason(
   tile: TileState | undefined,
   structure: StructureType,
   playerId = 0,
   state?: GameState | null,
 ): string | null {
-  if (!tile || tile.terrain === "water") return "Structures require a land tile.";
-  if (tile.owner !== playerId) return "You can only build inside your own territory.";
-  if (tile.structure) return "This tile already contains a structure.";
-  if (state?.battles.some((battle) => battle.tileId === tile.id)) {
-    return "Construction cannot begin while this tile is contested.";
-  }
-  if (structure === "farm" && tile.terrain !== "meadow") return "Farms require a Fertile Meadow.";
-  if (structure === "barracks" && tile.terrain !== "muster")
-    return "Barracks require a Muster Ground.";
-  const costMilli =
-    structure === "farm"
-      ? BALANCE.farm.costMilli
-      : structure === "barracks"
-        ? BALANCE.barracks.costMilli
-        : BALANCE.turret.costMilli;
-  if (state && (state.players[playerId]?.supplyMilli ?? 0) < costMilli) {
-    return `Not enough Supply — ${costMilli / SUPPLY_SCALE} required.`;
-  }
-  return null;
+  if (!tile || !state) return "Structures require a land tile.";
+  return canPlaceStructure(state, playerId, tile.id, structure).reason ?? null;
 }
 
 function terrainName(terrain: TileState["terrain"]): string {
@@ -224,6 +190,11 @@ function debugScenarioFocusTile(state: GameState, scenario: DebugScenario): stri
   }
   if (scenario === "capture") {
     return [...state.events].reverse().find((event) => event.type === "capture")?.tileId;
+  }
+  if (scenario === "interior-build") {
+    return (
+      state.enclosures[0]?.tileIds[0] ?? state.map.spawnCenters[state.config.localPlayerId ?? 0]
+    );
   }
   return state.battles[0]?.tileId;
 }
@@ -264,6 +235,17 @@ export function GameApp() {
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [sendPercent, setSendPercent] = useState<SendPercent>(50);
   const [buildMode, setBuildMode] = useState<StructureType | null>(null);
+  const [rallySourceId, setRallySourceId] = useState<string | null>(null);
+  const [multiPhase, setMultiPhase] = useState<MultiPhase>("idle");
+  const [multiSources, setMultiSources] = useState<string[]>([]);
+  const [multiTargets, setMultiTargets] = useState<string[]>([]);
+  const [multiKeyHeld, setMultiKeyHeld] = useState(false);
+  const [placementDeadlineAt, setPlacementDeadlineAt] = useState<number | null>(null);
+  const [placementNow, setPlacementNow] = useState(() => Date.now());
+  const [roomPlacement, setRoomPlacement] = useState<Extract<
+    ServerMessage,
+    { type: "placement" }
+  > | null>(null);
   const [speed, setSpeed] = useState<1 | 2 | 4>(1);
   const [scoreOpen, setScoreOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -285,17 +267,33 @@ export function GameApp() {
   const bridgeRef = useRef<SimulationBridge | null>(null);
   const audioRef = useRef<AudioDirector | null>(null);
   const roomClientRef = useRef<MultiplayerClient | null>(null);
+  const roomMessageQueueRef = useRef(new OrderedAsyncQueue());
+  const roomConnectionGenerationRef = useRef(0);
   const roomAppliedSequenceRef = useRef(0);
   const roomCommandTargetsRef = useRef(new Map<number, number>());
   const appliedRoomSequencesRef = useRef(new Set<number>());
   const roomIdentityRef = useRef<RoomIdentity | null>(null);
-  const pendingCheckpointRef = useRef<{ tick: number; sequence: number } | null>(null);
+  const workerRelaySequenceRef = useRef(0);
+  const pendingCheckpointRef = useRef<{ requestedTick: number } | null>(null);
   const lastCheckpointTickRef = useRef(0);
   const lastAutosaveTickRef = useRef(0);
   const roomCompletionSentRef = useRef(false);
+  const roomPlacementRef = useRef<Extract<ServerMessage, { type: "placement" }> | null>(null);
+  const pendingStartedRef = useRef<Extract<ServerMessage, { type: "started" }> | null>(null);
+  const publishedCandidateHashRef = useRef<string | null>(null);
+  const publishedFinalVectorRef = useRef<string | null>(null);
+  const placementSyncSentRef = useRef(new Map<number, string>());
+  const openingTimerRef = useRef<number | null>(null);
+  const openingPhaseHandledRef = useRef(false);
   const pendingDebugScenarioRef = useRef<DebugScenario | null>(null);
   const debugStateHistoryRef = useRef(new Map<number, GameState>());
   const latestStateRef = useRef<GameState | null>(null);
+  const recommendedPlacementRef = useRef<{ key: string; centerId: string | null } | null>(null);
+  const debugPlacementCandidatesRef = useRef<{
+    signature: string;
+    candidates: string[];
+    selectableCandidates: string[];
+  } | null>(null);
 
   const loadDebugScenario = useCallback((scenario: DebugScenario) => {
     pendingDebugScenarioRef.current = scenario;
@@ -349,8 +347,54 @@ export function GameApp() {
       bridgeRef.current?.send({ type: "snapshot" });
     }
     if (typeof window !== "undefined" && state.config.debug) {
+      const placementSignature = placementPresentationSignature(
+        state,
+        state.config.localPlayerId ?? 0,
+      );
+      if (debugPlacementCandidatesRef.current?.signature !== placementSignature) {
+        const candidates = eligibleSpawnCenters(state.map);
+        debugPlacementCandidatesRef.current = {
+          signature: placementSignature,
+          candidates,
+          selectableCandidates:
+            state.phase === "placement"
+              ? candidates.filter(
+                  (centerId) =>
+                    validateSpawnChoicePreview(state, state.config.localPlayerId ?? 0, centerId).ok,
+                )
+              : [],
+        };
+      }
+      const placementCandidates = debugPlacementCandidatesRef.current;
+      let recommendedPlacementCenter: string | null = null;
+      if (state.phase === "placement") {
+        const recommendationKey = `${state.map.seed}:${state.map.archetype}:${state.map.generationAttempt}:${state.players
+          .map(
+            (player) =>
+              `${player.id}:${player.isHuman ? (state.placement.placements[player.id]?.centerId ?? "") : "ai"}`,
+          )
+          .join("|")}`;
+        if (recommendedPlacementRef.current?.key !== recommendationKey) {
+          try {
+            recommendedPlacementRef.current = {
+              key: recommendationKey,
+              centerId: computeFinalSpawnVector(state)[state.config.localPlayerId ?? 0] ?? null,
+            };
+          } catch {
+            recommendedPlacementRef.current = { key: recommendationKey, centerId: null };
+          }
+        }
+        recommendedPlacementCenter = recommendedPlacementRef.current.centerId;
+      }
       (window as Window & { __HEX_DOMINION__?: unknown }).__HEX_DOMINION__ = Object.freeze({
         tick: state.tick,
+        phase: state.phase,
+        placement: {
+          ...state.placement,
+          candidates: placementCandidates.candidates,
+          recommendedPlacementCenter,
+          selectableCandidates: placementCandidates.selectableCandidates,
+        },
         config: state.config,
         map: {
           landCount: state.map.landCount,
@@ -402,21 +446,44 @@ export function GameApp() {
         battles: state.battles.map((battle) => ({
           id: battle.id,
           tileId: battle.tileId,
-          actualControl: battle.control,
-          attacker: battle.attackerTroops,
-          defender: battle.defenderTroops,
+          incumbentOwner: battle.incumbentOwner,
+          participants: battle.participants.map((participant) => ({ ...participant })),
+          actualControl: battle.participants.find(
+            (participant) => participant.playerId !== battle.incumbentOwner,
+          )?.control,
+          attacker:
+            battle.participants.find(
+              (participant) => participant.playerId !== battle.incumbentOwner,
+            )?.troops ?? 0,
+          defender:
+            battle.participants.find(
+              (participant) => participant.playerId === battle.incumbentOwner,
+            )?.troops ?? 0,
         })),
+        enclosures: state.enclosures,
+        multi: {
+          phase: multiPhase,
+          sourceIds: multiSources,
+          destinationIds: multiTargets,
+        },
         stateHash: state.stateHash,
         winner: state.victory.winnerId,
         selectTile: (tileId: string) => handleTileClickRef.current(tileId),
         hoverTile: (tileId: string | null) => handleTileHoverRef.current(tileId),
         cancelSelection: () => cancelSelectionRef.current(),
+        fitOverview: () => rendererRef.current?.fitMap(),
+        setTransientCapture: (active: boolean) => rendererRef.current?.setCaptureMode(active),
+        captureFrame: () => rendererRef.current?.captureFrameDataUrl() ?? Promise.resolve(""),
         getPresentation: () =>
           rendererRef.current?.inspectPresentation() ?? {
             stacks: [],
             battles: [],
+            captures: [],
+            focusTileId: null,
+            keyboardTileId: null,
             visibleObjects: 0,
           },
+        getTileClientPoint: (tileId: string) => rendererRef.current?.clientPointFor(tileId) ?? null,
         inspectStateAt: (tick: number) => debugStateHistoryRef.current.get(tick) ?? null,
         loadScenario: (scenario: DebugScenario) => {
           loadDebugScenario(scenario);
@@ -425,7 +492,126 @@ export function GameApp() {
     } else if (typeof window !== "undefined") {
       delete (window as Window & { __HEX_DOMINION__?: unknown }).__HEX_DOMINION__;
     }
-  }, [state, selectedId, loadDebugScenario]);
+  }, [state, selectedId, loadDebugScenario, multiPhase, multiSources, multiTargets]);
+
+  useEffect(() => {
+    if (state?.phase !== "placement" || placementDeadlineAt === null) return;
+    setPlacementNow(Date.now());
+    const timer = window.setInterval(() => setPlacementNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [state?.phase, placementDeadlineAt]);
+
+  useEffect(() => {
+    if (
+      !state?.config.multiplayer ||
+      state.phase !== "placement" ||
+      !roomClientRef.current ||
+      !roomIdentityRef.current?.player.isHost ||
+      publishedCandidateHashRef.current !== null
+    ) {
+      return;
+    }
+    const candidates = eligibleSpawnCenters(state.map);
+    const candidateHash = stableHash({
+      generationAttempt: state.map.generationAttempt,
+      candidates,
+    });
+    try {
+      roomClientRef.current.publishPlacementCandidates(
+        state.map.generationAttempt,
+        candidateHash,
+        candidates,
+      );
+      publishedCandidateHashRef.current = candidateHash;
+    } catch (reason) {
+      setError(
+        reason instanceof Error ? reason.message : "Could not publish placement candidates.",
+      );
+    }
+  }, [state]);
+
+  useEffect(() => {
+    if (!state || state.phase !== "placement" || !roomPlacement) return;
+    for (const selection of roomPlacement.selections) {
+      const local = state.placement.placements[selection.seat];
+      if (!local || !state.players[selection.seat]?.isHuman) continue;
+      const syncKey = `${selection.centerId ?? ""}:${selection.locked ? 1 : 0}`;
+      if (placementSyncSentRef.current.get(selection.seat) === syncKey) continue;
+      if (selection.centerId && local.centerId !== selection.centerId && !local.locked) {
+        bridgeRef.current?.send({
+          type: "command",
+          command: {
+            type: "choose-spawn",
+            playerId: selection.seat,
+            centerId: selection.centerId,
+          },
+        });
+        placementSyncSentRef.current.set(selection.seat, `${syncKey}:choose`);
+        continue;
+      }
+      if (selection.locked && !local.locked && local.centerId === selection.centerId) {
+        bridgeRef.current?.send({
+          type: "command",
+          command: { type: "lock-spawn", playerId: selection.seat },
+        });
+        placementSyncSentRef.current.set(selection.seat, `${syncKey}:lock`);
+        continue;
+      }
+      placementSyncSentRef.current.set(selection.seat, syncKey);
+    }
+
+    const synchronized = roomPlacement.selections.every((selection) => {
+      const local = state.placement.placements[selection.seat];
+      return local?.centerId === selection.centerId && (!selection.locked || local.locked);
+    });
+    const timedOut = Date.now() >= roomPlacement.deadlineAt;
+    const humansLocked = roomPlacement.selections.every((selection) => selection.locked);
+    if (
+      synchronized &&
+      (humansLocked || timedOut) &&
+      roomPlacement.generationAttempt !== null &&
+      roomPlacement.candidateHash &&
+      roomClientRef.current
+    ) {
+      try {
+        const centers = computeFinalSpawnVector(state);
+        const key = centers.join("|");
+        if (key !== publishedFinalVectorRef.current) {
+          roomClientRef.current.finalizePlacement(
+            roomPlacement.generationAttempt,
+            roomPlacement.candidateHash,
+            centers,
+          );
+          publishedFinalVectorRef.current = key;
+        }
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : "Could not finalize starting centers.");
+      }
+    }
+  }, [roomPlacement, state]);
+
+  useEffect(() => {
+    const openingState = latestStateRef.current;
+    if (!openingState || openingState.phase !== "opening" || openingPhaseHandledRef.current) return;
+    openingPhaseHandledRef.current = true;
+    const localCenter =
+      openingState.config.startingCenters?.[openingState.config.localPlayerId ?? 0];
+    if (localCenter) rendererRef.current?.focusOn(localCenter, 0.88);
+    const relayStartAt = pendingStartedRef.current?.startedAt;
+    const delay = relayStartAt === undefined ? 1_000 : Math.max(0, relayStartAt - Date.now());
+    openingTimerRef.current = window.setTimeout(() => {
+      bridgeRef.current?.send({ type: "begin-match" });
+      if (relayStartAt !== undefined) {
+        const targetTick = Math.max(0, Math.floor(((Date.now() - relayStartAt) * 10) / 1000));
+        if (targetTick > 0) bridgeRef.current?.send({ type: "catch-up", targetTick });
+      }
+      openingTimerRef.current = null;
+    }, delay);
+    return () => {
+      if (openingTimerRef.current !== null) window.clearTimeout(openingTimerRef.current);
+      openingTimerRef.current = null;
+    };
+  }, [state?.phase]);
 
   useEffect(() => {
     if (screen !== "match" || !hostRef.current || rendererRef.current) return;
@@ -479,11 +665,18 @@ export function GameApp() {
   }, [buildMode]);
 
   useEffect(() => {
-    if (!state || !selectedId || !hoveredId) {
+    const selected = selectedId ? state?.map.tiles[selectedId] : undefined;
+    if (
+      !state ||
+      !selectedId ||
+      !hoveredId ||
+      selected?.owner !== (state.config.localPlayerId ?? 0) ||
+      selected.troops <= 1
+    ) {
       rendererRef.current?.setRoutePreview(null);
       return;
     }
-    const path = findClientPath(state, selectedId, hoveredId, state.config.localPlayerId ?? 0);
+    const path = findPath(state.map, selectedId, hoveredId, state.config.localPlayerId ?? 0, true);
     rendererRef.current?.setRoutePreview(path ?? [selectedId, hoveredId], Boolean(path));
   }, [state, selectedId, hoveredId]);
 
@@ -506,29 +699,6 @@ export function GameApp() {
     return () => cancelAnimationFrame(frame);
   }, []);
 
-  useEffect(() => {
-    const keydown = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (target?.matches("input, textarea, select, button")) return;
-      if (["1", "2", "3", "4"].includes(event.key)) {
-        const percentages: SendPercent[] = [25, 50, 75, 100];
-        setSendPercent(percentages[Number(event.key) - 1]!);
-      } else if (event.key === "Escape") cancelSelection();
-      else if (event.key === " " && screen === "match" && !config.multiplayer) {
-        event.preventDefault();
-        togglePause();
-      } else if (event.key.toLowerCase() === "f")
-        setBuildMode((mode) => (mode === "farm" ? null : "farm"));
-      else if (event.key.toLowerCase() === "b")
-        setBuildMode((mode) => (mode === "barracks" ? null : "barracks"));
-      else if (event.key.toLowerCase() === "t")
-        setBuildMode((mode) => (mode === "turret" ? null : "turret"));
-      else if (event.key.toLowerCase() === "g" && config.debug) setScoreOpen((open) => !open);
-    };
-    window.addEventListener("keydown", keydown);
-    return () => window.removeEventListener("keydown", keydown);
-  });
-
   const startGame = useCallback((nextConfig: MatchConfig, snapshot?: EngineSnapshot) => {
     bridgeRef.current?.destroy();
     audioRef.current?.destroy();
@@ -537,6 +707,24 @@ export function GameApp() {
     setState(null);
     setSelectedId(null);
     setBuildMode(null);
+    setRallySourceId(null);
+    setMultiPhase("idle");
+    setMultiSources([]);
+    setMultiTargets([]);
+    setMultiKeyHeld(false);
+    publishedCandidateHashRef.current = null;
+    publishedFinalVectorRef.current = null;
+    placementSyncSentRef.current.clear();
+    workerRelaySequenceRef.current = 0;
+    if (!nextConfig.multiplayer) {
+      pendingStartedRef.current = null;
+      roomPlacementRef.current = null;
+      setRoomPlacement(null);
+      setPlacementDeadlineAt(null);
+    }
+    openingPhaseHandledRef.current = false;
+    if (openingTimerRef.current !== null) window.clearTimeout(openingTimerRef.current);
+    openingTimerRef.current = null;
     debugStateHistoryRef.current.clear();
     setLoading(true);
     setScreen("match");
@@ -547,6 +735,9 @@ export function GameApp() {
     const bridge = new SimulationBridge(
       (message) => {
         if (message.type === "ready" || message.type === "state") {
+          if (message.relaySequence !== undefined) {
+            workerRelaySequenceRef.current = message.relaySequence;
+          }
           if (message.state.config.debug) {
             debugStateHistoryRef.current.set(message.state.tick, message.state);
             const oldestTick = message.state.tick - 40;
@@ -571,31 +762,39 @@ export function GameApp() {
               // The game continues even if browser storage is unavailable.
             }
           } else {
-            try {
-              const pending = pendingCheckpointRef.current;
-              const identity = roomIdentityRef.current;
-              if (pending && identity?.player.isHost && roomClientRef.current) {
-                const checkpointSnapshot: EngineSnapshot = {
-                  ...message.snapshot,
-                  // Commands after the applied sequence remain in the relay log.
-                  pendingCommands: [],
-                };
-                const payload = JSON.stringify(checkpointSnapshot);
-                if (payload.length < 250_000) {
-                  roomClientRef.current.publishCheckpoint({
-                    tick: message.snapshot.state.tick,
-                    sequence: pending.sequence,
-                    hash: message.snapshot.state.stateHash,
-                    encoding: "json",
-                    payload,
-                  });
-                }
-              }
-            } catch {
-              // Reconnect will request a prior checkpoint plus the retained log.
-            } finally {
+            const pending = pendingCheckpointRef.current;
+            const identity = roomIdentityRef.current;
+            const checkpointSequence = message.relaySequence;
+            if (
+              !pending ||
+              !identity?.player.isHost ||
+              !roomClientRef.current ||
+              checkpointSequence === undefined
+            ) {
               pendingCheckpointRef.current = null;
+              return;
             }
+            const checkpointSnapshot: EngineSnapshot = {
+              ...message.snapshot,
+              // Commands after the applied sequence remain in the relay log.
+              pendingCommands: [],
+            };
+            void encodeCheckpoint(checkpointSnapshot)
+              .then(({ encoding, payload }) => {
+                roomClientRef.current?.publishCheckpoint({
+                  tick: message.snapshot.state.tick,
+                  sequence: checkpointSequence,
+                  hash: message.snapshot.state.stateHash,
+                  encoding,
+                  payload,
+                });
+              })
+              .catch(() => {
+                // Reconnect will request a prior checkpoint plus the retained log.
+              })
+              .finally(() => {
+                pendingCheckpointRef.current = null;
+              });
           }
         } else if (message.type === "error") {
           setError(message.message);
@@ -630,6 +829,7 @@ export function GameApp() {
 
   const connectRoom = useCallback(
     async (reconnect = false) => {
+      const connectionGeneration = ++roomConnectionGenerationRef.current;
       setRoomBusy(true);
       setMultiplayer((current) => ({ ...current, status: "Contacting the room relay…" }));
       try {
@@ -655,6 +855,7 @@ export function GameApp() {
                   playerName: config.playerName.trim(),
                 });
 
+        roomClientRef.current = client;
         client.onMessage((message: ServerMessage) => {
           if (message.type === "lobby") {
             setRoomPlayers(message.players);
@@ -669,23 +870,49 @@ export function GameApp() {
               setRoomIdentity(nextIdentity);
               setRoomReady(ownPlayer.ready);
             }
-            setMultiplayer((current) => ({
-              ...current,
-              status: "The room is open. Ready your banner when everyone has joined.",
-            }));
-          } else if (message.type === "started") {
+            if (message.phase === "lobby") {
+              if (latestStateRef.current?.phase === "placement") {
+                bridgeRef.current?.destroy();
+                bridgeRef.current = null;
+                setState(null);
+                setRoomPlacement(null);
+                roomPlacementRef.current = null;
+                setPlacementDeadlineAt(null);
+                setScreen("menu");
+                setTab("multiplayer");
+              }
+              setMultiplayer((current) => ({
+                ...current,
+                status: "The room is open. Ready your banner when everyone has joined.",
+              }));
+            }
+          } else if (message.type === "placement") {
+            roomPlacementRef.current = message;
+            setRoomPlacement(message);
+            setRoomPlayers(message.players);
+            setPlacementDeadlineAt(message.deadlineAt);
+            const ownPlayer = message.players.find((player) => player.id === identity.player.id);
+            if (ownPlayer) {
+              const nextIdentity: RoomIdentity = {
+                ...(roomIdentityRef.current ?? identity),
+                phase: "placement",
+                player: ownPlayer,
+              };
+              roomIdentityRef.current = nextIdentity;
+              setRoomIdentity(nextIdentity);
+            }
             const playerNames: string[] = [];
             for (const player of message.players) playerNames[player.seat] = player.name;
-            const currentSeat =
-              message.players.find((player) => player.id === identity.player.id)?.seat ??
-              identity.player.seat;
+            const currentSeat = ownPlayer?.seat ?? identity.player.seat;
             const current = latestStateRef.current;
-            const alreadyRunning = Boolean(
-              current?.config.multiplayer &&
-              current.map.seed === message.config.seed &&
-              current.map.archetype === message.config.archetype,
-            );
-            if (!alreadyRunning) {
+            if (
+              !current?.config.multiplayer ||
+              current.map.seed !== message.config.seed ||
+              current.map.archetype !== message.config.archetype
+            ) {
+              publishedCandidateHashRef.current = null;
+              publishedFinalVectorRef.current = null;
+              pendingStartedRef.current = null;
               appliedRoomSequencesRef.current.clear();
               roomCommandTargetsRef.current.clear();
               roomAppliedSequenceRef.current = 0;
@@ -702,46 +929,111 @@ export function GameApp() {
                 localPlayerId: currentSeat,
               });
             }
+            // Initial joins and placement reconnects both start a fresh local
+            // Worker at elapsed tick zero. Catch it up to the relay epoch so
+            // deterministic bot choreography never visibly replays.
+            bridgeRef.current?.send({
+              type: "catch-up",
+              targetTick: placementCatchUpTick(message.startedAt),
+            });
+            setMultiplayer((currentStatus) => ({
+              ...currentStatus,
+              status: "Choose and lock a starting center.",
+            }));
+          } else if (message.type === "started") {
+            pendingStartedRef.current = message;
+            const playerNames: string[] = [];
+            for (const player of message.players) playerNames[player.seat] = player.name;
+            const currentSeat =
+              message.players.find((player) => player.id === identity.player.id)?.seat ??
+              identity.player.seat;
+            // The relay's immutable final vector is the handoff contract. A
+            // fresh opening engine avoids racing the last placement broadcast
+            // against a one-shot finalize message on this client's old Worker.
+            appliedRoomSequencesRef.current.clear();
+            roomCommandTargetsRef.current.clear();
+            roomAppliedSequenceRef.current = 0;
+            roomCompletionSentRef.current = false;
+            startGame({
+              ...config,
+              seed: message.config.seed,
+              archetype: message.config.archetype,
+              difficulty: message.config.difficulty,
+              aiCount: message.config.botCount,
+              multiplayer: true,
+              humanSeats: message.players.map((player) => player.seat),
+              playerNames,
+              localPlayerId: currentSeat,
+              startingCenters: message.spawnCenters,
+            });
+            roomPlacementRef.current = null;
+            setRoomPlacement(null);
+            setPlacementDeadlineAt(null);
           } else if (message.type === "command-batch" || message.type === "sync") {
-            if (message.type === "sync" && message.checkpoint?.encoding === "json") {
-              try {
-                const checkpoint = parseEngineSnapshot(
-                  JSON.parse(message.checkpoint.payload) as unknown,
-                );
-                const current = latestStateRef.current;
-                if (!current || current.tick < checkpoint.state.tick) {
-                  bridgeRef.current?.send({
-                    type: "restore",
-                    snapshot: { ...checkpoint, pendingCommands: [] },
-                  });
-                  appliedRoomSequencesRef.current.clear();
-                  roomCommandTargetsRef.current.clear();
-                  roomAppliedSequenceRef.current = message.checkpoint.sequence;
+            void roomMessageQueueRef.current
+              .enqueue(async () => {
+                if (connectionGeneration !== roomConnectionGenerationRef.current) return;
+                if (message.type === "sync" && message.checkpoint) {
+                  try {
+                    const decoded = await decodeCheckpointPayload(
+                      message.checkpoint.encoding,
+                      message.checkpoint.payload,
+                    );
+                    if (connectionGeneration !== roomConnectionGenerationRef.current) return;
+                    const checkpoint = parseEngineSnapshot(decoded);
+                    const current = latestStateRef.current;
+                    const localConfig = current?.config ?? config;
+                    const localizedCheckpoint = localizeCheckpointForRecipient(
+                      checkpoint,
+                      roomIdentityRef.current?.player.seat ?? identity.player.seat,
+                      localConfig,
+                    );
+                    // A sync checkpoint is a canonical repair base, even when
+                    // this client has speculatively advanced beyond its tick.
+                    bridgeRef.current?.send({
+                      type: "restore",
+                      snapshot: localizedCheckpoint,
+                      relaySequence: message.checkpoint.sequence,
+                    });
+                    workerRelaySequenceRef.current = message.checkpoint.sequence;
+                    appliedRoomSequencesRef.current.clear();
+                    roomCommandTargetsRef.current.clear();
+                    roomAppliedSequenceRef.current = message.checkpoint.sequence;
+                  } catch {
+                    setError(
+                      "The reconnect checkpoint was invalid. Requesting the command log instead.",
+                    );
+                  }
                 }
-              } catch {
+                if (connectionGeneration !== roomConnectionGenerationRef.current) return;
+                for (const ordered of message.commands) {
+                  if (ordered.sequence <= roomAppliedSequenceRef.current) continue;
+                  if (appliedRoomSequencesRef.current.has(ordered.sequence)) continue;
+                  appliedRoomSequencesRef.current.add(ordered.sequence);
+                  roomCommandTargetsRef.current.set(ordered.sequence, ordered.targetTick);
+                  bridgeRef.current?.send({
+                    type: "command",
+                    command: { ...ordered.command, scheduledTick: ordered.targetTick },
+                    relaySequence: ordered.sequence,
+                  });
+                }
+                if (message.hasMore) {
+                  const lastInPage =
+                    message.commands.at(-1)?.sequence ??
+                    Math.max(0, ...appliedRoomSequencesRef.current);
+                  client.requestMissing(lastInPage);
+                } else {
+                  bridgeRef.current?.send({ type: "catch-up", targetTick: message.serverTick });
+                }
+              })
+              .catch((reason: unknown) => {
+                if (connectionGeneration !== roomConnectionGenerationRef.current) return;
                 setError(
-                  "The reconnect checkpoint was invalid. Requesting the command log instead.",
+                  reason instanceof Error
+                    ? `Room synchronization failed: ${reason.message}`
+                    : "Room synchronization failed while ordering relay messages.",
                 );
-              }
-            }
-            for (const ordered of message.commands) {
-              if (ordered.sequence <= roomAppliedSequenceRef.current) continue;
-              if (appliedRoomSequencesRef.current.has(ordered.sequence)) continue;
-              appliedRoomSequencesRef.current.add(ordered.sequence);
-              roomCommandTargetsRef.current.set(ordered.sequence, ordered.targetTick);
-              bridgeRef.current?.send({
-                type: "command",
-                command: { ...ordered.command, scheduledTick: ordered.targetTick },
               });
-            }
-            if (message.hasMore) {
-              const lastInPage =
-                message.commands.at(-1)?.sequence ??
-                Math.max(0, ...appliedRoomSequencesRef.current);
-              client.requestMissing(lastInPage);
-            } else {
-              bridgeRef.current?.send({ type: "catch-up", targetTick: message.serverTick });
-            }
           } else if (message.type === "desync") {
             setError(`Synchronization warning at tick ${message.tick}: ${message.message}`);
           } else if (message.type === "complete") {
@@ -756,7 +1048,6 @@ export function GameApp() {
           }
         });
         await client.connect(identity);
-        roomClientRef.current = client;
         roomIdentityRef.current = roomIdentityRef.current ?? identity;
         setRoomIdentity(roomIdentityRef.current);
         setRoomPlayers([identity.player]);
@@ -797,6 +1088,7 @@ export function GameApp() {
   }, []);
 
   const leaveMatch = useCallback(() => {
+    roomConnectionGenerationRef.current += 1;
     bridgeRef.current?.destroy();
     bridgeRef.current = null;
     audioRef.current?.destroy();
@@ -813,6 +1105,8 @@ export function GameApp() {
     roomIdentityRef.current = null;
     setRoomPlayers([]);
     setRoomReady(false);
+    setRoomPlacement(null);
+    setPlacementDeadlineAt(null);
     setState(null);
     setScreen("menu");
     setLoading(false);
@@ -821,11 +1115,20 @@ export function GameApp() {
     roomCommandTargetsRef.current.clear();
     appliedRoomSequencesRef.current.clear();
     pendingCheckpointRef.current = null;
+    workerRelaySequenceRef.current = 0;
     roomCompletionSentRef.current = false;
+    roomPlacementRef.current = null;
+    pendingStartedRef.current = null;
+    publishedCandidateHashRef.current = null;
+    publishedFinalVectorRef.current = null;
+    openingPhaseHandledRef.current = false;
+    if (openingTimerRef.current !== null) window.clearTimeout(openingTimerRef.current);
+    openingTimerRef.current = null;
   }, []);
 
   useEffect(
     () => () => {
+      roomConnectionGenerationRef.current += 1;
       roomClientRef.current?.close();
       bridgeRef.current?.destroy();
       audioRef.current?.destroy();
@@ -847,7 +1150,7 @@ export function GameApp() {
       if (state.tick % 50 === 0) {
         roomClientRef.current?.sendHash(
           state.tick,
-          roomAppliedSequenceRef.current,
+          workerRelaySequenceRef.current,
           state.stateHash,
         );
       }
@@ -859,8 +1162,7 @@ export function GameApp() {
       ) {
         lastCheckpointTickRef.current = state.tick;
         pendingCheckpointRef.current = {
-          tick: state.tick,
-          sequence: roomAppliedSequenceRef.current,
+          requestedTick: state.tick,
         };
         bridgeRef.current?.send({ type: "snapshot" });
       }
@@ -890,12 +1192,66 @@ export function GameApp() {
     }
   }, [startGame]);
 
+  const cancelMulti = useCallback(() => {
+    setMultiPhase("idle");
+    setMultiSources([]);
+    setMultiTargets([]);
+    setMultiKeyHeld(false);
+    rendererRef.current?.setMultiPreview(null);
+  }, []);
+
   const cancelSelection = useCallback(() => {
     setSelectedId(null);
     setHoveredId(null);
     setBuildMode(null);
+    setRallySourceId(null);
+    cancelMulti();
     rendererRef.current?.setRoutePreview(null);
+  }, [cancelMulti]);
+
+  const beginMulti = useCallback(() => {
+    if (latestStateRef.current?.phase !== "running") return;
+    setSelectedId(null);
+    setBuildMode(null);
+    setRallySourceId(null);
+    setMultiSources([]);
+    setMultiTargets([]);
+    setMultiPhase("sources");
   }, []);
+
+  const sendMultiMove = useCallback(
+    (targets = multiTargets) => {
+      const current = latestStateRef.current;
+      if (
+        !current ||
+        current.phase !== "running" ||
+        multiSources.length === 0 ||
+        targets.length === 0
+      )
+        return;
+      const plan = planMultiMove(
+        current,
+        current.config.localPlayerId ?? 0,
+        multiSources,
+        targets,
+        sendPercent,
+      );
+      if (!plan.ok) {
+        setError(plan.reason ?? "The aggregate move is not feasible.");
+        window.setTimeout(() => setError(null), 2_200);
+        return;
+      }
+      dispatchCommand({
+        type: "multi-move",
+        playerId: current.config.localPlayerId ?? 0,
+        sourceIds: multiSources,
+        destinationIds: targets,
+        percent: sendPercent,
+      });
+      cancelMulti();
+    },
+    [cancelMulti, dispatchCommand, multiSources, multiTargets, sendPercent],
+  );
 
   const handleTileHover = useCallback((tileId: string | null) => setHoveredId(tileId), []);
 
@@ -909,8 +1265,79 @@ export function GameApp() {
       }
       const tile = current.map.tiles[tileId];
       if (!tile) return;
+      const localPlayerId = current.config.localPlayerId ?? 0;
+      if (current.phase === "placement") {
+        const placement = current.placement.placements[localPlayerId];
+        if (placement?.locked) return;
+        const placementChoice = validateSpawnChoice(current, localPlayerId, tileId);
+        if (!placementChoice.ok) {
+          setError(
+            placementChoice.reason ?? "Choose a land center with a safe seven-hex starting area.",
+          );
+          window.setTimeout(() => setError(null), 1_800);
+          return;
+        }
+        if (current.config.multiplayer) {
+          try {
+            roomClientRef.current?.claimPlacement(tileId);
+          } catch (reason) {
+            setError(
+              reason instanceof Error ? reason.message : "Could not claim that starting area.",
+            );
+          }
+          // The relay broadcast is the placement authority. Applying the
+          // provisional choice locally before its acknowledgement would leave
+          // an irreversibly divergent claim when the relay rejects a conflict.
+          return;
+        }
+        bridgeRef.current?.send({
+          type: "command",
+          command: { type: "choose-spawn", playerId: localPlayerId, centerId: tileId },
+        });
+        return;
+      }
+      if (current.phase !== "running") return;
+      if (rallySourceId) {
+        const path = findPath(current.map, rallySourceId, tileId, localPlayerId, true);
+        if (!path || path.length < 2) {
+          setError("That rally destination is currently unreachable.");
+          window.setTimeout(() => setError(null), 1_800);
+          return;
+        }
+        dispatchCommand({
+          type: "set-rally",
+          playerId: localPlayerId,
+          tileId: rallySourceId,
+          destinationId: tileId,
+        });
+        setRallySourceId(null);
+        return;
+      }
+      if (multiPhase === "sources") {
+        if (tile.owner !== localPlayerId || tile.troops <= 1) return;
+        setMultiSources((sources) =>
+          sources.includes(tileId)
+            ? sources.filter((sourceId) => sourceId !== tileId)
+            : [...sources, tileId],
+        );
+        return;
+      }
+      if (multiPhase === "targets") {
+        const nextSources = multiSources.filter((sourceId) => sourceId !== tileId);
+        if (nextSources.length !== multiSources.length) setMultiSources(nextSources);
+        if (multiKeyHeld) {
+          setMultiTargets((targets) =>
+            targets.includes(tileId)
+              ? targets.filter((destinationId) => destinationId !== tileId)
+              : [...targets, tileId],
+          );
+        } else {
+          sendMultiMove([tileId]);
+        }
+        return;
+      }
       if (buildMode) {
-        const reason = structureReason(tile, buildMode, current.config.localPlayerId ?? 0, current);
+        const reason = structureReason(tile, buildMode, localPlayerId, current);
         if (reason) {
           setError(reason);
           window.setTimeout(() => setError(null), 1800);
@@ -918,7 +1345,7 @@ export function GameApp() {
         }
         dispatchCommand({
           type: "build",
-          playerId: current.config.localPlayerId ?? 0,
+          playerId: localPlayerId,
           tileId,
           structure: buildMode,
         });
@@ -930,7 +1357,12 @@ export function GameApp() {
           setSelectedId(null);
           return;
         }
-        const path = findClientPath(current, selectedId, tileId, current.config.localPlayerId ?? 0);
+        const selectedSource = current.map.tiles[selectedId];
+        if (selectedSource?.owner !== localPlayerId || selectedSource.troops <= 1) {
+          setSelectedId(tileId);
+          return;
+        }
+        const path = findPath(current.map, selectedId, tileId, localPlayerId, true);
         if (!path) {
           setError(
             "No legal route. Armies may cross friendly territory and take one final hostile step.",
@@ -940,7 +1372,7 @@ export function GameApp() {
         }
         const command: GameCommand = {
           type: "move",
-          playerId: current.config.localPlayerId ?? 0,
+          playerId: localPlayerId,
           sourceId: selectedId,
           destinationId: tileId,
           percent: sendPercent,
@@ -950,12 +1382,21 @@ export function GameApp() {
         rendererRef.current?.setRoutePreview(null);
         return;
       }
-      if (tile.owner === (current.config.localPlayerId ?? 0) && tile.troops > 1) {
-        setSelectedId(tileId);
-        audioRef.current?.playSelection();
-      }
+      setSelectedId(tileId);
+      if (tile.owner === localPlayerId && tile.troops > 1) audioRef.current?.playSelection();
     },
-    [buildMode, selectedId, sendPercent, cancelSelection, dispatchCommand],
+    [
+      buildMode,
+      selectedId,
+      sendPercent,
+      rallySourceId,
+      multiPhase,
+      multiSources,
+      multiKeyHeld,
+      cancelSelection,
+      dispatchCommand,
+      sendMultiMove,
+    ],
   );
 
   const handleTileClickRef = useRef(handleTileClick);
@@ -971,6 +1412,27 @@ export function GameApp() {
     cancelSelectionRef.current = cancelSelection;
   }, [cancelSelection]);
 
+  const lockLocalPlacement = useCallback(() => {
+    const current = latestStateRef.current;
+    if (!current || current.phase !== "placement") return;
+    const playerId = current.config.localPlayerId ?? 0;
+    const placement = current.placement.placements[playerId];
+    if (!placement?.centerId || placement.locked) return;
+    if (current.config.multiplayer) {
+      try {
+        roomClientRef.current?.lockPlacement(placement.centerId);
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : "Could not lock the starting center.");
+      }
+      // Wait for the public placement payload before locking Worker state.
+      return;
+    }
+    bridgeRef.current?.send({
+      type: "command",
+      command: { type: "lock-spawn", playerId },
+    });
+  }, []);
+
   const togglePause = useCallback(() => {
     const paused = !(latestStateRef.current?.paused ?? false);
     bridgeRef.current?.send({ type: "pause", paused });
@@ -982,27 +1444,125 @@ export function GameApp() {
     bridgeRef.current?.send({ type: "speed", speed: value });
   }, []);
 
+  useEffect(() => {
+    const isTypingTarget = (target: EventTarget | null): boolean => {
+      const element = target instanceof HTMLElement ? target : null;
+      return Boolean(
+        element?.isContentEditable || element?.matches("input, textarea, select, button"),
+      );
+    };
+    const battlefieldActive = (): boolean =>
+      screen === "match" && latestStateRef.current?.phase === "running";
+    const cancelTransientInput = (): void => {
+      if (multiPhase !== "idle") cancelMulti();
+    };
+    const keydown = (event: KeyboardEvent) => {
+      if (isTypingTarget(event.target) || !battlefieldActive()) return;
+      if (event.key === "Shift") {
+        if (event.repeat) return;
+        setMultiKeyHeld(true);
+        if (multiPhase === "idle") beginMulti();
+        return;
+      }
+      if (["1", "2", "3", "4"].includes(event.key)) {
+        const percentages: SendPercent[] = [25, 50, 75, 100];
+        setSendPercent(percentages[Number(event.key) - 1]!);
+      } else if (event.key === "Escape") {
+        cancelSelection();
+      } else if (event.key === " " && !config.multiplayer) {
+        event.preventDefault();
+        togglePause();
+      } else if (["f", "b", "t"].includes(event.key.toLowerCase())) {
+        cancelMulti();
+        setSelectedId(null);
+        setRallySourceId(null);
+        const type =
+          event.key.toLowerCase() === "f"
+            ? "farm"
+            : event.key.toLowerCase() === "b"
+              ? "barracks"
+              : "turret";
+        setBuildMode((mode) => (mode === type ? null : type));
+      } else if (event.key.toLowerCase() === "g" && config.debug) {
+        setScoreOpen((open) => !open);
+      }
+    };
+    const keyup = (event: KeyboardEvent) => {
+      if (event.key !== "Shift" || isTypingTarget(event.target)) return;
+      setMultiKeyHeld(false);
+      if (!battlefieldActive()) {
+        cancelTransientInput();
+        return;
+      }
+      if (multiPhase === "sources") {
+        if (multiSources.length === 0) cancelMulti();
+        else setMultiPhase("targets");
+      } else if (multiPhase === "targets" && multiTargets.length > 0) {
+        sendMultiMove();
+      }
+    };
+    const blur = () => cancelTransientInput();
+    const visibility = () => {
+      if (document.visibilityState !== "visible") cancelTransientInput();
+    };
+    window.addEventListener("keydown", keydown);
+    window.addEventListener("keyup", keyup);
+    window.addEventListener("blur", blur);
+    document.addEventListener("visibilitychange", visibility);
+    return () => {
+      window.removeEventListener("keydown", keydown);
+      window.removeEventListener("keyup", keyup);
+      window.removeEventListener("blur", blur);
+      document.removeEventListener("visibilitychange", visibility);
+    };
+  }, [
+    beginMulti,
+    cancelMulti,
+    cancelSelection,
+    config.debug,
+    config.multiplayer,
+    multiPhase,
+    multiSources.length,
+    multiTargets.length,
+    screen,
+    sendMultiMove,
+    togglePause,
+  ]);
+
+  useEffect(() => {
+    if (!state || state.phase !== "running" || multiPhase === "idle") {
+      rendererRef.current?.setMultiPreview(null);
+      return;
+    }
+    const destinationIds =
+      multiPhase === "targets" && hoveredId && !multiTargets.includes(hoveredId)
+        ? [...multiTargets, hoveredId]
+        : multiTargets;
+    const plan: MultiMovePlan | null =
+      multiSources.length > 0 && destinationIds.length > 0
+        ? planMultiMove(
+            state,
+            state.config.localPlayerId ?? 0,
+            multiSources,
+            destinationIds,
+            sendPercent,
+          )
+        : null;
+    rendererRef.current?.setMultiPreview({
+      sourceIds: multiSources,
+      destinationIds,
+      plan,
+    });
+  }, [hoveredId, multiPhase, multiSources, multiTargets, sendPercent, state]);
+
   const localPlayerId = config.localPlayerId ?? 0;
   const selectedTile = selectedId && state ? state.map.tiles[selectedId] : undefined;
   const hoveredTile = hoveredId && state ? state.map.tiles[hoveredId] : undefined;
   const human = state?.players[localPlayerId];
-  const incomeMilli = useMemo(() => {
-    if (!state || !human) return 0;
-    let perSecond = human.tileCount * BALANCE.tileIncomeMilliPerSecond;
-    for (const tileId of state.map.landIds) {
-      const tile = state.map.tiles[tileId]!;
-      if (
-        tile.owner === localPlayerId &&
-        tile.structure?.type === "farm" &&
-        tile.structure.status === "active"
-      ) {
-        perSecond += Math.round(
-          (BALANCE.farm.incomeMilliPerSecond * tile.structure.integrity) / 1000,
-        );
-      }
-    }
-    return perSecond;
-  }, [state, human, localPlayerId]);
+  const incomeMilli = useMemo(
+    () => (state && human ? calculateIncomeMilliPerSecond(state, localPlayerId) : 0),
+    [state, human, localPlayerId],
+  );
 
   const sortedPlayers = useMemo(
     () =>
@@ -1019,14 +1579,14 @@ export function GameApp() {
   const selectedStructureProgress = useMemo(() => {
     const structure = selectedTile?.structure;
     if (!structure) return 0;
-    if (structure.status === "constructing") {
+    if (structure.pendingProgressTicks !== null) {
       const required =
         structure.type === "farm"
           ? BALANCE.farm.buildTicks
           : structure.type === "barracks"
             ? BALANCE.barracks.buildTicks
             : BALANCE.turret.buildTicks;
-      return Math.min(100, Math.round((structure.progressTicks / required) * 100));
+      return Math.min(100, Math.round((structure.pendingProgressTicks / required) * 100));
     }
     if (structure.status === "seized")
       return Math.min(100, Math.round((structure.seizedTicks / BALANCE.seizedTicks) * 100));
@@ -1042,10 +1602,122 @@ export function GameApp() {
     if (structure.type === "barracks")
       return Math.min(
         100,
-        Math.round((structure.progressTicks / BALANCE.barracks.trainTicks) * 100),
+        Math.round(
+          (structure.barracksProgressMilli /
+            (BALANCE.barracks.trainTicks * BALANCE.fullIntegrity)) *
+            100,
+        ),
+      );
+    if (structure.type === "turret")
+      return Math.min(
+        100,
+        Math.round(
+          (structure.turretShotProgressMilli / (BALANCE.turret.shotTicks * BALANCE.fullIntegrity)) *
+            100,
+        ),
       );
     return 100;
   }, [selectedTile]);
+  const selectedStructureProgressLabel = useMemo(() => {
+    const structure = selectedTile?.structure;
+    if (!structure) return "No structure progress";
+    if (structure.pendingProgressTicks !== null) {
+      return `Construction ${selectedStructureProgress}%`;
+    }
+    if (structure.status === "seized") {
+      return `Seizure recovery ${selectedStructureProgress}%`;
+    }
+    if (structure.status === "repairing") {
+      return `Integrity repair ${selectedStructureProgress}%`;
+    }
+    if (structure.type === "barracks") {
+      return `Barracks production cycle ${selectedStructureProgress}%`;
+    }
+    if (structure.type === "turret") {
+      return `Turret volley accumulator ${selectedStructureProgress}%`;
+    }
+    return `Structure operational ${selectedStructureProgress}%`;
+  }, [selectedStructureProgress, selectedTile]);
+  const selectedBattle =
+    selectedTile && state
+      ? state.battles.find((battle) => battle.tileId === selectedTile.id)
+      : undefined;
+  const selectedBattleParticipants = useMemo(
+    () => (state && selectedBattle ? battlePresentation(state, selectedBattle) : []),
+    [selectedBattle, state],
+  );
+  const selectedEnclosure =
+    selectedTile && state
+      ? state.enclosures.find((enclosure) => enclosure.tileIds.includes(selectedTile.id))
+      : undefined;
+  const selectedTurretSupportStatus = useMemo(() => {
+    const structure = selectedTile?.structure;
+    if (!state || !selectedTile || structure?.type !== "turret") return null;
+    if (
+      selectedTile.owner === null ||
+      structure.completedCount === 0 ||
+      (structure.status !== "active" && structure.status !== "repairing")
+    ) {
+      return "Turret support inactive";
+    }
+    const owner = selectedTile.owner;
+    const eligible = (battle: GameState["battles"][number]): boolean =>
+      battle.participants.some(
+        (participant) => participant.playerId === owner && participant.troops > 0,
+      ) &&
+      battle.participants.some(
+        (participant) => participant.playerId !== owner && participant.troops > 0,
+      );
+    const home = state.battles.find(
+      (battle) => battle.tileId === selectedTile.id && eligible(battle),
+    );
+    const adjacentIds = new Set(neighbors(selectedTile).map(axialKey));
+    const targets = home
+      ? [home]
+      : state.battles
+          .filter((battle) => adjacentIds.has(battle.tileId) && eligible(battle))
+          .sort((left, right) => left.tileId.localeCompare(right.tileId));
+    if (targets.length === 0) {
+      return `Turret x${structure.completedCount} ready; no eligible nearby battle`;
+    }
+    return `Turret x${structure.completedCount} supporting ${targets.length} ${
+      targets.length === 1 ? "battle" : "battles"
+    }: ${targets.map((battle) => battle.tileId).join(", ")}${home ? " (home priority)" : ""}`;
+  }, [selectedTile, state]);
+  const selectedRallyBlocked = Boolean(
+    state &&
+    selectedTile?.structure?.type === "barracks" &&
+    selectedTile.structure.rallyTargetId &&
+    isBarracksRallyBlocked(state, selectedTile, selectedTile.structure),
+  );
+  const localPlacement = state?.placement.placements[localPlayerId];
+  const placementSeconds =
+    state?.phase === "placement" && placementDeadlineAt !== null
+      ? Math.max(0, Math.ceil((placementDeadlineAt - placementNow) / 1000))
+      : null;
+  const stagedMultiPlan = useMemo<MultiMovePlan | null>(() => {
+    if (
+      !state ||
+      state.phase !== "running" ||
+      multiSources.length === 0 ||
+      multiTargets.length === 0
+    )
+      return null;
+    return planMultiMove(state, localPlayerId, multiSources, multiTargets, sendPercent);
+  }, [localPlayerId, multiSources, multiTargets, sendPercent, state]);
+  const multiAvailableTroops = useMemo(() => {
+    if (!state) return 0;
+    const destinationSet = new Set(multiTargets);
+    return multiSources.reduce((sum, tileId) => {
+      const tile = state.map.tiles[tileId];
+      return (
+        sum +
+        (tile && tile.owner === localPlayerId && !destinationSet.has(tileId)
+          ? troopsForPercent(tile.troops, sendPercent)
+          : 0)
+      );
+    }, 0);
+  }, [localPlayerId, multiSources, multiTargets, sendPercent, state]);
   const debugRoutes = useMemo<{ friendly: DebugRoute | null; hostile: DebugRoute | null }>(() => {
     if (!state?.config.debug) return { friendly: null, hostile: null };
     let friendly: DebugRoute | null = null;
@@ -1591,6 +2263,58 @@ export function GameApp() {
     <main className="game-screen" data-testid="game-screen">
       <div className="battlefield-host" ref={hostRef} />
       <div className="map-vignette" aria-hidden="true" />
+      {state?.phase === "placement" && (
+        <section
+          className="placement-panel"
+          data-testid="placement-panel"
+          aria-labelledby="placement-title"
+        >
+          <header>
+            <span>Before the first tick</span>
+            <h1 id="placement-title">Choose your dominion</h1>
+            <p>
+              Select a highlighted center. Its seven-hex footprint remains provisional until you
+              lock it.
+            </p>
+          </header>
+          <div className="placement-roster" aria-label="Starting center status">
+            {state.placement.placements.map((placement) => {
+              const player = state.players[placement.playerId]!;
+              return (
+                <div key={placement.playerId} className={placement.locked ? "is-locked" : ""}>
+                  <i style={{ background: `#${player.color.toString(16).padStart(6, "0")}` }} />
+                  <span>
+                    <strong>{player.name}</strong>
+                    <small>{placement.centerId ?? "Choosing a center"}</small>
+                  </span>
+                  <b>{placement.locked ? "LOCKED" : "PROVISIONAL"}</b>
+                </div>
+              );
+            })}
+          </div>
+          <footer>
+            <span aria-live="polite">
+              {placementSeconds === null
+                ? "Single-player waits for your lock"
+                : `${placementSeconds}s until deterministic assignment`}
+            </span>
+            <button
+              type="button"
+              data-testid="lock-placement"
+              disabled={!localPlacement?.centerId || localPlacement.locked}
+              onClick={lockLocalPlacement}
+            >
+              {localPlacement?.locked ? "Center locked" : "Lock In"}
+            </button>
+          </footer>
+        </section>
+      )}
+      {state?.phase === "opening" && (
+        <div className="opening-banner" data-testid="opening-banner" role="status">
+          <span>Your banner rises</span>
+          <strong>The realm opens…</strong>
+        </div>
+      )}
       <header className="hud-top">
         <button
           className="hud-brand"
@@ -1631,7 +2355,11 @@ export function GameApp() {
           className="time-controls"
           aria-label={config.multiplayer ? "Live multiplayer status" : "Simulation speed"}
         >
-          {config.multiplayer ? (
+          {state?.phase === "placement" || state?.phase === "opening" ? (
+            <span className="live-status">
+              <i /> {state.phase === "placement" ? "PLACEMENT" : "OPENING"}
+            </span>
+          ) : config.multiplayer ? (
             <span className="live-status">
               <i /> LIVE
             </span>
@@ -1741,6 +2469,28 @@ export function GameApp() {
               </small>
             </div>
           ))}
+        {state?.enclosures.map((enclosure) => {
+          const remainingTicks = Math.max(0, BALANCE.encirclementTicks - enclosure.progressTicks);
+          const captor =
+            state.players[enclosure.captorId]?.name ?? `Player ${enclosure.captorId + 1}`;
+          return (
+            <div
+              key={`enclosure-${enclosure.id}`}
+              className="event-feed__item event-feed__item--encirclement"
+              data-testid={`enclosure-summary-${enclosure.id}`}
+              role="status"
+            >
+              <i />
+              <span>
+                {captor} encircles a {enclosure.tileIds.length}-tile pocket
+              </span>
+              <small>
+                {remainingTicks} {remainingTicks === 1 ? "tick" : "ticks"} ·{" "}
+                {(remainingTicks / TICKS_PER_SECOND).toFixed(1)}s
+              </small>
+            </div>
+          );
+        })}
       </aside>
 
       {selectedTile && (
@@ -1781,101 +2531,289 @@ export function GameApp() {
               <strong>{selectedTile.structure ? selectedTile.structure.type : "None"}</strong>
             </span>
           </div>
+          {selectedBattle && (
+            <div
+              className="structure-status"
+              data-testid="battle-participant-roster"
+              aria-label={`Battle participants at ${selectedTile.id}`}
+            >
+              <span aria-hidden="true">BATTLE</span>
+              <span role="list">
+                <strong>Battle participants</strong>
+                {selectedBattleParticipants.map((participant) => {
+                  const name =
+                    participant.playerId === null
+                      ? "Neutral defenders"
+                      : (state?.players[participant.playerId]?.name ??
+                        `Player ${participant.playerId + 1}`);
+                  return (
+                    <small
+                      key={participant.playerId ?? "neutral"}
+                      data-testid={`battle-participant-${participant.playerId ?? "neutral"}`}
+                      role="listitem"
+                    >
+                      {name} · {participant.troops} troops ·
+                      {` ${(participant.sharePermyriad / 100).toFixed(2)}% effective share`}
+                      {participant.incumbent ? " · incumbent" : ""}
+                      {participant.turretSupportCount > 0
+                        ? ` · supported by Turret x${participant.turretSupportCount}`
+                        : ""}
+                    </small>
+                  );
+                })}
+              </span>
+            </div>
+          )}
+          {selectedEnclosure && state && (
+            <div className="structure-status" data-testid="enclosure-status" role="status">
+              <span aria-hidden="true">RING</span>
+              <span>
+                <strong>
+                  Encirclement by
+                  {` ${state.players[selectedEnclosure.captorId]?.name ?? `Player ${selectedEnclosure.captorId + 1}`}`}
+                </strong>
+                <small>
+                  {selectedEnclosure.tileIds.length}-tile pocket ·
+                  {` ${Math.max(0, BALANCE.encirclementTicks - selectedEnclosure.progressTicks)} ${Math.max(0, BALANCE.encirclementTicks - selectedEnclosure.progressTicks) === 1 ? "tick" : "ticks"} · `}
+                  {(
+                    Math.max(0, BALANCE.encirclementTicks - selectedEnclosure.progressTicks) /
+                    TICKS_PER_SECOND
+                  ).toFixed(1)}{" "}
+                  seconds remaining
+                </small>
+              </span>
+            </div>
+          )}
           {selectedTile.structure && (
             <div className="structure-status">
               <StructureGlyph type={selectedTile.structure.type} />
               <span>
-                <strong>{selectedTile.structure.type}</strong>
+                <strong>
+                  {selectedTile.structure.type} x{selectedTile.structure.completedCount}
+                  {selectedTile.structure.pendingProgressTicks !== null ? " +1" : ""}
+                </strong>
                 <small>
-                  {selectedTile.structure.status} ·{" "}
+                  {selectedTile.structure.pendingProgressTicks !== null
+                    ? "constructing next copy"
+                    : (selectedTile.structure.status ?? "foundation")}
+                  {" · "}
                   {Math.round(selectedTile.structure.integrity / 10)}% integrity
+                  {selectedTile.structure.type === "barracks" &&
+                    ` · ${selectedTile.structure.productionPaused ? "production paused" : "producing"}`}
+                  {selectedTile.structure.type === "barracks" &&
+                    selectedTile.structure.rallyTargetId &&
+                    ` · rally ${selectedRallyBlocked ? "blocked" : "active"} to ${selectedTile.structure.rallyTargetId}`}
                 </small>
-                <i className="structure-progress">
+                {selectedTile.structure.type === "barracks" &&
+                  selectedTile.structure.rallyQueuedTroops > 0 && (
+                    <small data-testid="rally-queued-status">
+                      {selectedTile.structure.rallyQueuedTroops} trained troops queued
+                    </small>
+                  )}
+                {selectedTurretSupportStatus && (
+                  <small data-testid="turret-support-status">{selectedTurretSupportStatus}</small>
+                )}
+                <small data-testid="structure-progress-text">
+                  {selectedStructureProgressLabel}
+                </small>
+                <i
+                  className="structure-progress"
+                  role="progressbar"
+                  aria-label={selectedStructureProgressLabel}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={selectedStructureProgress}
+                >
                   <b style={{ width: `${selectedStructureProgress}%` }} />
                 </i>
               </span>
-              {selectedTile.structure.status === "constructing" ? (
-                <button
-                  onClick={() =>
-                    dispatchCommand({
-                      type: "cancel-build",
-                      playerId: localPlayerId,
-                      tileId: selectedTile.id,
-                    })
-                  }
-                >
-                  Cancel
-                </button>
-              ) : (
-                selectedTile.structure.type === "barracks" && (
+              {selectedTile.owner === localPlayerId &&
+                (selectedTile.structure.pendingProgressTicks !== null ? (
                   <button
                     onClick={() =>
                       dispatchCommand({
-                        type: "toggle-barracks",
+                        type: "cancel-build",
                         playerId: localPlayerId,
                         tileId: selectedTile.id,
                       })
                     }
                   >
-                    {selectedTile.structure.productionPaused ? "Resume" : "Pause"}
+                    Cancel
                   </button>
-                )
-              )}
+                ) : (
+                  selectedTile.structure.type === "barracks" &&
+                  selectedTile.structure.completedCount > 0 && (
+                    <button
+                      onClick={() =>
+                        dispatchCommand({
+                          type: "toggle-barracks",
+                          playerId: localPlayerId,
+                          tileId: selectedTile.id,
+                        })
+                      }
+                    >
+                      {selectedTile.structure.productionPaused ? "Resume" : "Pause"}
+                    </button>
+                  )
+                ))}
+              {selectedTile.structure.type === "barracks" &&
+                selectedTile.structure.completedCount > 0 &&
+                selectedTile.owner === localPlayerId && (
+                  <div className="rally-actions">
+                    <button
+                      type="button"
+                      className={rallySourceId === selectedTile.id ? "is-active" : ""}
+                      onClick={() => {
+                        cancelMulti();
+                        setBuildMode(null);
+                        setRallySourceId(selectedTile.id);
+                      }}
+                    >
+                      Set Rally Point
+                    </button>
+                    {selectedTile.structure.rallyTargetId && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          dispatchCommand({
+                            type: "clear-rally",
+                            playerId: localPlayerId,
+                            tileId: selectedTile.id,
+                          })
+                        }
+                      >
+                        Clear Rally Point
+                      </button>
+                    )}
+                  </div>
+                )}
             </div>
           )}
         </aside>
       )}
 
-      <div className="command-dock">
-        <div className="send-control">
-          <span>Dispatch</span>
-          {([25, 50, 75, 100] as const).map((value, index) => (
-            <button
-              key={value}
-              className={sendPercent === value ? "is-active" : ""}
-              onClick={() => setSendPercent(value)}
-              aria-pressed={sendPercent === value}
-            >
-              <b>{value}%</b>
-              <small>{index + 1}</small>
-            </button>
-          ))}
-          <em>
-            {selectedTile
-              ? `Send ${Math.max(0, Math.min(selectedTile.troops - 1, Math.floor((selectedTile.troops * sendPercent) / 100)))} troops`
-              : "Select a garrison"}
-          </em>
-        </div>
-        <div className="dock-divider" />
-        <div className="build-control">
-          <span>Raise structure</span>
-          {(["farm", "barracks", "turret"] as const).map((type) => {
-            const cost =
-              type === "farm"
-                ? BALANCE.farm.costMilli
-                : type === "barracks"
-                  ? BALANCE.barracks.costMilli
-                  : BALANCE.turret.costMilli;
-            return (
+      {state?.phase === "running" && (
+        <div className="command-dock">
+          <div className="send-control">
+            <span>Dispatch</span>
+            {([25, 50, 75, 100] as const).map((value, index) => (
               <button
-                key={type}
-                data-testid={`build-${type}`}
-                className={buildMode === type ? "is-active" : ""}
-                onClick={() => setBuildMode((mode) => (mode === type ? null : type))}
-                aria-pressed={buildMode === type}
+                key={value}
+                className={sendPercent === value ? "is-active" : ""}
+                onClick={() => setSendPercent(value)}
+                aria-pressed={sendPercent === value}
               >
-                <StructureGlyph type={type} />
-                <span>
-                  <b>{type}</b>
-                  <small>
-                    {formatSupply(cost)} supply · {type[0]!.toUpperCase()}
-                  </small>
-                </span>
+                <b>{value}%</b>
+                <small>{index + 1}</small>
               </button>
-            );
-          })}
+            ))}
+            <em>
+              {selectedTile
+                ? `Send ${Math.max(0, Math.min(selectedTile.troops - 1, Math.floor((selectedTile.troops * sendPercent) / 100)))} troops`
+                : "Select a garrison"}
+            </em>
+            <button
+              type="button"
+              className={`multi-launch ${multiPhase !== "idle" ? "is-active" : ""}`}
+              aria-pressed={multiPhase !== "idle"}
+              aria-label="Start Multi movement selection"
+              onClick={() => {
+                if (multiPhase !== "idle") cancelMulti();
+                else {
+                  beginMulti();
+                  setMultiKeyHeld(true);
+                }
+              }}
+            >
+              Multi <kbd>Shift</kbd>
+            </button>
+          </div>
+          <div className="dock-divider" />
+          <div className="build-control">
+            <span>Raise structure</span>
+            {(["farm", "barracks", "turret"] as const).map((type) => {
+              const cost =
+                type === "farm"
+                  ? BALANCE.farm.costMilli
+                  : type === "barracks"
+                    ? BALANCE.barracks.costMilli
+                    : BALANCE.turret.costMilli;
+              return (
+                <button
+                  key={type}
+                  data-testid={`build-${type}`}
+                  className={buildMode === type ? "is-active" : ""}
+                  onClick={() => {
+                    cancelMulti();
+                    setRallySourceId(null);
+                    setSelectedId(null);
+                    setBuildMode((mode) => (mode === type ? null : type));
+                  }}
+                  aria-pressed={buildMode === type}
+                >
+                  <StructureGlyph type={type} />
+                  <span>
+                    <b>{type}</b>
+                    <small>
+                      {formatSupply(cost)} supply · {type[0]!.toUpperCase()}
+                    </small>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
         </div>
-      </div>
+      )}
+
+      {state?.phase === "running" && multiPhase !== "idle" && (
+        <section className="multi-panel" data-testid="multi-panel" aria-label="Multi movement">
+          <header aria-live="polite">
+            <span>MULTI · {multiPhase === "sources" ? "SELECT SOURCES" : "CHOOSE TARGETS"}</span>
+            <strong>
+              {multiSources.length} source{multiSources.length === 1 ? "" : "s"} ·{" "}
+              {multiTargets.length} target{multiTargets.length === 1 ? "" : "s"}
+            </strong>
+          </header>
+          <p>
+            {multiAvailableTroops} troops at {sendPercent}%
+            {stagedMultiPlan?.ok
+              ? ` · ${stagedMultiPlan.destinationQuotas.map((quota) => quota.troops).join(" / ")} projected`
+              : stagedMultiPlan?.reason
+                ? ` · ${stagedMultiPlan.reason}`
+                : ""}
+          </p>
+          <div>
+            <button
+              type="button"
+              className={multiPhase === "sources" ? "is-active" : ""}
+              onClick={() => {
+                setMultiPhase("sources");
+                setMultiTargets([]);
+                setMultiKeyHeld(true);
+              }}
+            >
+              Select Sources
+            </button>
+            <button
+              type="button"
+              className={multiPhase === "targets" ? "is-active" : ""}
+              disabled={multiSources.length === 0}
+              onClick={() => {
+                setMultiPhase("targets");
+                setMultiKeyHeld(true);
+              }}
+            >
+              Choose Targets
+            </button>
+            <button type="button" disabled={!stagedMultiPlan?.ok} onClick={() => sendMultiMove()}>
+              Send
+            </button>
+            <button type="button" onClick={cancelMulti}>
+              Cancel
+            </button>
+          </div>
+        </section>
+      )}
 
       {buildMode && (
         <div className={`build-tooltip ${buildReason ? "is-invalid" : ""}`}>
@@ -1888,6 +2826,19 @@ export function GameApp() {
             </small>
           </span>
           <kbd>Esc</kbd>
+        </div>
+      )}
+
+      {rallySourceId && (
+        <div className="build-tooltip rally-tooltip" role="status">
+          <StructureGlyph type="barracks" />
+          <span>
+            <strong>Choose rally destination</strong>
+            <small>Friendly, neutral, or one reachable hostile final step.</small>
+          </span>
+          <button type="button" onClick={() => setRallySourceId(null)}>
+            Cancel
+          </button>
         </div>
       )}
 

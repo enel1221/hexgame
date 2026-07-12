@@ -1,15 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
   axialKey,
-  createGame,
+  cloneDeterministic,
+  executeMultiMove,
   findPath,
   issueMoveOrder,
   movementTicksForTile,
   neighbors,
   tickMovement,
+  planMultiMove,
   troopsForPercent,
 } from "../../src/core";
-import { TEST_CONFIG } from "./fixtures";
+import { createRunningGame, TEST_CONFIG } from "./fixtures";
 
 describe("army movement", () => {
   it.each([
@@ -22,7 +24,7 @@ describe("army movement", () => {
   });
 
   it("takes longer to cross Hills than ordinary land", () => {
-    const state = createGame({ ...TEST_CONFIG, seed: "hill-movement" }).state;
+    const state = createRunningGame({ ...TEST_CONFIG, seed: "hill-movement" }).state;
     const tile = state.map.tiles[state.map.spawnClusters[0]![1]!]!;
     tile.terrain = "plains";
     const ordinary = movementTicksForTile(tile);
@@ -31,7 +33,7 @@ describe("army movement", () => {
   });
 
   it("always leaves one troop and exposes smooth segment progress", () => {
-    const state = createGame({ ...TEST_CONFIG, seed: "movement" }).state;
+    const state = createRunningGame({ ...TEST_CONFIG, seed: "movement" }).state;
     const source = state.map.tiles[state.map.spawnCenters[0]!]!;
     const destination = neighbors(source)
       .map((hex) => state.map.tiles[axialKey(hex)])
@@ -50,7 +52,7 @@ describe("army movement", () => {
   });
 
   it("stops at the last legal friendly tile when a route is completely cut", () => {
-    const state = createGame({ ...TEST_CONFIG, seed: "route-cut" }).state;
+    const state = createRunningGame({ ...TEST_CONFIG, seed: "route-cut" }).state;
     const cluster = state.map.spawnClusters[0]!;
     let sourceId = "";
     let destinationId = "";
@@ -78,7 +80,7 @@ describe("army movement", () => {
   });
 
   it("stops when an intermediate tile changes hands after the army reaches it", () => {
-    const state = createGame({ ...TEST_CONFIG, seed: "audit-route" }).state;
+    const state = createRunningGame({ ...TEST_CONFIG, seed: "audit-route" }).state;
     const owned = state.map.spawnClusters[0]!;
     const route = owned
       .flatMap((sourceId) =>
@@ -100,5 +102,92 @@ describe("army movement", () => {
     expect(source.troops).toBe(10);
     expect(state.battles).toHaveLength(0);
     expect(state.events.at(-1)?.type).toBe("route-interrupted");
+  });
+
+  it("plans one atomic multi-source order with exact even destination quotas", () => {
+    const state = createRunningGame({ ...TEST_CONFIG, seed: "multi-even" }).state;
+    const [sourceA, sourceB, sourceC, destinationA, destinationB] = state.map.spawnClusters[0]!;
+    for (const id of [sourceA, sourceB, sourceC]) state.map.tiles[id!]!.troops = 10;
+    const plan = planMultiMove(
+      state,
+      0,
+      [sourceC!, sourceA!, sourceB!],
+      [destinationB!, destinationA!],
+      100,
+    );
+    expect(plan.ok).toBe(true);
+    expect(plan.pooledTroops).toBe(27);
+    expect(plan.destinationQuotas.map(({ troops }) => troops).sort((a, b) => a - b)).toEqual([
+      13, 14,
+    ]);
+
+    const beforeEntity = state.nextEntityId;
+    expect(
+      executeMultiMove(
+        state,
+        0,
+        [sourceC!, sourceA!, sourceB!],
+        [destinationB!, destinationA!],
+        100,
+      ).ok,
+    ).toBe(true);
+    expect(state.map.tiles[sourceA!]!.troops).toBe(1);
+    expect(state.map.tiles[sourceB!]!.troops).toBe(1);
+    expect(state.map.tiles[sourceC!]!.troops).toBe(1);
+    expect(state.stacks.reduce((sum, stack) => sum + stack.troops, 0)).toBe(27);
+    expect(state.stacks.map((stack) => stack.id)).toEqual(
+      Array.from({ length: state.stacks.length }, (_, index) => beforeEntity + index),
+    );
+  });
+
+  it("is selection-order invariant and rejects infeasible allocation without mutation", () => {
+    const original = createRunningGame({ ...TEST_CONFIG, seed: "multi-atomic" }).state;
+    const [sourceA, sourceB, destinationA, destinationB] = original.map.spawnClusters[0]!;
+    original.map.tiles[sourceA!]!.troops = 12;
+    original.map.tiles[sourceB!]!.troops = 8;
+    const left = planMultiMove(
+      original,
+      0,
+      [sourceA!, sourceB!],
+      [destinationA!, destinationB!],
+      75,
+    );
+    const right = planMultiMove(
+      original,
+      0,
+      [sourceB!, sourceA!],
+      [destinationB!, destinationA!],
+      75,
+    );
+    expect(right).toEqual(left);
+
+    const unreachable = original.map.landIds.find(
+      (id) => original.map.tiles[id]!.owner !== 0 && !findPath(original.map, sourceA!, id, 0, true),
+    )!;
+    const troopsBefore = original.map.tiles[sourceA!]!.troops;
+    const stacksBefore = cloneDeterministic(original.stacks);
+    expect(executeMultiMove(original, 0, [sourceA!], [unreachable], 100).ok).toBe(false);
+    expect(original.map.tiles[sourceA!]!.troops).toBe(troopsBefore);
+    expect(original.stacks).toEqual(stacksBefore);
+  });
+
+  it("replans from surviving sources and reclassifies a source selected as the destination", () => {
+    const state = createRunningGame({ ...TEST_CONFIG, seed: "multi-stale-reclassify" }).state;
+    const [sourceA, sourceB, destination] = state.map.spawnClusters[0]!;
+    state.map.tiles[sourceA!]!.troops = 11;
+    state.map.tiles[sourceB!]!.troops = 9;
+
+    state.map.tiles[sourceA!]!.owner = 1;
+    const stale = planMultiMove(state, 0, [sourceA!, sourceB!], [destination!], 100);
+    expect(stale.ok).toBe(true);
+    expect(stale.sourceContributions).toEqual([{ sourceId: sourceB, troops: 8 }]);
+
+    state.map.tiles[sourceA!]!.owner = 0;
+    const sourceATroops = state.map.tiles[sourceA!]!.troops;
+    const sourceBTroops = state.map.tiles[sourceB!]!.troops;
+    expect(executeMultiMove(state, 0, [sourceA!, sourceB!], [sourceA!], 100).ok).toBe(true);
+    expect(state.map.tiles[sourceA!]!.troops).toBe(sourceATroops);
+    expect(state.map.tiles[sourceB!]!.troops).toBe(1);
+    expect(state.stacks.reduce((sum, stack) => sum + stack.troops, 0)).toBe(sourceBTroops - 1);
   });
 });

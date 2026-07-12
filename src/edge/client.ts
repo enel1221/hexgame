@@ -15,7 +15,7 @@ import {
 
 export interface RoomIdentity {
   roomCode: string;
-  phase: "lobby" | "started" | "complete";
+  phase: "lobby" | "placement" | "started" | "complete";
   config: RoomConfig;
   player: PlayerSummary;
   reconnectToken: string;
@@ -125,6 +125,44 @@ export class MultiplayerClient {
     this.send({ type: "start", requestId });
   }
 
+  publishPlacementCandidates(
+    generationAttempt: number,
+    candidateHash: string,
+    candidates: string[],
+    requestId?: string,
+  ): void {
+    this.send({
+      type: "placement-candidates",
+      generationAttempt,
+      candidateHash,
+      candidates,
+      requestId,
+    });
+  }
+
+  claimPlacement(centerId: string, requestId?: string): void {
+    this.send({ type: "placement-claim", centerId, requestId });
+  }
+
+  lockPlacement(centerId: string, requestId?: string): void {
+    this.send({ type: "placement-lock", centerId, requestId });
+  }
+
+  finalizePlacement(
+    generationAttempt: number,
+    candidateHash: string,
+    spawnCenters: string[],
+    requestId?: string,
+  ): void {
+    this.send({
+      type: "placement-finalize",
+      generationAttempt,
+      candidateHash,
+      spawnCenters,
+      requestId,
+    });
+  }
+
   sendCommand(command: GameCommand, requestId?: string): number {
     const clientSequence = this.nextClientSequence;
     this.send({ type: "command", clientSequence, command, requestId });
@@ -141,7 +179,7 @@ export class MultiplayerClient {
       tick: number;
       sequence: number;
       hash: string;
-      encoding: "json" | "base64";
+      encoding: "json" | "base64" | "gzip-base64";
       payload: string;
     },
     requestId?: string,

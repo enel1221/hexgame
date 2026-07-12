@@ -61,6 +61,60 @@ describe("multiplayer protocol schemas", () => {
         percent: 33,
       }).success,
     ).toBe(false);
+    expect(
+      GameCommandSchema.safeParse({
+        type: "multi-move",
+        playerId: 0,
+        sourceIds: ["0,0", "0,0"],
+        destinationIds: ["1,0"],
+        percent: 50,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("validates placement, rally, and bounded atomic multi-move messages", () => {
+    expect(
+      GameCommandSchema.parse({
+        type: "multi-move",
+        playerId: 0,
+        sourceIds: Array.from({ length: 64 }, (_, index) => `${index},0`),
+        destinationIds: Array.from({ length: 16 }, (_, index) => `${index},1`),
+        percent: 75,
+      }),
+    ).toMatchObject({ type: "multi-move", percent: 75 });
+    expect(
+      GameCommandSchema.safeParse({
+        type: "multi-move",
+        playerId: 0,
+        sourceIds: Array.from({ length: 65 }, (_, index) => `${index},0`),
+        destinationIds: ["0,1"],
+        percent: 75,
+      }).success,
+    ).toBe(false);
+    expect(
+      GameCommandSchema.safeParse({
+        type: "set-rally",
+        playerId: 2,
+        tileId: "-2,4",
+        destinationId: "3,-1",
+      }).success,
+    ).toBe(true);
+    expect(
+      ClientMessageSchema.safeParse({
+        type: "placement-finalize",
+        generationAttempt: 1,
+        candidateHash: "12345678abcdef00",
+        spawnCenters: ["0,0", "6,0"],
+      }).success,
+    ).toBe(true);
+    expect(
+      ClientMessageSchema.safeParse({
+        type: "placement-finalize",
+        generationAttempt: 1,
+        candidateHash: "12345678abcdef00",
+        spawnCenters: ["0,0", "0,0"],
+      }).success,
+    ).toBe(false);
   });
 
   it("accepts bounded client batches and rejects nested or oversized batches", () => {

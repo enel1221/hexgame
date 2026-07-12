@@ -4,7 +4,8 @@ export type MapArchetype = "heartland" | "broken-crown" | "highland-basin";
 export type Difficulty = "easy" | "normal" | "hard";
 export type GraphicsQuality = "low" | "medium" | "high";
 export type StructureType = "farm" | "barracks" | "turret";
-export type StructureStatus = "constructing" | "active" | "seized" | "repairing";
+export type StructureStatus = "active" | "seized" | "repairing";
+export type GamePhase = "placement" | "opening" | "running" | "complete";
 
 export interface Axial {
   q: number;
@@ -13,11 +14,21 @@ export interface Axial {
 
 export interface StructureState {
   type: StructureType;
-  status: StructureStatus;
+  completedCount: number;
+  /** Null while the first copy is still pending. */
+  status: StructureStatus | null;
   integrity: number;
-  progressTicks: number;
+  /** Null when no additional copy is under construction. */
+  pendingProgressTicks: number | null;
   seizedTicks: number;
   productionPaused: boolean;
+  /** Fixed-point integrity-ticks toward the next aggregate Barracks cycle. */
+  barracksProgressMilli: number;
+  rallyTargetId: string | null;
+  /** Newly trained troops retained locally while the rally route is blocked. */
+  rallyQueuedTroops: number;
+  /** Fixed-point integrity-ticks toward the next aggregate Turret volley. */
+  turretShotProgressMilli: number;
 }
 
 export interface TileState extends Axial {
@@ -43,6 +54,21 @@ export interface GeneratedMap {
   spawnCenters: string[];
   spawnClusters: string[][];
   generationAttempt: number;
+}
+
+export interface SpawnPlacement {
+  playerId: number;
+  centerId: string | null;
+  locked: boolean;
+  relocationCount: number;
+  aiTargetRelocations: number;
+  nextAiActionTick: number | null;
+}
+
+export interface PlacementState {
+  elapsedTicks: number;
+  maxTicks: number | null;
+  placements: SpawnPlacement[];
 }
 
 export interface PlayerState {
@@ -85,28 +111,33 @@ export interface MovingStack {
   issuedTick: number;
 }
 
-export interface WaitingChallenger {
-  owner: number;
+export interface BattleParticipant {
+  /** Null is reserved for the neutral incumbent. */
+  playerId: number | null;
   troops: number;
+  control: number;
+  casualtyProgressMilli: number;
   entryFrom: string;
-  queuedTick: number;
+  joinedTick: number;
+  lastReinforcementTick: number;
+  reinforcementAmount: number;
 }
 
 export interface BattleState {
   id: number;
   tileId: string;
-  defender: number | null;
-  attacker: number;
-  defenderTroops: number;
-  attackerTroops: number;
-  control: number;
+  incumbentOwner: number | null;
+  participants: BattleParticipant[];
   ageTicks: number;
   roundAccumulator: number;
-  entryFrom: string;
-  waiting: WaitingChallenger[];
-  lastReinforcementTick: number;
-  reinforcementSide: "attacker" | "defender" | null;
-  reinforcementAmount: number;
+}
+
+export interface EnclosureState {
+  id: number;
+  captorId: number;
+  tileIds: string[];
+  boundaryIds: string[];
+  progressTicks: number;
 }
 
 export interface VictoryState {
@@ -126,6 +157,14 @@ export type GameEventType =
   | "construction-started"
   | "construction-complete"
   | "structure-seized"
+  | "spawn-selected"
+  | "spawn-locked"
+  | "placement-complete"
+  | "rally-set"
+  | "rally-cleared"
+  | "turret-volley"
+  | "encirclement-started"
+  | "encirclement-complete"
   | "elimination"
   | "victory-countdown"
   | "victory";
@@ -136,6 +175,8 @@ export interface GameEvent {
   type: GameEventType;
   playerId?: number;
   tileId?: string;
+  tileIds?: string[];
+  sourceTileId?: string;
   amount?: number;
   message: string;
 }
@@ -155,16 +196,21 @@ export interface MatchConfig {
   humanSeats?: number[];
   playerNames?: string[];
   localPlayerId?: number;
+  /** Immutable final spawn inputs, populated when placement completes. */
+  startingCenters?: string[];
 }
 
 export interface GameState {
-  version: 1;
+  version: 2;
   config: MatchConfig;
+  phase: GamePhase;
+  placement: PlacementState;
   tick: number;
   map: GeneratedMap;
   players: PlayerState[];
   stacks: MovingStack[];
   battles: BattleState[];
+  enclosures: EnclosureState[];
   events: GameEvent[];
   nextEntityId: number;
   victory: VictoryState;
@@ -176,10 +222,29 @@ export type SendPercent = 25 | 50 | 75 | 100;
 
 export type GameCommand =
   | {
+      type: "choose-spawn";
+      playerId: number;
+      centerId: string;
+      scheduledTick?: number;
+    }
+  | {
+      type: "lock-spawn";
+      playerId: number;
+      scheduledTick?: number;
+    }
+  | {
       type: "move";
       playerId: number;
       sourceId: string;
       destinationId: string;
+      percent: SendPercent;
+      scheduledTick?: number;
+    }
+  | {
+      type: "multi-move";
+      playerId: number;
+      sourceIds: string[];
+      destinationIds: string[];
       percent: SendPercent;
       scheduledTick?: number;
     }
@@ -198,6 +263,19 @@ export type GameCommand =
     }
   | {
       type: "toggle-barracks";
+      playerId: number;
+      tileId: string;
+      scheduledTick?: number;
+    }
+  | {
+      type: "set-rally";
+      playerId: number;
+      tileId: string;
+      destinationId: string;
+      scheduledTick?: number;
+    }
+  | {
+      type: "clear-rally";
       playerId: number;
       tileId: string;
       scheduledTick?: number;
@@ -226,17 +304,35 @@ export type DebugScenario =
 
 export type WorkerRequest =
   | { type: "start"; config: MatchConfig }
-  | { type: "command"; command: GameCommand }
+  | {
+      type: "command";
+      command: GameCommand;
+      /** Relay transport order; deliberately kept outside deterministic rules data. */
+      relaySequence?: number;
+    }
   | { type: "pause"; paused: boolean }
   | { type: "speed"; speed: 1 | 2 | 4 }
   | { type: "catch-up"; targetTick: number }
+  | { type: "finalize-placement"; centers: string[] }
+  | { type: "begin-match" }
   | { type: "debug-scenario"; scenario: DebugScenario }
   | { type: "snapshot" }
-  | { type: "restore"; snapshot: EngineSnapshot }
+  | {
+      type: "restore";
+      snapshot: EngineSnapshot;
+      /** Sequence already represented by a multiplayer checkpoint. */
+      relaySequence?: number;
+    }
   | { type: "dispose" };
 
 export type WorkerResponse =
-  | { type: "ready"; state: GameState }
-  | { type: "state"; state: GameState; simulationMs: number; aiMs: number }
-  | { type: "snapshot"; snapshot: EngineSnapshot }
+  | { type: "ready"; state: GameState; relaySequence?: number }
+  | {
+      type: "state";
+      state: GameState;
+      simulationMs: number;
+      aiMs: number;
+      relaySequence?: number;
+    }
+  | { type: "snapshot"; snapshot: EngineSnapshot; relaySequence?: number }
   | { type: "error"; message: string };

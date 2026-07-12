@@ -2,10 +2,11 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
 import { resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { stableHash } from "../../src/core/hash";
 
 interface Identity {
   roomCode: string;
-  phase: "lobby" | "started" | "complete";
+  phase: "lobby" | "placement" | "started" | "complete";
   reconnectToken: string;
   websocketUrl: string;
   reconnected: boolean;
@@ -23,13 +24,15 @@ interface RelayMessage {
   serverTick?: number;
   replay?: boolean;
   majorityHash?: string | null;
-  phase?: "lobby" | "started" | "complete";
+  phase?: "lobby" | "placement" | "started" | "complete";
   winnerSeat?: number;
   finalTick?: number;
   hash?: string;
   hashes?: Record<string, string>;
-  checkpoint?: { sequence: number; payload: string } | null;
+  checkpoint?: { sequence: number; encoding?: string; payload: string } | null;
   players?: Array<{ ready: boolean; seat?: number; isHost?: boolean }>;
+  selections?: Array<{ seat: number; centerId: string | null; locked: boolean }>;
+  spawnCenters?: string[];
   commands?: Array<{
     sequence: number;
     targetTick: number;
@@ -190,8 +193,82 @@ describe("local Wrangler multiplayer relay", () => {
 
     hostSocket.send({ type: "start", requestId: "start" });
     await Promise.all([
-      hostSocket.take((message) => message.type === "started"),
-      guestSocket.take((message) => message.type === "started"),
+      hostSocket.take((message) => message.type === "placement"),
+      guestSocket.take((message) => message.type === "placement"),
+    ]);
+    const candidates = ["0,0", "12,0", "6,0"];
+    const candidateHash = stableHash({ generationAttempt: 0, candidates });
+    guestSocket.send({
+      type: "placement-candidates",
+      generationAttempt: 0,
+      candidateHash,
+      candidates,
+      requestId: "guest-candidate-poison",
+    });
+    expect(
+      await guestSocket.take(
+        (message) => message.type === "error" && message.requestId === "guest-candidate-poison",
+      ),
+    ).toMatchObject({ code: "placement-candidates-host-only", recoverable: false });
+    hostSocket.send({
+      type: "placement-candidates",
+      generationAttempt: 0,
+      candidateHash: "0123456789abcdef",
+      candidates,
+      requestId: "bad-candidate-hash",
+    });
+    expect(
+      await hostSocket.take(
+        (message) => message.type === "error" && message.requestId === "bad-candidate-hash",
+      ),
+    ).toMatchObject({ code: "placement-candidate-hash", recoverable: false });
+    hostSocket.send({
+      type: "placement-candidates",
+      generationAttempt: 0,
+      candidateHash,
+      candidates,
+      requestId: "placement-candidates",
+    });
+    await hostSocket.take(
+      (message) => message.type === "ack" && message.requestId === "placement-candidates",
+    );
+    hostSocket.send({
+      type: "placement-claim",
+      centerId: "0,0",
+      requestId: "host-claim",
+    });
+    guestSocket.send({
+      type: "placement-claim",
+      centerId: "6,0",
+      requestId: "guest-claim",
+    });
+    await Promise.all([
+      hostSocket.take((message) => message.type === "ack" && message.requestId === "host-claim"),
+      guestSocket.take((message) => message.type === "ack" && message.requestId === "guest-claim"),
+    ]);
+    hostSocket.send({ type: "placement-lock", centerId: "0,0", requestId: "host-lock" });
+    guestSocket.send({ type: "placement-lock", centerId: "6,0", requestId: "guest-lock" });
+    await Promise.all([
+      hostSocket.take((message) => message.type === "ack" && message.requestId === "host-lock"),
+      guestSocket.take((message) => message.type === "ack" && message.requestId === "guest-lock"),
+    ]);
+    hostSocket.send({
+      type: "placement-finalize",
+      generationAttempt: 0,
+      candidateHash,
+      spawnCenters: ["0,0", "6,0"],
+      requestId: "placement-finalize",
+    });
+    await hostSocket.take(
+      (message) => message.type === "ack" && message.requestId === "placement-finalize",
+    );
+    await Promise.all([
+      hostSocket
+        .take((message) => message.type === "started", 8_000)
+        .then((message) => expect(message.spawnCenters).toEqual(["0,0", "6,0"])),
+      guestSocket
+        .take((message) => message.type === "started", 8_000)
+        .then((message) => expect(message.spawnCenters).toEqual(["0,0", "6,0"])),
     ]);
 
     guestSocket.send({
@@ -299,8 +376,8 @@ describe("local Wrangler multiplayer relay", () => {
       tick: checkpointTick,
       sequence: 1,
       hash: "aaaaaaaa",
-      encoding: "json",
-      payload: '{"checkpoint":1}',
+      encoding: "gzip-base64",
+      payload: "H4sIAAAAAAAA/6tWSs5IzMtLLS5RslIyrAUAZcRIexAAAAA=",
       requestId: "checkpoint-1",
     });
     await hostSocket.take(
@@ -353,6 +430,50 @@ describe("local Wrangler multiplayer relay", () => {
       ),
     ]);
 
+    hostSocket.send({
+      type: "command",
+      clientSequence: 2,
+      requestId: "command-3",
+      command: {
+        type: "move",
+        playerId: 0,
+        sourceId: "0,0",
+        destinationId: "1,0",
+        percent: 25,
+      },
+    });
+    const thirdAck = await hostSocket.take(
+      (message) => message.type === "ack" && message.requestId === "command-3",
+    );
+    expect(thirdAck).toMatchObject({ sequence: 3 });
+    await Promise.all([
+      hostSocket.take(
+        (message) =>
+          message.type === "command-batch" &&
+          message.commands?.some((command) => command.sequence === 3) === true,
+      ),
+      guestSocket.take(
+        (message) =>
+          message.type === "command-batch" &&
+          message.commands?.some((command) => command.sequence === 3) === true,
+      ),
+    ]);
+    await waitForServerTick(hostSocket, 2, thirdAck.targetTick!);
+    hostSocket.send({
+      type: "checkpoint",
+      tick: thirdAck.targetTick!,
+      sequence: 2,
+      hash: "aaaaaaaa",
+      encoding: "json",
+      payload: '{"checkpoint":"skips-sequence-3"}',
+      requestId: "checkpoint-skips-command",
+    });
+    expect(
+      await hostSocket.take(
+        (message) => message.type === "error" && message.requestId === "checkpoint-skips-command",
+      ),
+    ).toMatchObject({ code: "checkpoint-uncovered-command", recoverable: true });
+
     hostSocket.send({ type: "hash", tick: 20, sequence: 2, hash: "aaaaaaaa" });
     guestSocket.send({ type: "hash", tick: 20, sequence: 2, hash: "bbbbbbbb" });
     const desync = await hostSocket.take((message) => message.type === "desync");
@@ -367,8 +488,11 @@ describe("local Wrangler multiplayer relay", () => {
     const recovery = await guestSocket.take(
       (message) => message.type === "sync" && message.checkpoint?.sequence === 1,
     );
-    expect(recovery.checkpoint?.payload).toBe('{"checkpoint":1}');
-    expect(recovery.commands?.map((command) => command.sequence)).toEqual([2]);
+    expect(recovery.checkpoint).toMatchObject({
+      encoding: "gzip-base64",
+      payload: "H4sIAAAAAAAA/6tWSs5IzMtLLS5RslIyrAUAZcRIexAAAAA=",
+    });
+    expect(recovery.commands?.map((command) => command.sequence)).toEqual([2, 3]);
     expect(recovery.serverTick).toBeGreaterThanOrEqual(checkpointTick);
 
     guestSocket.close();
@@ -384,8 +508,8 @@ describe("local Wrangler multiplayer relay", () => {
     const reconnectSync = await replacement.take(
       (message) => message.type === "sync" && message.checkpoint?.sequence === 1,
     );
-    expect(reconnectSync.latestSequence).toBe(2);
-    expect(reconnectSync.commands?.map((command) => command.sequence)).toEqual([2]);
+    expect(reconnectSync.latestSequence).toBe(3);
+    expect(reconnectSync.commands?.map((command) => command.sequence)).toEqual([2, 3]);
     expect(reconnectSync.serverTick).toBeGreaterThanOrEqual(checkpointTick);
 
     hostSocket.send({
@@ -425,6 +549,114 @@ describe("local Wrangler multiplayer relay", () => {
     completedSocket.close();
     hostSocket.close();
   }, 20_000);
+
+  it("preserves provisional placement through reconnect and rejects conflicting finals", async () => {
+    const host = await postIdentity(`${baseUrl}/api/rooms`, {
+      playerName: "Placement Host",
+      config: {
+        seed: "placement-reconnect",
+        archetype: "heartland",
+        difficulty: "normal",
+        botCount: 0,
+        maxHumans: 2,
+      },
+    });
+    const guest = await postIdentity(`${baseUrl}/api/rooms/${host.roomCode}/join`, {
+      playerName: "Placement Guest",
+    });
+    const hostSocket = new SocketInbox(host.websocketUrl);
+    const guestSocket = new SocketInbox(guest.websocketUrl);
+    await Promise.all([hostSocket.open(), guestSocket.open()]);
+    await Promise.all([
+      hostSocket.take((message) => message.type === "welcome"),
+      guestSocket.take((message) => message.type === "welcome"),
+    ]);
+    guestSocket.send({ type: "ready", ready: true });
+    await hostSocket.take(
+      (message) =>
+        message.type === "lobby" &&
+        message.players?.length === 2 &&
+        message.players[1]?.ready === true,
+    );
+    hostSocket.send({ type: "start" });
+    await Promise.all([
+      hostSocket.take((message) => message.type === "placement"),
+      guestSocket.take((message) => message.type === "placement"),
+    ]);
+    const candidates = ["0,0", "12,0", "5,0", "6,0"];
+    const candidateHash = stableHash({ generationAttempt: 2, candidates });
+    hostSocket.send({
+      type: "placement-candidates",
+      generationAttempt: 2,
+      candidateHash,
+      candidates,
+      requestId: "reconnect-candidates",
+    });
+    await hostSocket.take(
+      (message) => message.type === "ack" && message.requestId === "reconnect-candidates",
+    );
+    guestSocket.send({ type: "placement-claim", centerId: "6,0", requestId: "claim-before-drop" });
+    await guestSocket.take(
+      (message) => message.type === "ack" && message.requestId === "claim-before-drop",
+    );
+    guestSocket.close();
+
+    const identity = await postIdentity(`${baseUrl}/api/rooms/${host.roomCode}/join`, {
+      playerName: "Placement Guest",
+      reconnectToken: guest.reconnectToken,
+    });
+    expect(identity).toMatchObject({ phase: "placement", reconnected: true, player: { seat: 1 } });
+    const replacement = new SocketInbox(identity.websocketUrl);
+    await replacement.open();
+    await replacement.take(
+      (message) => message.type === "welcome" && message.phase === "placement",
+    );
+    const restored = await replacement.take((message) => message.type === "placement");
+    expect(restored.selections).toContainEqual({ seat: 1, centerId: "6,0", locked: false });
+
+    hostSocket.send({ type: "placement-lock", centerId: "0,0", requestId: "reconnect-host-lock" });
+    replacement.send({
+      type: "placement-lock",
+      centerId: "6,0",
+      requestId: "reconnect-guest-lock",
+    });
+    await Promise.all([
+      hostSocket.take(
+        (message) => message.type === "ack" && message.requestId === "reconnect-host-lock",
+      ),
+      replacement.take(
+        (message) => message.type === "ack" && message.requestId === "reconnect-guest-lock",
+      ),
+    ]);
+    replacement.send({
+      type: "placement-finalize",
+      generationAttempt: 2,
+      candidateHash,
+      spawnCenters: ["0,0", "5,0"],
+      requestId: "conflicting-final",
+    });
+    expect(
+      await replacement.take(
+        (message) => message.type === "error" && message.requestId === "conflicting-final",
+      ),
+    ).toMatchObject({ code: "placement-conflict", recoverable: true });
+
+    replacement.send({
+      type: "placement-finalize",
+      generationAttempt: 2,
+      candidateHash,
+      spawnCenters: ["0,0", "6,0"],
+      requestId: "valid-final",
+    });
+    await replacement.take(
+      (message) => message.type === "ack" && message.requestId === "valid-final",
+    );
+    const started = await replacement.take((message) => message.type === "started", 8_000);
+    expect(started.spawnCenters).toEqual(["0,0", "6,0"]);
+
+    replacement.close();
+    hostSocket.close();
+  }, 15_000);
 
   it("requires a second human before a zero-bot room can start", async () => {
     const host = await postIdentity(`${baseUrl}/api/rooms`, {
@@ -560,7 +792,9 @@ async function waitForServerTick(
   afterSequence: number,
   targetTick: number,
 ): Promise<number> {
-  for (let attempt = 0; attempt < 30; attempt += 1) {
+  // Placement finalization includes a one-second presentation handoff before
+  // the relay's authoritative 10 Hz match clock begins.
+  for (let attempt = 0; attempt < 80; attempt += 1) {
     inbox.send({
       type: "missing",
       afterSequence,

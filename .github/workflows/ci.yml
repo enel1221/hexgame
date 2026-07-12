@@ -106,5 +106,7 @@ jobs:
           else
             app_url="https://main.hex-dominion.inkgrid.io"
           fi
-          curl --fail --silent --show-error --retry 8 --retry-all-errors --retry-delay 5 "$app_url" >/dev/null
-          curl --fail --silent --show-error --retry 8 --retry-all-errors --retry-delay 5 "${{ steps.target.outputs.relay_url }}/health" >/dev/null
+          # Custom hostnames can briefly return 403 while Cloudflare activates a
+          # newly deployed route. Allow up to two minutes for that propagation.
+          curl --fail --silent --show-error --retry 24 --retry-all-errors --retry-delay 5 --connect-timeout 10 --max-time 20 "$app_url" >/dev/null
+          curl --fail --silent --show-error --retry 24 --retry-all-errors --retry-delay 5 --connect-timeout 10 --max-time 20 "${{ steps.target.outputs.relay_url }}/health" >/dev/null

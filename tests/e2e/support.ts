@@ -1,4 +1,5 @@
 import { expect, type Page } from "@playwright/test";
+import { BALANCE } from "../../src/shared/balance";
 
 export type MapArchetype = "heartland" | "broken-crown" | "highland-basin";
 export interface TestUnitCounts {
@@ -355,7 +356,10 @@ export async function startSinglePlayer(
     const selectedCenter = placement.placement.recommendedPlacementCenter;
     if (!selectedCenter) throw new Error("No stable non-conflicting placement center is available");
     const candidate = byId.get(selectedCenter);
-    if (!candidate || !occupied.every((other) => axialDistance(candidate, other) >= 6)) {
+    if (
+      !candidate ||
+      !occupied.every((other) => axialDistance(candidate, other) >= BALANCE.minimumSpawnDistance)
+    ) {
       throw new Error("Recommended placement conflicts with a locked center");
     }
     await page.evaluate((id) => window.__HEX_DOMINION__?.selectTile(id), selectedCenter);

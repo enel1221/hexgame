@@ -17,7 +17,6 @@ export interface BuildingRule {
   buildTicks: number;
   trainTicks: number;
   troopCostMilli: number;
-  localTarget: number;
 }
 
 export const BUILDING_RULES: Record<StructureType, BuildingRule> = {
@@ -26,21 +25,18 @@ export const BUILDING_RULES: Record<StructureType, BuildingRule> = {
     buildTicks: BALANCE.barracks.buildTicks,
     trainTicks: BALANCE.barracks.trainTicks,
     troopCostMilli: BALANCE.barracks.troopCostMilli,
-    localTarget: BALANCE.barracks.localTarget,
   },
   "archery-range": {
     costMilli: BALANCE.archeryRange.costMilli,
     buildTicks: BALANCE.archeryRange.buildTicks,
     trainTicks: BALANCE.archeryRange.trainTicks,
     troopCostMilli: BALANCE.archeryRange.troopCostMilli,
-    localTarget: BALANCE.archeryRange.localTarget,
   },
   "wizard-tower": {
     costMilli: BALANCE.wizardTower.costMilli,
     buildTicks: BALANCE.wizardTower.buildTicks,
     trainTicks: BALANCE.wizardTower.trainTicks,
     troopCostMilli: BALANCE.wizardTower.troopCostMilli,
-    localTarget: BALANCE.wizardTower.localTarget,
   },
 };
 
@@ -344,21 +340,13 @@ function tickProduction(state: GameState, tile: TileState, structure: StructureS
   }
   const rules = BUILDING_RULES[structure.type];
   if (structure.productionPaused) return;
-  if (!hasRally && totalUnits(tile.units) >= rules.localTarget) {
-    structure.trainingProgressMilli = 0;
-    return;
-  }
 
   structure.trainingProgressMilli += structure.integrity;
   const cycle = rules.trainTicks * BALANCE.fullIntegrity;
   if (structure.trainingProgressMilli < cycle) return;
 
   const affordable = Math.floor(player.supplyMilli / rules.troopCostMilli);
-  const localSpace = Math.max(0, rules.localTarget - totalUnits(tile.units));
-  const capacity = route
-    ? structure.completedCount
-    : Math.min(structure.completedCount, localSpace);
-  const trained = Math.min(capacity, affordable);
+  const trained = Math.min(structure.completedCount, affordable);
   if (trained <= 0) {
     structure.trainingProgressMilli = cycle;
     return;

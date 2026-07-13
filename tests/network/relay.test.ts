@@ -101,7 +101,7 @@ describe("deterministic command relay helpers", () => {
     for (let left = 0; left < expected.length; left += 1) {
       for (let right = left + 1; right < expected.length; right += 1) {
         expect(placementCenterDistance(expected[left]!, expected[right]!)).toBeGreaterThanOrEqual(
-          6,
+          BALANCE.minimumSpawnDistance,
         );
       }
     }
@@ -200,10 +200,10 @@ describe("deterministic command relay helpers", () => {
       finalizePlacementCenters({
         seed: "placement-conflict",
         totalParticipants: 2,
-        candidates: ["0,0", "5,0", "10,0"],
+        candidates: ["0,0", "3,0", "10,0"],
         selections: [
           { seat: 0, centerId: "0,0" },
-          { seat: 1, centerId: "5,0" },
+          { seat: 1, centerId: "3,0" },
         ],
       }),
     ).toThrow(/conflicts/i);

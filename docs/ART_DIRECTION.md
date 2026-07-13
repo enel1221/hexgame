@@ -98,11 +98,11 @@ The battlefield battle indicator is a designed, camera-anchored PixiJS object wi
 2. inset dark track;
 3. one canonical color/pattern segment per active faction;
 4. eased segment boundaries and a subtle delayed reinforcement trail;
-5. compact incumbent, typed-support, and explicit RPS advantage markers;
-6. exact M/R/W participant counts where space permits;
+5. an inline `x1.xx` weighted type multiplier on every segment wide enough to label;
+6. a compact incumbent marker;
 7. reinforcement halo and temporary `+N` count.
 
-Segment targets are authoritative effective-power shares whose integer widths total exactly 10,000. Player color/pattern remains faction identity; a narrow typed strip and up/down advantage cue explain the Wizard > Melee > Ranged > Wizard cycle without recoloring the whole bar. A late third or fourth faction appears as its own smoothly expanding segment, never as part of a fake coalition. Small segments move full composition, support, and multiplier detail into the semantic tile inspector rather than rendering illegible labels. This must not be restyled as a generic HTML progress element.
+Segment targets are authoritative effective-power shares whose integer widths total exactly 10,000. Player color/pattern remains faction identity, while each readable segment labels its aggregate Wizard > Melee > Ranged > Wizard benefit as a single multiplier. A late third or fourth faction appears as its own smoothly expanding segment, never as part of a fake coalition. Exact M/R/W composition, typed support, and narrow-segment multipliers live in the semantic tile inspector rather than crowding the world bar. This must not be restyled as a generic HTML progress element.
 
 ## UI and responsive composition
 

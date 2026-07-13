@@ -220,16 +220,16 @@ describe("deterministic spawn placement", () => {
   it("extends partial human claims while preview rejects an unbalanced final choice", () => {
     const engine = createGame({
       ...TEST_CONFIG,
-      seed: "fair-choice-audit",
+      seed: "balance-fixture-0",
       multiplayer: true,
       aiCount: 0,
       humanSeats: [0, 1, 2, 3],
       playerNames: ["North", "East", "South", "West"],
     });
     for (const [playerId, centerId] of [
-      [0, "-1,6"],
-      [1, "1,10"],
-      [2, "14,6"],
+      [0, "0,4"],
+      [1, "10,5"],
+      [2, "6,7"],
     ] as const) {
       expect(applyCommand(engine.state, { type: "choose-spawn", playerId, centerId })).toEqual({
         ok: true,
@@ -237,16 +237,16 @@ describe("deterministic spawn placement", () => {
     }
 
     const beforePreview = structuredClone(engine.state);
-    const rejectedPreview = validateSpawnChoicePreview(engine.state, 3, "5,2");
+    const rejectedPreview = validateSpawnChoicePreview(engine.state, 3, "9,2");
     expect(rejectedPreview).toMatchObject({
       ok: false,
       reason: expect.stringMatching(/balanced placement spacing/i),
     });
-    expect(validateSpawnChoice(engine.state, 3, "5,2")).toEqual(rejectedPreview);
+    expect(validateSpawnChoice(engine.state, 3, "9,2")).toEqual(rejectedPreview);
     expect(engine.state).toEqual(beforePreview);
 
     const vector = computeFinalSpawnVector(engine.state);
-    expect(vector.slice(0, 3)).toEqual(["-1,6", "1,10", "14,6"]);
+    expect(vector.slice(0, 3)).toEqual(["0,4", "10,5", "6,7"]);
     expect(validateFinalSpawnVector(engine.state, vector)).toEqual({ ok: true });
   });
 

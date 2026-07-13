@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { BALANCE } from "../../src/shared/balance";
 import {
   ClientMessageSchema,
   CreateRoomRequestSchema,
@@ -140,13 +141,13 @@ describe("multiplayer protocol schemas", () => {
       type: "placement-candidates" as const,
       generationAttempt: 0,
       candidateHash: "12345678abcdef00",
-      candidates: Array.from({ length: 1_092 }, (_, index) => `${index},0`),
+      candidates: Array.from({ length: BALANCE.maxLand }, (_, index) => `${index},0`),
     };
     expect(PlacementCandidatesMessageSchema.safeParse(message).success).toBe(true);
     expect(
       PlacementCandidatesMessageSchema.safeParse({
         ...message,
-        candidates: [...message.candidates, "1092,0"],
+        candidates: [...message.candidates, `${BALANCE.maxLand},0`],
       }).success,
     ).toBe(false);
   });

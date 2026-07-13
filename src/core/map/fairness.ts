@@ -400,7 +400,7 @@ export function analyzeMapFairness(
     .filter(Number.isFinite);
   const minimumSpawnDistance = finiteNearest.length ? Math.min(...finiteNearest) : 0;
   const maximumNearestSpawnDistance = finiteNearest.length ? Math.max(...finiteNearest) : 0;
-  if (expectedPlayers > 1 && minimumSpawnDistance < 6) {
+  if (expectedPlayers > 1 && minimumSpawnDistance < BALANCE.minimumSpawnDistance) {
     reasons.push(`spawn centers are only ${minimumSpawnDistance} tiles apart`);
   }
   if (minimumSpawnDistance > 0 && maximumNearestSpawnDistance > minimumSpawnDistance * 2) {

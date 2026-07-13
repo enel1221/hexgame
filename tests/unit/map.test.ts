@@ -71,25 +71,25 @@ describe("procedural archetypes", () => {
   });
 
   it.each([
-    [3, 180],
-    [4, 208],
-    [5, 260],
-    [6, 312],
-    [7, 364],
-    [8, 416],
-    [9, 468],
-    [10, 520],
-    [11, 572],
-    [12, 624],
-    [13, 676],
-    [14, 728],
-    [15, 780],
-    [16, 832],
-    [17, 884],
-    [18, 936],
-    [19, 988],
-    [20, 1040],
-    [21, 1092],
+    [3, 128],
+    [4, 128],
+    [5, 150],
+    [6, 180],
+    [7, 210],
+    [8, 240],
+    [9, 270],
+    [10, 300],
+    [11, 330],
+    [12, 360],
+    [13, 390],
+    [14, 420],
+    [15, 450],
+    [16, 480],
+    [17, 510],
+    [18, 540],
+    [19, 570],
+    [20, 600],
+    [21, 630],
   ])("targets %i players at %i land tiles", (players, expectedLand) => {
     expect(targetLandCount(players)).toBe(expectedLand);
     expect(targetLandForPlayers(players)).toBe(expectedLand);
@@ -245,7 +245,7 @@ describe("deterministic fairness retries", () => {
   it("derives a new deterministic attempt after a rejected fair map", () => {
     const attempts: number[] = [];
     const options = {
-      seed: "forced-retry",
+      seed: "retry-hook",
       archetype: "heartland" as const,
       aiCount: 3,
       fairnessValidator: (

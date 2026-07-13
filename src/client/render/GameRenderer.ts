@@ -23,9 +23,14 @@ import type {
   UnitCounts,
   UnitType,
 } from "@/src/shared/types";
+import { formatTypeMultiplier } from "../battleLabels";
 import { bindWebGlContextRecovery, type RendererContextStatus } from "./contextRecovery";
 
-const HEX_SIZE = 44;
+const HEX_SIZE = 132;
+const LEGACY_HEX_SIZE = 44;
+const TERRAIN_DETAIL_SCALE = HEX_SIZE / LEGACY_HEX_SIZE;
+const TERRAIN_STROKE_SCALE = Math.sqrt(TERRAIN_DETAIL_SCALE);
+const FIT_MIN_ZOOM = 0.1;
 const MIN_ZOOM = 0.13;
 const MAX_ZOOM = 1.6;
 const FOCUS_MIN_ZOOM = 0.34;
@@ -39,10 +44,15 @@ const UNIT_COLORS: Record<UnitType, number> = {
 };
 
 type TileCallback = (tileId: string | null) => void;
+type MultiSelectionPhase = "sources" | "targets";
+type TileDragCallback = (tileId: string, phase: MultiSelectionPhase) => void;
 
 interface RendererCallbacks {
   onTileClick: TileCallback;
+  onTileDrag: TileDragCallback;
   onTileHover: TileCallback;
+  getMultiSelectionPhase: () => MultiSelectionPhase | null;
+  onMultiGestureState: (active: boolean) => void;
   onCancel: () => void;
   onZoom?: (zoom: number) => void;
   onContextStatus?: (status: RendererContextStatus) => void;
@@ -111,6 +121,7 @@ interface BattleVisual {
   container: Container;
   frame: Graphics;
   counts: BitmapText;
+  multiplierLabels: BitmapText[];
   fighters: SoldierVisual[];
   combatEffects: Graphics;
   tileId: string;
@@ -119,7 +130,6 @@ interface BattleVisual {
   reinforcementSignature: string;
   pulse: number;
   amount: number;
-  baseCounts: string;
   resolving: number | null;
 }
 
@@ -172,6 +182,14 @@ function hexPoints(size = HEX_SIZE, offsetY = 0): number[] {
     points.push(Math.cos(angle) * size, Math.sin(angle) * size + offsetY);
   }
   return points;
+}
+
+function terrainDetail(value: number): number {
+  return value * TERRAIN_DETAIL_SCALE;
+}
+
+function terrainStroke(value: number): number {
+  return value * TERRAIN_STROKE_SCALE;
 }
 
 function tilePosition(tile: TileState): { x: number; y: number } {
@@ -381,84 +399,175 @@ function drawTerrainTile(
   if (tile.terrain === "meadow") {
     const rowColor = 0xc9d68b;
     for (let row = -2; row <= 2; row += 1) {
-      const rowY = y + row * 6 + wobble * 0.25;
+      const rowY = y + terrainDetail(row * 6 + wobble * 0.25);
       graphics
-        .moveTo(x - 19, rowY)
-        .bezierCurveTo(x - 7, rowY - 2, x + 8, rowY + 3, x + 20, rowY)
-        .stroke({ color: rowColor, width: 1.1, alpha: 0.43 });
+        .moveTo(x - terrainDetail(19), rowY)
+        .bezierCurveTo(
+          x - terrainDetail(7),
+          rowY - terrainDetail(2),
+          x + terrainDetail(8),
+          rowY + terrainDetail(3),
+          x + terrainDetail(20),
+          rowY,
+        )
+        .stroke({ color: rowColor, width: terrainStroke(1.1), alpha: 0.43 });
     }
     if (quality !== "low") {
       for (let flower = 0; flower < 5; flower += 1) {
-        const fx = x - 18 + ((seed >>> (flower * 3)) % 35);
-        const fy = y - 18 + ((seed >>> (flower * 2 + 1)) % 33);
+        const fx = x + terrainDetail(-18 + ((seed >>> (flower * 3)) % 35));
+        const fy = y + terrainDetail(-18 + ((seed >>> (flower * 2 + 1)) % 33));
         graphics
-          .star(fx, fy, 4, 1.6, 0.55)
+          .star(fx, fy, 4, terrainDetail(1.6), terrainDetail(0.55))
           .fill({ color: flower % 2 ? 0xf1d08b : 0xf2b6c2, alpha: 0.82 });
       }
     }
   } else if (tile.terrain === "muster") {
     graphics
-      .moveTo(x - 25, y + 12)
-      .bezierCurveTo(x - 8, y + 4, x + 7, y - 4, x + 25, y - 13)
-      .stroke({ color: 0x71634f, width: 5, alpha: 0.46 });
+      .moveTo(x - terrainDetail(25), y + terrainDetail(12))
+      .bezierCurveTo(
+        x - terrainDetail(8),
+        y + terrainDetail(4),
+        x + terrainDetail(7),
+        y - terrainDetail(4),
+        x + terrainDetail(25),
+        y - terrainDetail(13),
+      )
+      .stroke({ color: 0x71634f, width: terrainStroke(5), alpha: 0.46 });
     graphics
-      .moveTo(x - 19, y - 19)
-      .bezierCurveTo(x - 5, y - 8, x + 7, y + 6, x + 21, y + 20)
-      .stroke({ color: 0x7c6a52, width: 4, alpha: 0.44 });
-    graphics.circle(x + 10, y - 8, 6).fill({ color: 0x74624b, alpha: 0.95 });
-    graphics.circle(x + 10, y - 8, 3.5).fill({ color: 0xbda477, alpha: 0.9 });
-    graphics.rect(x + 8.6, y - 20, 2.8, 13).fill({ color: 0x594939 });
-    graphics.poly([x + 11, y - 20, x + 21, y - 16, x + 11, y - 12]).fill({ color: 0xd6b063 });
+      .moveTo(x - terrainDetail(19), y - terrainDetail(19))
+      .bezierCurveTo(
+        x - terrainDetail(5),
+        y - terrainDetail(8),
+        x + terrainDetail(7),
+        y + terrainDetail(6),
+        x + terrainDetail(21),
+        y + terrainDetail(20),
+      )
+      .stroke({ color: 0x7c6a52, width: terrainStroke(4), alpha: 0.44 });
+    graphics
+      .circle(x + terrainDetail(10), y - terrainDetail(8), terrainDetail(6))
+      .fill({ color: 0x74624b, alpha: 0.95 });
+    graphics
+      .circle(x + terrainDetail(10), y - terrainDetail(8), terrainDetail(3.5))
+      .fill({ color: 0xbda477, alpha: 0.9 });
+    graphics
+      .rect(x + terrainDetail(8.6), y - terrainDetail(20), terrainDetail(2.8), terrainDetail(13))
+      .fill({ color: 0x594939 });
+    graphics
+      .poly([
+        x + terrainDetail(11),
+        y - terrainDetail(20),
+        x + terrainDetail(21),
+        y - terrainDetail(16),
+        x + terrainDetail(11),
+        y - terrainDetail(12),
+      ])
+      .fill({ color: 0xd6b063 });
   } else if (tile.terrain === "forest") {
     const clusters = quality === "low" ? 3 : 5;
     for (let tree = 0; tree < clusters; tree += 1) {
-      const tx = x - 19 + ((seed >>> (tree * 4)) % 39);
-      const ty = y - 13 + ((seed >>> (tree * 3 + 2)) % 27);
+      const tx = x + terrainDetail(-19 + ((seed >>> (tree * 4)) % 39));
+      const ty = y + terrainDetail(-13 + ((seed >>> (tree * 3 + 2)) % 27));
       const scale = 0.82 + ((seed >>> (tree + 5)) % 5) * 0.06;
-      graphics.rect(tx - 1.5, ty + 2, 3, 10).fill({ color: 0x3f382d, alpha: 0.88 });
       graphics
-        .poly([tx, ty - 14 * scale, tx - 9 * scale, ty + 5, tx + 9 * scale, ty + 5])
+        .rect(tx - terrainDetail(1.5), ty + terrainDetail(2), terrainDetail(3), terrainDetail(10))
+        .fill({ color: 0x3f382d, alpha: 0.88 });
+      graphics
+        .poly([
+          tx,
+          ty - terrainDetail(14 * scale),
+          tx - terrainDetail(9 * scale),
+          ty + terrainDetail(5),
+          tx + terrainDetail(9 * scale),
+          ty + terrainDetail(5),
+        ])
         .fill({ color: tree % 2 ? 0x294c3e : 0x355b43, alpha: 1 })
-        .stroke({ color: 0x6f8a5b, width: 0.8, alpha: 0.35 });
+        .stroke({ color: 0x6f8a5b, width: terrainStroke(0.8), alpha: 0.35 });
       graphics
-        .poly([tx - 1, ty - 9 * scale, tx - 7 * scale, ty + 9, tx + 7 * scale, ty + 9])
+        .poly([
+          tx - terrainDetail(1),
+          ty - terrainDetail(9 * scale),
+          tx - terrainDetail(7 * scale),
+          ty + terrainDetail(9),
+          tx + terrainDetail(7 * scale),
+          ty + terrainDetail(9),
+        ])
         .fill({ color: tree % 2 ? 0x355d45 : 0x2a4f3a, alpha: 0.96 });
     }
   } else if (tile.terrain === "hills") {
     graphics
-      .poly([x - 26, y + 15, x - 10, y - 15, x + 2, y + 14])
+      .poly([
+        x - terrainDetail(26),
+        y + terrainDetail(15),
+        x - terrainDetail(10),
+        y - terrainDetail(15),
+        x + terrainDetail(2),
+        y + terrainDetail(14),
+      ])
       .fill({ color: 0x706c5f })
-      .stroke({ color: 0xc2b69b, width: 1, alpha: 0.45 });
+      .stroke({ color: 0xc2b69b, width: terrainStroke(1), alpha: 0.45 });
     graphics
-      .poly([x - 12, y + 16, x + 8, y - 18, x + 27, y + 16])
+      .poly([
+        x - terrainDetail(12),
+        y + terrainDetail(16),
+        x + terrainDetail(8),
+        y - terrainDetail(18),
+        x + terrainDetail(27),
+        y + terrainDetail(16),
+      ])
       .fill({ color: 0x777162 })
-      .stroke({ color: 0xd0c4aa, width: 1, alpha: 0.42 });
+      .stroke({ color: 0xd0c4aa, width: terrainStroke(1), alpha: 0.42 });
     graphics
-      .poly([x + 1, y - 7, x + 8, y - 18, x + 15, y - 5, x + 8, y - 9])
+      .poly([
+        x + terrainDetail(1),
+        y - terrainDetail(7),
+        x + terrainDetail(8),
+        y - terrainDetail(18),
+        x + terrainDetail(15),
+        y - terrainDetail(5),
+        x + terrainDetail(8),
+        y - terrainDetail(9),
+      ])
       .fill({ color: 0xd7d0be, alpha: 0.75 });
   } else if (tile.terrain === "plains") {
     for (let tuft = 0; tuft < (quality === "high" ? 5 : 3); tuft += 1) {
-      const gx = x - 22 + ((seed >>> (tuft * 4)) % 44);
-      const gy = y - 14 + ((seed >>> (tuft * 3 + 1)) % 30);
+      const gx = x + terrainDetail(-22 + ((seed >>> (tuft * 4)) % 44));
+      const gy = y + terrainDetail(-14 + ((seed >>> (tuft * 3 + 1)) % 30));
       graphics
-        .moveTo(gx, gy + 5)
-        .lineTo(gx - 3, gy)
-        .moveTo(gx, gy + 5)
-        .lineTo(gx + 1, gy - 2)
-        .moveTo(gx, gy + 5)
-        .lineTo(gx + 4, gy + 1)
-        .stroke({ color: 0xc4bf78, width: 1, alpha: 0.58 });
+        .moveTo(gx, gy + terrainDetail(5))
+        .lineTo(gx - terrainDetail(3), gy)
+        .moveTo(gx, gy + terrainDetail(5))
+        .lineTo(gx + terrainDetail(1), gy - terrainDetail(2))
+        .moveTo(gx, gy + terrainDetail(5))
+        .lineTo(gx + terrainDetail(4), gy + terrainDetail(1))
+        .stroke({ color: 0xc4bf78, width: terrainStroke(1), alpha: 0.58 });
     }
-    graphics.ellipse(x + 16, y + 11, 5, 2.5).fill({ color: 0x6e6b56, alpha: 0.44 });
+    graphics
+      .ellipse(x + terrainDetail(16), y + terrainDetail(11), terrainDetail(5), terrainDetail(2.5))
+      .fill({ color: 0x6e6b56, alpha: 0.44 });
   } else if (tile.terrain === "water") {
     const waveCount = quality === "low" ? 2 : 4;
     for (let wave = 0; wave < waveCount; wave += 1) {
-      const waveY = y - 15 + wave * 10 + (seed % 3);
+      const waveY = y + terrainDetail(-15 + wave * 10 + (seed % 3));
       graphics
-        .moveTo(x - 21, waveY)
-        .bezierCurveTo(x - 12, waveY - 3, x - 6, waveY + 3, x + 2, waveY)
-        .bezierCurveTo(x + 9, waveY - 3, x + 15, waveY + 2, x + 22, waveY - 1)
-        .stroke({ color: 0x91c1c3, width: 1.2, alpha: 0.3 });
+        .moveTo(x - terrainDetail(21), waveY)
+        .bezierCurveTo(
+          x - terrainDetail(12),
+          waveY - terrainDetail(3),
+          x - terrainDetail(6),
+          waveY + terrainDetail(3),
+          x + terrainDetail(2),
+          waveY,
+        )
+        .bezierCurveTo(
+          x + terrainDetail(9),
+          waveY - terrainDetail(3),
+          x + terrainDetail(15),
+          waveY + terrainDetail(2),
+          x + terrainDetail(22),
+          waveY - terrainDetail(1),
+        )
+        .stroke({ color: 0x91c1c3, width: terrainStroke(1.2), alpha: 0.3 });
     }
   }
 }
@@ -714,6 +823,7 @@ export class GameRenderer {
   private buildMode: StructureType | null = null;
   private route: { path: string[]; valid: boolean } | null = null;
   private multiPreview: {
+    phase: MultiSelectionPhase;
     sourceIds: string[];
     destinationIds: string[];
     plan: MultiMovePlan | null;
@@ -746,8 +856,12 @@ export class GameRenderer {
     worldX: number;
     worldY: number;
     button: number;
+    selectionPhase: MultiSelectionPhase | null;
   } | null = null;
   private panning = false;
+  private dragSelecting = false;
+  private dragLastPoint: { x: number; y: number } | null = null;
+  private dragVisitedIds = new Set<string>();
   private keys = new Set<string>();
   private pointers = new Map<number, { x: number; y: number }>();
   private pinchDistance = 0;
@@ -756,6 +870,7 @@ export class GameRenderer {
   private contextLost = false;
   private unbindContextRecovery: (() => void) | null = null;
   private mapBounds = new Rectangle(0, 0, 1, 1);
+  private interactionMinZoom = MIN_ZOOM;
 
   constructor(host: HTMLElement, options: RendererOptions, callbacks: RendererCallbacks) {
     this.host = host;
@@ -884,12 +999,14 @@ export class GameRenderer {
 
   setMultiPreview(
     preview: {
+      phase: MultiSelectionPhase;
       sourceIds: string[];
       destinationIds: string[];
       plan: MultiMovePlan | null;
     } | null,
   ): void {
     this.multiPreview = preview;
+    this.updateCanvasAccessibilityLabel();
     if (!this.contextLost) this.drawMultiPreview();
   }
 
@@ -901,7 +1018,9 @@ export class GameRenderer {
       (this.host.clientHeight - padding * 2) / this.mapBounds.height,
       1,
     );
-    this.world.scale.set(Math.max(MIN_ZOOM, scale));
+    const fittedScale = Math.max(FIT_MIN_ZOOM, scale);
+    this.interactionMinZoom = Math.min(MIN_ZOOM, fittedScale);
+    this.world.scale.set(fittedScale);
     this.world.position.set(
       this.host.clientWidth / 2 -
         (this.mapBounds.x + this.mapBounds.width / 2) * this.world.scale.x,
@@ -1150,9 +1269,9 @@ export class GameRenderer {
         if (pattern % 2 === 1) {
           for (let line = -18; line <= 18; line += 9) {
             this.ownershipLayer
-              .moveTo(x + line - 8, y + 21)
-              .lineTo(x + line + 12, y + 1)
-              .stroke({ color, width: 1, alpha: 0.18 });
+              .moveTo(x + terrainDetail(line - 8), y + terrainDetail(21))
+              .lineTo(x + terrainDetail(line + 12), y + terrainDetail(1))
+              .stroke({ color, width: terrainStroke(1), alpha: 0.18 });
           }
         }
       }
@@ -1764,6 +1883,7 @@ export class GameRenderer {
           container,
           frame,
           counts,
+          multiplierLabels: [],
           fighters,
           combatEffects,
           tileId: battle.tileId,
@@ -1795,7 +1915,6 @@ export class GameRenderer {
             .join("|"),
           pulse: 0,
           amount: 0,
-          baseCounts: "",
           resolving: null,
         };
         this.battleLayer.addChild(container);
@@ -1824,19 +1943,6 @@ export class GameRenderer {
           rpsMultiplierPermille: participant.rpsMultiplierPermille,
         };
       });
-      const shown = presentation
-        .slice(0, 3)
-        .map(
-          (participant) =>
-            `${participant.troops}${
-              participant.rpsMultiplierPermille === 1000
-                ? ""
-                : ` ${participant.rpsMultiplierPermille > 1000 ? "+" : "-"}${Math.abs(
-                    Math.round((participant.rpsMultiplierPermille - 1000) / 10),
-                  )}%`
-            }`,
-        );
-      visual.baseCounts = `${shown.join(" · ")}${presentation.length > 3 ? ` · +${presentation.length - 3}` : ""}`;
       const reinforcementSignature = presentation
         .map((participant) => {
           const source = battle.participants.find(
@@ -2238,7 +2344,29 @@ export class GameRenderer {
     this.clampCamera();
   };
 
+  private syncBattleMultiplierLabels(visual: BattleVisual): void {
+    while (visual.multiplierLabels.length < visual.segments.length) {
+      const label = createBadge("", 8);
+      visual.multiplierLabels.push(label);
+      visual.container.addChild(label);
+    }
+    while (visual.multiplierLabels.length > visual.segments.length) {
+      visual.multiplierLabels.pop()?.destroy();
+    }
+    visual.multiplierLabels.forEach((label, index) => {
+      const segment = visual.segments[index]!;
+      label.text = formatTypeMultiplier(segment.rpsMultiplierPermille);
+      label.tint =
+        segment.rpsMultiplierPermille > 1000
+          ? 0xb9f2cd
+          : segment.rpsMultiplierPermille < 1000
+            ? 0xffb4ae
+            : 0xf2e5c7;
+    });
+  }
+
   private drawBattleBar(visual: BattleVisual): void {
+    this.syncBattleMultiplierLabels(visual);
     visual.frame.clear();
     visual.frame
       .roundRect(-BAR_WIDTH / 2 - 6, -BAR_HEIGHT / 2 - 11, BAR_WIDTH + 12, BAR_HEIGHT + 34, 7)
@@ -2269,42 +2397,12 @@ export class GameRenderer {
               : (this.state?.players[segment.playerId]?.pattern ?? segment.playerId % 7);
           drawBattleSegmentPattern(visual.frame, cursor, width, pattern, segment.color);
         }
-        const unitTotal = Math.max(1, totalUnits(segment.units));
-        let typeCursor = cursor;
-        UNIT_TYPES.forEach((type, typeIndex) => {
-          const typeWidth =
-            typeIndex === UNIT_TYPES.length - 1
-              ? cursor + width - typeCursor
-              : (segment.units[type] / unitTotal) * width;
-          if (typeWidth > 0.25) {
-            visual.frame
-              .rect(typeCursor, BAR_HEIGHT / 2 + 2, typeWidth, 4)
-              .fill({ color: UNIT_COLORS[type], alpha: 0.98 });
-          }
-          typeCursor += typeWidth;
-        });
-        const middle = cursor + width / 2;
-        if (width >= 11 && segment.rpsMultiplierPermille !== 1000) {
-          const advantaged = segment.rpsMultiplierPermille > 1000;
-          visual.frame
-            .poly(
-              advantaged
-                ? [middle - 4, -10, middle, -15, middle + 4, -10]
-                : [middle - 4, -15, middle, -10, middle + 4, -15],
-            )
-            .stroke({
-              color: advantaged ? 0x8fe1b2 : 0xffa09a,
-              width: 1.8,
-              alpha: 0.98,
-            });
-        }
-        const support =
-          totalUnits(segment.localSupportPower) + totalUnits(segment.adjacentSupportPower);
-        if (width >= 8 && support > 0) {
-          visual.frame
-            .star(middle, BAR_HEIGHT / 2 + 4, 4, 3.2, 1.4, Math.PI / 4)
-            .fill({ color: 0xf4e1a4, alpha: 0.96 });
-        }
+      }
+      const label = visual.multiplierLabels[index];
+      if (label) {
+        label.visible = width >= label.width + 7;
+        label.position.set(cursor + width / 2, 0);
+        label.alpha = segment.rpsMultiplierPermille === 1000 ? 0.82 : 1;
       }
       cursor += width;
       if (index < visual.segments.length - 1) {
@@ -2320,14 +2418,18 @@ export class GameRenderer {
         .fill({ color: incumbent.color })
         .stroke({ color: 0xe8dab2, width: 1 });
     }
-    visual.counts.text = visual.baseCounts;
+    visual.counts.text = "";
+    visual.counts.visible = false;
     if (visual.pulse > 0) {
       visual.frame.circle(0, 0, 10 + (1 - visual.pulse) * 8).stroke({
         color: 0xffefae,
         width: 2.5,
         alpha: visual.pulse,
       });
-      if (visual.amount > 0) visual.counts.text = `${visual.baseCounts}  +${visual.amount}`;
+      if (visual.amount > 0) {
+        visual.counts.text = `+${visual.amount}`;
+        visual.counts.visible = true;
+      }
     }
     visual.counts.position.y = 20;
   }
@@ -2338,6 +2440,7 @@ export class GameRenderer {
     canvas.addEventListener("pointermove", this.onPointerMove);
     canvas.addEventListener("pointerup", this.onPointerUp);
     canvas.addEventListener("pointercancel", this.onPointerCancel);
+    canvas.addEventListener("lostpointercapture", this.onLostPointerCapture);
     canvas.addEventListener("wheel", this.onWheel, { passive: false });
     canvas.addEventListener("contextmenu", this.onContextMenu);
     canvas.addEventListener("dblclick", this.onDoubleClick);
@@ -2356,6 +2459,7 @@ export class GameRenderer {
     canvas.removeEventListener("pointermove", this.onPointerMove);
     canvas.removeEventListener("pointerup", this.onPointerUp);
     canvas.removeEventListener("pointercancel", this.onPointerCancel);
+    canvas.removeEventListener("lostpointercapture", this.onLostPointerCapture);
     canvas.removeEventListener("wheel", this.onWheel);
     canvas.removeEventListener("contextmenu", this.onContextMenu);
     canvas.removeEventListener("dblclick", this.onDoubleClick);
@@ -2387,8 +2491,16 @@ export class GameRenderer {
       worldX: this.world.x,
       worldY: this.world.y,
       button: event.button,
+      selectionPhase:
+        event.button === 0 && event.pointerType === "mouse"
+          ? this.callbacks.getMultiSelectionPhase()
+          : null,
     };
     this.panning = pinching || event.button === 1;
+    this.dragSelecting = false;
+    this.dragLastPoint = { x: event.clientX, y: event.clientY };
+    this.dragVisitedIds.clear();
+    if (this.pointerStart.selectionPhase) this.callbacks.onMultiGestureState(true);
   };
 
   private onPointerMove = (event: PointerEvent): void => {
@@ -2408,6 +2520,15 @@ export class GameRenderer {
     if (this.pointerStart) {
       const dx = event.clientX - this.pointerStart.x;
       const dy = event.clientY - this.pointerStart.y;
+      if (this.dragSelecting) {
+        this.visitDragSelectionSegment(event.clientX, event.clientY);
+        return;
+      }
+      if (!this.panning && this.pointerStart.selectionPhase && Math.hypot(dx, dy) > 7) {
+        this.dragSelecting = true;
+        this.visitDragSelectionSegment(event.clientX, event.clientY);
+        return;
+      }
       if (this.panning || Math.hypot(dx, dy) > 7) {
         this.panning = true;
         this.world.position.set(this.pointerStart.worldX + dx, this.pointerStart.worldY + dy);
@@ -2426,12 +2547,16 @@ export class GameRenderer {
     this.pointers.delete(event.pointerId);
     if (this.pointers.size < 2) this.pinchDistance = 0;
     const start = this.pointerStart;
-    if (start && !this.panning) {
+    if (start && this.dragSelecting) {
+      this.visitDragSelectionSegment(event.clientX, event.clientY);
+    } else if (start && !this.panning) {
       if (start.button === 2) this.callbacks.onCancel();
-      else this.callbacks.onTileClick(this.tileAtClient(event.clientX, event.clientY));
+      else if (document.elementFromPoint(event.clientX, event.clientY) === this.app.canvas) {
+        this.callbacks.onTileClick(this.tileAtClient(event.clientX, event.clientY));
+      }
     }
-    this.pointerStart = null;
-    this.panning = false;
+    this.resetPointerGesture();
+    if (start?.selectionPhase) this.callbacks.onMultiGestureState(false);
     try {
       this.app.canvas.releasePointerCapture(event.pointerId);
     } catch {
@@ -2440,10 +2565,11 @@ export class GameRenderer {
   };
 
   private onPointerCancel = (event: PointerEvent): void => {
+    const hadMultiGesture = Boolean(this.pointerStart?.selectionPhase);
     this.pointers.clear();
-    this.pointerStart = null;
-    this.panning = false;
+    this.resetPointerGesture();
     this.pinchDistance = 0;
+    if (hadMultiGesture) this.callbacks.onMultiGestureState(false);
     try {
       if (this.app.canvas.hasPointerCapture(event.pointerId)) {
         this.app.canvas.releasePointerCapture(event.pointerId);
@@ -2452,6 +2578,10 @@ export class GameRenderer {
       // Browser cancellation may have already released capture.
     }
     this.callbacks.onCancel();
+  };
+
+  private onLostPointerCapture = (event: PointerEvent): void => {
+    if (this.pointerStart) this.onPointerCancel(event);
   };
 
   private onWheel = (event: WheelEvent): void => {
@@ -2553,19 +2683,21 @@ export class GameRenderer {
                   ? "neutral defenders"
                   : (this.state?.players[participant.playerId]?.name ??
                     `player ${participant.playerId + 1}`);
-              const modifier = Math.round((participant.rpsMultiplierPermille - 1000) / 10);
-              return `${name}, ${formatUnits(participant.units)}, ${modifier > 0 ? `${modifier} percent type advantage` : modifier < 0 ? `${Math.abs(modifier)} percent type disadvantage` : "even type matchup"}`;
+              return `${name}, ${formatUnits(participant.units)}, type multiplier ${(participant.rpsMultiplierPermille / 1000).toFixed(2)}`;
             })
             .join("; ")}.`
         : "";
+    const multiSummary = this.multiPreview
+      ? ` Multi ${this.multiPreview.phase === "sources" ? "source selection" : "target selection"} is active; desktop mouse users may drag across hexes to add them.`
+      : "";
     this.app.canvas.setAttribute(
       "aria-label",
-      `Hex Dominion battlefield.${current}${battleSummary} Use arrow keys to move the hex cursor, Enter or Space to select, and Escape to cancel.`,
+      `Hex Dominion battlefield.${current}${battleSummary}${multiSummary} Use arrow keys to move the hex cursor, Enter or Space to select, and Escape to cancel.`,
     );
   }
 
   private onKeyDown = (event: KeyboardEvent): void => {
-    const target = event.target as HTMLElement | null;
+    const target = event.target instanceof HTMLElement ? event.target : null;
     if (target?.isContentEditable || target?.matches("input, select, textarea, button")) return;
     this.keys.add(event.key.toLowerCase());
   };
@@ -2575,11 +2707,12 @@ export class GameRenderer {
   };
 
   private onWindowBlur = (): void => {
+    const hadMultiGesture = Boolean(this.pointerStart?.selectionPhase);
     this.keys.clear();
     this.pointers.clear();
-    this.pointerStart = null;
-    this.panning = false;
+    this.resetPointerGesture();
     this.pinchDistance = 0;
+    if (hadMultiGesture) this.callbacks.onMultiGestureState(false);
     this.callbacks.onCancel();
   };
 
@@ -2592,7 +2725,7 @@ export class GameRenderer {
     const x = clientX - rect.left;
     const y = clientY - rect.top;
     const old = this.world.scale.x;
-    const next = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, old * factor));
+    const next = Math.max(this.interactionMinZoom, Math.min(MAX_ZOOM, old * factor));
     const wx = (x - this.world.x) / old;
     const wy = (y - this.world.y) / old;
     this.world.scale.set(next);
@@ -2611,6 +2744,40 @@ export class GameRenderer {
     const axial = pixelToAxial({ x: wx, y: wy }, HEX_SIZE);
     const id = axialKey(axial);
     return this.state.map.tiles[id] ? id : null;
+  }
+
+  private visitDragSelectionSegment(clientX: number, clientY: number): void {
+    const phase = this.pointerStart?.selectionPhase;
+    const from = this.dragLastPoint;
+    if (!phase || !from) return;
+    const distance = Math.hypot(clientX - from.x, clientY - from.y);
+    const sampleSpacing = Math.max(4, HEX_SIZE * this.world.scale.x * 0.35);
+    const samples = Math.max(1, Math.ceil(distance / sampleSpacing));
+    for (let sample = 0; sample <= samples; sample += 1) {
+      const progress = sample / samples;
+      const x = from.x + (clientX - from.x) * progress;
+      const y = from.y + (clientY - from.y) * progress;
+      if (document.elementFromPoint(x, y) !== this.app.canvas) continue;
+      const tileId = this.tileAtClient(x, y);
+      if (!tileId || this.dragVisitedIds.has(tileId)) continue;
+      this.dragVisitedIds.add(tileId);
+      this.callbacks.onTileDrag(tileId, phase);
+    }
+    this.dragLastPoint = { x: clientX, y: clientY };
+    const hoveredId = this.tileAtClient(clientX, clientY);
+    if (hoveredId !== this.hoveredId) {
+      this.hoveredId = hoveredId;
+      this.callbacks.onTileHover(hoveredId);
+      this.drawHighlights();
+    }
+  }
+
+  private resetPointerGesture(): void {
+    this.pointerStart = null;
+    this.panning = false;
+    this.dragSelecting = false;
+    this.dragLastPoint = null;
+    this.dragVisitedIds.clear();
   }
 
   private clampCamera(): void {

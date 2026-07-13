@@ -125,6 +125,35 @@ describe("aggregate production structures", () => {
     ["barracks", "melee"],
     ["archery-range", "ranged"],
     ["wizard-tower", "wizard"],
+  ] as const)("keeps %s production running past 40 local units", (type, unitType) => {
+    const state = createRunningGame({ ...TEST_CONFIG, seed: `uncapped-training-${type}` }).state;
+    const tile =
+      type === "barracks" ? state.map.tiles[state.map.spawnCenters[0]!]! : emptySite(state, type);
+    if (!tile.structure) {
+      state.players[0]!.supplyMilli = 1_000_000;
+      startConstruction(state, 0, tile.id, type);
+      finishPending(state, tile.id);
+    }
+    for (const candidate of Object.values(state.map.tiles)) {
+      if (candidate.id !== tile.id && candidate.owner === 0 && candidate.structure) {
+        candidate.structure.productionPaused = true;
+      }
+    }
+    tile.structure!.completedCount = 2;
+    tile.units = unitsOf(unitType, 40);
+    const rules = BUILDING_RULES[type];
+    state.players[0]!.supplyMilli = 6 * rules.troopCostMilli;
+
+    for (let tick = 0; tick < rules.trainTicks * 3; tick += 1) tickStructures(state);
+
+    expect(tile.units).toEqual(unitsOf(unitType, 46));
+    expect(state.players[0]!.supplyMilli).toBe(0);
+  });
+
+  it.each([
+    ["barracks", "melee"],
+    ["archery-range", "ranged"],
+    ["wizard-tower", "wizard"],
   ] as const)("rallies one typed %s batch as one moving stack", (type, unitType) => {
     const state = createRunningGame({ ...TEST_CONFIG, seed: `rally-${type}` }).state;
     state.players[0]!.supplyMilli = 1_000_000;
@@ -169,19 +198,19 @@ describe("aggregate production structures", () => {
       .map((id) => findPath(state.map, tile.id, id, 0, true))
       .find((candidate) => candidate && candidate.length >= 3)!;
     tile.structure!.completedCount = 3;
-    tile.units = unitsOf("melee", 35);
+    tile.units = unitsOf("melee", 40);
     state.players[0]!.supplyMilli = 1_000_000;
     expect(setRally(state, 0, tile.id, route.at(-1)!).ok).toBe(true);
     state.map.tiles[route[1]!]!.owner = 1;
-    for (let tick = 0; tick < BALANCE.barracks.trainTicks; tick += 1) tickStructures(state);
-    expect(tile.units.melee).toBe(38);
-    expect(tile.structure!.rallyQueuedUnits).toEqual(unitsOf("melee", 3));
+    for (let tick = 0; tick < BALANCE.barracks.trainTicks * 2; tick += 1) tickStructures(state);
+    expect(tile.units.melee).toBe(46);
+    expect(tile.structure!.rallyQueuedUnits).toEqual(unitsOf("melee", 6));
     expect(toggleProduction(state, 0, tile.id).ok).toBe(true);
     state.map.tiles[route[1]!]!.owner = 0;
     tickStructures(state);
     expect(state.stacks).toHaveLength(1);
-    expect(state.stacks[0]!.units).toEqual(unitsOf("melee", 3));
-    expect(tile.units.melee).toBe(35);
+    expect(state.stacks[0]!.units).toEqual(unitsOf("melee", 6));
+    expect(tile.units.melee).toBe(40);
     expect(tile.structure!.rallyQueuedUnits).toEqual(unitsOf("melee", 0));
   });
 });

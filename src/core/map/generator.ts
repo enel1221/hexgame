@@ -705,7 +705,9 @@ export function applySpawnAllocations(
   // Give every neutral tile one deterministic unit without favoring one type globally.
   for (const id of map.landIds) {
     const type = UNIT_TYPES[hashSeed(`${seed}:neutral-unit:${id}`) % UNIT_TYPES.length]!;
-    map.tiles[id]!.units = unitsOf(type, 1);
+    const tile = Object.hasOwn(map.tiles, id) ? map.tiles[id] : undefined;
+    if (!tile) throw new Error(`Generated land tile ${id} is missing`);
+    tile.units = unitsOf(type, 1);
   }
 
   for (let playerId = 0; playerId < totalPlayers; playerId += 1) {

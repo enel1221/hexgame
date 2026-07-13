@@ -40,6 +40,10 @@ test.describe("Hex Dominion browser flows", () => {
       await option.click();
       await expect(option).toHaveAttribute("aria-checked", "true");
     }
+    await expect(page.getByTestId("map-heartland")).toContainText("River Gates");
+    await expect(page.getByTestId("map-broken-crown")).toContainText("Shattered Crown");
+    await expect(page.getByTestId("map-highland-basin")).toContainText("Highland Passes");
+    await expect(page.getByText("312", { exact: true })).toBeVisible();
 
     await page.getByTestId("player-name").fill("");
     await expect(page.getByTestId("start-match")).toBeDisabled();
@@ -169,13 +173,13 @@ test.describe("Hex Dominion browser flows", () => {
     expect(snapshot.players.filter((player) => player.isHuman)).toHaveLength(1);
     expect(snapshot.map.archetype).toBe("heartland");
     expect(snapshot.map.seed).toBe("E2E-THREE-AI");
-    expect(snapshot.map.landCount).toBe(380);
+    expect(snapshot.map.landCount).toBe(208);
     expect(snapshot.map.spawnClusters).toHaveLength(4);
     expect(snapshot.map.spawnClusters.every((cluster) => cluster.length === 7)).toBe(true);
     expect(snapshot.stateHash).toMatch(/^[0-9a-f]{16}$/);
 
     await expect(page.getByTestId("supply")).toContainText(/\d/);
-    await expect(page.getByTestId("land-control")).toContainText(/7\s*\/\s*380/);
+    await expect(page.getByTestId("land-control")).toContainText(/7\s*\/\s*208/);
     await expect(page.getByTestId("debug-overlay")).toContainText("FIELD TELEMETRY");
     await expect(page.getByTestId("debug-overlay")).toContainText("E2E-THREE-AI");
     await health.assertHealthy();
@@ -220,7 +224,7 @@ test.describe("Hex Dominion browser flows", () => {
 
     expect(snapshot.config.aiCount).toBe(20);
     expect(snapshot.players).toHaveLength(21);
-    expect(snapshot.map.landCount).toBe(1_995);
+    expect(snapshot.map.landCount).toBe(1_092);
     expect(snapshot.map.spawnClusters).toHaveLength(21);
     expect(snapshot.stateHash).toMatch(/^[0-9a-f]{16}$/);
     const startingTick = snapshot.tick;
@@ -232,7 +236,7 @@ test.describe("Hex Dominion browser flows", () => {
       },
     );
 
-    await expect(page.getByTestId("land-control")).toContainText(/7\s*\/\s*1995/);
+    await expect(page.getByTestId("land-control")).toContainText(/7\s*\/\s*1092/);
     await expect(page.getByTestId("debug-overlay")).toContainText("E2E-TWENTY-AI");
     await health.assertHealthy();
   });
@@ -559,7 +563,7 @@ test.describe("Hex Dominion browser flows", () => {
         .filter((tile) => tile.owner === localPlayerId && tile.structure?.status === "active")
         .map((tile) => tile.structure!.type)
         .sort(),
-    ).toEqual(["barracks", "farm", "turret"]);
+    ).toEqual(["archery-range", "barracks", "wizard-tower"]);
 
     const structureTiles = structures.map.tiles.filter(
       (tile) => tile.owner === localPlayerId && tile.structure,
@@ -567,18 +571,23 @@ test.describe("Hex Dominion browser flows", () => {
     for (const tile of structureTiles) {
       await inspectDebugTile(page, tile.id);
       const progress = page.getByTestId("structure-progress-text");
-      if (tile.structure!.type === "farm") {
+      if (tile.structure!.type === "archery-range") {
         await expect(progress).toHaveText("Construction 50%");
       } else if (tile.structure!.type === "barracks") {
-        await expect(progress).toHaveText("Barracks production cycle 50%");
-        await expect(page.getByTestId("rally-queued-status")).toHaveText("4 trained troops queued");
+        await expect(progress).toHaveText("Barracks Melee training cycle 50%");
+        await expect(page.getByTestId("rally-queued-status")).toHaveText(
+          "4 Melee, 0 Ranged, 0 Wizard queued",
+        );
       } else {
-        await expect(progress).toHaveText("Turret volley accumulator 50%");
-        await expect(page.getByTestId("turret-support-status")).toHaveText(
-          "Turret x99 ready; no eligible nearby battle",
+        await expect(progress).toHaveText("Wizard Tower Wizard training cycle 0%");
+        await expect(page.getByTestId("typed-support-status")).toHaveText(
+          "Wizard Tower x99 ready; no eligible nearby battle",
         );
       }
-      await expect(page.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "50");
+      await expect(page.getByRole("progressbar")).toHaveAttribute(
+        "aria-valuenow",
+        tile.structure!.type === "wizard-tower" ? "0" : "50",
+      );
     }
 
     const battle = await loadDebugScenario(page, "battle");
@@ -598,7 +607,9 @@ test.describe("Hex Dominion browser flows", () => {
           ? "Neutral defenders"
           : battle.players.find((player) => player.id === participant.playerId)!.name;
       await expect(row).toContainText(name);
-      await expect(row).toContainText(`${participant.troops} troops`);
+      await expect(row).toContainText(`${participant.troops} units`);
+      await expect(row.getByLabel(/Melee.*Ranged.*Wizard/i)).toBeVisible();
+      await expect(row).toContainText(/Type (?:advantage|disadvantage|matchup even)/i);
       await expect(row).toContainText(/\d+\.\d{2}% effective share/);
       if (participant.playerId === battle.battles[0]!.incumbentOwner) {
         await expect(row).toContainText("incumbent");
@@ -615,9 +626,10 @@ test.describe("Hex Dominion browser flows", () => {
         .battles.find((candidate) => candidate.id === battleId);
       return Boolean(
         seam &&
-        seam.actual === 0.5 &&
-        Math.abs(seam.displayed - 0.5) < 0.001 &&
-        Math.abs(seam.ghost - 0.5) < 0.001,
+        seam.actual > 0.5 &&
+        Math.abs(seam.displayed - seam.actual) < 0.001 &&
+        Math.abs(seam.ghost - seam.actual) < 0.001 &&
+        seam.segments?.some((segment) => segment.rpsMultiplierPermille > 1000),
       );
     }, battle.battles[0]!.id);
 
@@ -655,7 +667,9 @@ test.describe("Hex Dominion browser flows", () => {
       localPlayerId,
     );
     expect(captured.players.find((player) => player.id === localPlayerId)?.tiles).toBe(8);
-    await expect(page.locator(".event-feed")).toContainText("+3 Supply for hostile capture");
+    await expect(page.locator(".event-feed")).toContainText(
+      `+${BALANCE.captureRewardMilli / 1000} Supply for hostile capture`,
+    );
 
     const victory = await loadDebugScenario(page, "victory");
     expect(victory.winner).toBe(localPlayerId);
@@ -715,12 +729,14 @@ test.describe("Hex Dominion browser flows", () => {
 
     const developed = await loadDebugScenario(page, "developed-capture");
     const developedBattle = developed.battles[0]!;
-    const supplyBefore = developed.players.find(
-      (player) => player.id === localPlayerId,
-    )!.supplyMilli;
+    const playerBeforeCapture = developed.players.find((player) => player.id === localPlayerId)!;
     expect(
       developed.map.tiles.find((tile) => tile.id === developedBattle.tileId)?.structure,
-    ).toMatchObject({ type: "farm", status: "active", integrity: BALANCE.fullIntegrity });
+    ).toMatchObject({
+      type: "archery-range",
+      status: "active",
+      integrity: BALANCE.fullIntegrity,
+    });
     await resumeSimulation(page);
     await page.waitForFunction(
       ({ tileId, owner }) => {
@@ -737,13 +753,20 @@ test.describe("Hex Dominion browser flows", () => {
       (tile) => tile.id === developedBattle.tileId,
     )?.structure;
     expect(capturedStructure).toMatchObject({
-      type: "farm",
+      type: "archery-range",
       status: "seized",
       integrity: BALANCE.seizedIntegrity,
     });
-    const structureCaptureReward = BALANCE.captureRewardMilli + BALANCE.farmCaptureRewardMilli;
-    expect(captured.players.find((player) => player.id === localPlayerId)?.supplyMilli).toBe(
-      supplyBefore + structureCaptureReward,
+    const structureCaptureReward =
+      BALANCE.captureRewardMilli + BALANCE.archeryRangeCaptureRewardMilli;
+    const playerAfterCapture = captured.players.find((player) => player.id === localPlayerId)!;
+    const earnedDuringCapture =
+      playerAfterCapture.supplyEarnedMilli - playerBeforeCapture.supplyEarnedMilli;
+    const trainingSpentDuringCapture =
+      (playerAfterCapture.troopsTrained - playerBeforeCapture.troopsTrained) * 1_000;
+    expect(earnedDuringCapture).toBeGreaterThanOrEqual(structureCaptureReward);
+    expect(playerAfterCapture.supplyMilli).toBe(
+      playerBeforeCapture.supplyMilli + earnedDuringCapture - trainingSpentDuringCapture,
     );
     expect(captured.events).toEqual(
       expect.arrayContaining([
@@ -783,7 +806,9 @@ test.describe("Hex Dominion browser flows", () => {
     await health.assertHealthy();
   });
 
-  test("invalid Farm placement reports a recoverable user-facing error", async ({ page }) => {
+  test("invalid Archery Range placement reports a recoverable user-facing error", async ({
+    page,
+  }) => {
     const health = observeBrowserHealth(page);
     await startSinglePlayer(page, {
       aiCount: 3,
@@ -798,11 +823,14 @@ test.describe("Hex Dominion browser flows", () => {
         (tile) => tile.owner === localPlayerId && tile.terrain !== "meadow" && !tile.structure,
       ) ??
       snapshot.map.tiles.find((tile) => tile.owner === localPlayerId && Boolean(tile.structure));
-    expect(invalid, "the deterministic spawn should include invalid Farm land").toBeDefined();
+    expect(
+      invalid,
+      "the deterministic spawn should include invalid Archery Range land",
+    ).toBeDefined();
 
-    const farm = page.getByTestId("build-farm");
-    await farm.click();
-    await expect(farm).toHaveAttribute("aria-pressed", "true");
+    const range = page.getByTestId("build-archery-range");
+    await range.click();
+    await expect(range).toHaveAttribute("aria-pressed", "true");
     await page.evaluate((tileId) => {
       const api = window.__HEX_DOMINION__;
       if (!api) throw new Error("Hex Dominion debug API is unavailable");
@@ -810,7 +838,7 @@ test.describe("Hex Dominion browser flows", () => {
       api.selectTile(tileId);
     }, invalid!.id);
     await expect(page.getByRole("alert")).toContainText(
-      /Farms require (?:a )?Fertile Meadow|already contains a structure/,
+      /Archery Ranges require (?:a )?Fertile Meadow|already contains a structure/,
     );
     await expect(page.getByRole("alert")).toBeHidden({ timeout: 4_000 });
     await health.assertHealthy();
@@ -832,17 +860,22 @@ test.describe("Hex Dominion browser flows", () => {
     const barracks = page.getByTestId("build-barracks");
     await barracks.click();
     await expect(barracks).toHaveAttribute("aria-pressed", "true");
-    await page.evaluate((tileId) => window.__HEX_DOMINION__?.selectTile(tileId), invalid!.id);
+    await page.evaluate((tileId) => {
+      const api = window.__HEX_DOMINION__;
+      if (!api) throw new Error("Hex Dominion debug API is unavailable");
+      api.hoverTile(tileId);
+      api.selectTile(tileId);
+    }, invalid!.id);
     await expect(page.getByRole("alert")).toContainText(/Barracks require (?:a )?Muster Ground/);
     await expect(page.getByRole("alert")).toBeHidden({ timeout: 4_000 });
     await health.assertHealthy();
   });
 
-  test("builds a Turret on a fully enclosed interior owned tile", async ({ page }) => {
+  test("builds a Wizard Tower on a fully enclosed interior owned tile", async ({ page }) => {
     const health = observeBrowserHealth(page);
     await startSinglePlayer(page, {
       aiCount: 3,
-      seed: "E2E-INTERIOR-TURRET",
+      seed: "E2E-INTERIOR-WIZARD",
       playerName: "Interior Warden",
     });
     const fixture = await loadDebugScenario(page, "interior-build");
@@ -876,36 +909,44 @@ test.describe("Hex Dominion browser flows", () => {
     );
     expect(interior, "the fixture should expose a six-neighbor owned interior tile").toBeDefined();
 
-    const supplyBefore = fixture.players.find((player) => player.id === localPlayerId)!.supplyMilli;
-    const turret = page.getByTestId("build-turret");
-    await turret.click();
-    await expect(turret).toHaveAttribute("aria-pressed", "true");
+    const playerBeforeBuild = fixture.players.find((player) => player.id === localPlayerId)!;
+    const tower = page.getByTestId("build-wizard-tower");
+    await tower.click();
+    await expect(tower).toHaveAttribute("aria-pressed", "true");
     await page.evaluate((tileId) => window.__HEX_DOMINION__?.selectTile(tileId), interior!.id);
     await resumeSimulation(page);
     await page.waitForFunction(
       (tileId) =>
         window.__HEX_DOMINION__?.map.tiles.find((tile) => tile.id === tileId)?.structure?.type ===
-        "turret",
+        "wizard-tower",
       interior!.id,
       { timeout: 3_000 },
     );
     const built = await getTestApiSnapshot(page);
     expect(built.map.tiles.find((tile) => tile.id === interior!.id)?.structure).toMatchObject({
-      type: "turret",
+      type: "wizard-tower",
       completedCount: 0,
       status: null,
       pendingProgressTicks: expect.any(Number),
     });
-    const supplyAfter = built.players.find((player) => player.id === localPlayerId)!.supplyMilli;
-    expect(supplyAfter).toBeLessThan(supplyBefore);
-    expect(supplyAfter).toBeLessThanOrEqual(supplyBefore - BALANCE.turret.costMilli + 1_000);
+    const playerAfterBuild = built.players.find((player) => player.id === localPlayerId)!;
+    const incomeDuringBuild =
+      playerAfterBuild.supplyEarnedMilli - playerBeforeBuild.supplyEarnedMilli;
+    const trainingSpentDuringBuild =
+      (playerAfterBuild.troopsTrained - playerBeforeBuild.troopsTrained) * 1_000;
+    expect(playerAfterBuild.supplyMilli).toBe(
+      playerBeforeBuild.supplyMilli -
+        BALANCE.wizardTower.costMilli +
+        incomeDuringBuild -
+        trainingSpentDuringBuild,
+    );
     await health.assertHealthy();
   });
 
   for (const fixture of [
-    { type: "farm", seed: "E2E-BUILD-FARM", terrain: "meadow", cost: 45 },
+    { type: "archery-range", seed: "E2E-BUILD-ARCHERY", terrain: "meadow", cost: 75 },
     { type: "barracks", seed: "BUILD-2", terrain: "muster", cost: 70 },
-    { type: "turret", seed: "E2E-BUILD-TURRET", terrain: null, cost: 90 },
+    { type: "wizard-tower", seed: "E2E-BUILD-WIZARD", terrain: null, cost: 90 },
   ] as const) {
     test(`builds a ${fixture.type} on legal owned terrain`, async ({ page }) => {
       const health = observeBrowserHealth(page);
@@ -927,7 +968,7 @@ test.describe("Hex Dominion browser flows", () => {
       expect(tile, `${fixture.seed} should expose legal ${fixture.type} terrain`).toBeDefined();
       const completedBefore = tile!.structure?.completedCount ?? 0;
 
-      const supplyBefore = Number.parseFloat(await page.getByTestId("supply").innerText());
+      const playerBeforeBuild = snapshot.players.find((player) => player.id === localPlayerId)!;
       const build = page.getByTestId(`build-${fixture.type}`);
       await build.click();
       await expect(build).toHaveAttribute("aria-pressed", "true");
@@ -952,8 +993,17 @@ test.describe("Hex Dominion browser flows", () => {
       expect(structure?.type).toBe(fixture.type);
       expect(structure?.completedCount).toBe(completedBefore);
       expect(structure?.pendingProgressTicks).not.toBeNull();
-      const supplyAfter = Number.parseFloat(await page.getByTestId("supply").innerText());
-      expect(supplyAfter).toBeLessThanOrEqual(supplyBefore - fixture.cost + 0.5);
+      const playerAfterBuild = after.players.find((player) => player.id === localPlayerId)!;
+      const incomeDuringBuild =
+        playerAfterBuild.supplyEarnedMilli - playerBeforeBuild.supplyEarnedMilli;
+      const trainingSpentDuringBuild =
+        (playerAfterBuild.troopsTrained - playerBeforeBuild.troopsTrained) * 1_000;
+      expect(playerAfterBuild.supplyMilli).toBe(
+        playerBeforeBuild.supplyMilli -
+          fixture.cost * 1_000 +
+          incomeDuringBuild -
+          trainingSpentDuringBuild,
+      );
       await health.assertHealthy();
     });
   }

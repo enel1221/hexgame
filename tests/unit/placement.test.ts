@@ -15,6 +15,7 @@ import {
   validateSpawnChoicePreview,
   axialKey,
   neighbors,
+  totalUnits,
 } from "../../src/core";
 import { BALANCE } from "../../src/shared/balance";
 import type { GameCommand } from "../../src/shared/types";
@@ -72,9 +73,9 @@ describe("deterministic spawn placement", () => {
         destinationIds: [destinationId!],
         percent: 50,
       },
-      { type: "build", playerId: 0, tileId: sourceId!, structure: "turret" },
+      { type: "build", playerId: 0, tileId: sourceId!, structure: "wizard-tower" },
       { type: "cancel-build", playerId: 0, tileId: sourceId! },
-      { type: "toggle-barracks", playerId: 0, tileId: sourceId! },
+      { type: "toggle-production", playerId: 0, tileId: sourceId! },
       { type: "set-rally", playerId: 0, tileId: sourceId!, destinationId: destinationId! },
       { type: "clear-rally", playerId: 0, tileId: sourceId! },
     ];
@@ -119,9 +120,9 @@ describe("deterministic spawn placement", () => {
     for (let playerId = 0; playerId < engine.state.players.length; playerId += 1) {
       const cluster = engine.state.map.spawnClusters[playerId]!;
       expect(cluster).toHaveLength(BALANCE.startingTiles);
-      expect(cluster.reduce((sum, id) => sum + engine.state.map.tiles[id]!.troops, 0)).toBe(
-        BALANCE.startingTroops,
-      );
+      expect(
+        cluster.reduce((sum, id) => sum + totalUnits(engine.state.map.tiles[id]!.units), 0),
+      ).toBe(BALANCE.startingTroops);
       const centerId = engine.state.map.spawnCenters[playerId]!;
       expect(new Set(cluster)).toEqual(
         new Set([centerId, ...neighbors(engine.state.map.tiles[centerId]!).map(axialKey)]),
@@ -226,9 +227,9 @@ describe("deterministic spawn placement", () => {
       playerNames: ["North", "East", "South", "West"],
     });
     for (const [playerId, centerId] of [
-      [0, "8,13"],
-      [1, "18,7"],
-      [2, "16,3"],
+      [0, "-1,6"],
+      [1, "1,10"],
+      [2, "14,6"],
     ] as const) {
       expect(applyCommand(engine.state, { type: "choose-spawn", playerId, centerId })).toEqual({
         ok: true,
@@ -236,16 +237,16 @@ describe("deterministic spawn placement", () => {
     }
 
     const beforePreview = structuredClone(engine.state);
-    const rejectedPreview = validateSpawnChoicePreview(engine.state, 3, "2,5");
+    const rejectedPreview = validateSpawnChoicePreview(engine.state, 3, "5,2");
     expect(rejectedPreview).toMatchObject({
       ok: false,
       reason: expect.stringMatching(/balanced placement spacing/i),
     });
-    expect(validateSpawnChoice(engine.state, 3, "2,5")).toEqual(rejectedPreview);
+    expect(validateSpawnChoice(engine.state, 3, "5,2")).toEqual(rejectedPreview);
     expect(engine.state).toEqual(beforePreview);
 
     const vector = computeFinalSpawnVector(engine.state);
-    expect(vector.slice(0, 3)).toEqual(["8,13", "18,7", "16,3"]);
+    expect(vector.slice(0, 3)).toEqual(["-1,6", "1,10", "14,6"]);
     expect(validateFinalSpawnVector(engine.state, vector)).toEqual({ ok: true });
   });
 

@@ -14,6 +14,9 @@ import {
   startBattle,
   tickEncirclements,
   parseEngineSnapshot,
+  refreshPlayerAggregates,
+  totalUnits,
+  unitsOf,
 } from "../../src/core";
 import { BALANCE } from "../../src/shared/balance";
 import type { GameState, MovingStack, StructureState, TileState } from "../../src/shared/types";
@@ -51,7 +54,7 @@ function clearBoard(state: GameState): void {
   for (const tileId of state.map.landIds) {
     const tile = state.map.tiles[tileId]!;
     tile.owner = null;
-    tile.troops = 1;
+    tile.units = unitsOf("melee", 1);
     tile.structure = null;
     tile.controlledSinceTick = 0;
     tile.lastRewardTick = 0;
@@ -79,11 +82,11 @@ function installPocket(
   const boundaryIds = ring(center, interiorRadius + 1).map(axialKey);
   for (const id of interiorIds) {
     state.map.tiles[id]!.owner = 1;
-    state.map.tiles[id]!.troops = 4;
+    state.map.tiles[id]!.units = unitsOf("wizard", 4);
   }
   for (const id of boundaryIds) {
     state.map.tiles[id]!.owner = 0;
-    state.map.tiles[id]!.troops = 8;
+    state.map.tiles[id]!.units = unitsOf("melee", 8);
   }
   return { center, interiorIds, boundaryIds };
 }
@@ -108,10 +111,9 @@ function structure(
     pendingProgressTicks,
     seizedTicks: 0,
     productionPaused: false,
-    barracksProgressMilli: 0,
+    trainingProgressMilli: 0,
     rallyTargetId: null,
-    rallyQueuedTroops: 0,
-    turretShotProgressMilli: 0,
+    rallyQueuedUnits: unitsOf("melee", 0),
   };
 }
 
@@ -124,7 +126,7 @@ function movingStack(
   return {
     id,
     owner,
-    troops,
+    units: unitsOf("melee", troops),
     path,
     pathIndex: 0,
     segmentProgress: 0,
@@ -149,7 +151,7 @@ describe("deterministic delayed encirclement", () => {
     tickEnclosuresFor(state, 1);
     expect(state.enclosures).toHaveLength(0);
     expect(center.owner).toBe(0);
-    expect(center.troops).toBe(0);
+    expect(totalUnits(center.units)).toBe(0);
     expect(state.events.at(-1)).toMatchObject({
       type: "encirclement-complete",
       playerId: 0,
@@ -170,8 +172,8 @@ describe("deterministic delayed encirclement", () => {
     breach.owner = 0;
     tickEnclosuresFor(state, 1);
     expect(state.enclosures[0]?.progressTicks).toBe(1);
-    breach.troops = 5;
-    startBattle(state, breach, 2, 5, center.id);
+    breach.units = unitsOf("melee", 5);
+    startBattle(state, breach, 2, unitsOf("wizard", 5), center.id);
     tickEnclosuresFor(state, 1);
     expect(state.enclosures).toHaveLength(0);
   });
@@ -281,6 +283,7 @@ describe("deterministic delayed encirclement", () => {
         enclosure.boundaryIds.every((id) => state.map.tiles[id]!.owner === enclosure.captorId),
       ),
     ).toBe(true);
+    refreshPlayerAggregates(state);
     state.stateHash = hashGameState(state);
     expect(() =>
       parseEngineSnapshot({ state, commandHistory: [], pendingCommands: [] }),
@@ -291,8 +294,8 @@ describe("deterministic delayed encirclement", () => {
     const state = runningState("enclosure-structures-rewards");
     const { interiorIds } = installPocket(state, 1);
     state.tick = BALANCE.minimumOwnershipRewardTicks;
-    const farmTile = state.map.tiles[interiorIds[0]!]!;
-    farmTile.structure = structure("farm", 2, 12);
+    const rangeTile = state.map.tiles[interiorIds[0]!]!;
+    rangeTile.structure = structure("archery-range", 2, 12);
     const hostilePlain = state.map.tiles[interiorIds[1]!]!;
     hostilePlain.owner = 2;
     const neutral = state.map.tiles[interiorIds[2]!]!;
@@ -301,23 +304,24 @@ describe("deterministic delayed encirclement", () => {
     state.enclosures[0]!.progressTicks = BALANCE.encirclementTicks - 1;
     tickEnclosuresFor(state, 1);
 
-    expect(farmTile.structure).toMatchObject({
-      type: "farm",
+    expect(rangeTile.structure).toMatchObject({
+      type: "archery-range",
       completedCount: 2,
       status: "seized",
       integrity: BALANCE.seizedIntegrity,
       pendingProgressTicks: null,
     });
     expect(
-      state.events.find((event) => event.type === "reward" && event.tileId === farmTile.id)?.amount,
-    ).toBe(BALANCE.captureRewardMilli + BALANCE.farmCaptureRewardMilli * 2);
+      state.events.find((event) => event.type === "reward" && event.tileId === rangeTile.id)
+        ?.amount,
+    ).toBe(BALANCE.captureRewardMilli + BALANCE.archeryRangeCaptureRewardMilli * 2);
     expect(
       state.events.find((event) => event.type === "reward" && event.tileId === hostilePlain.id)
         ?.amount,
     ).toBe(BALANCE.captureRewardMilli);
     expect(
-      state.events.some((event) => event.type === "reward" && event.tileId === neutral.id),
-    ).toBe(false);
+      state.events.find((event) => event.type === "reward" && event.tileId === neutral.id)?.amount,
+    ).toBe(BALANCE.neutralCaptureRewardMilli);
   });
 
   it("cleans hostile garrisons, moving stacks, and battle participants while preserving captor forces", () => {
@@ -325,8 +329,8 @@ describe("deterministic delayed encirclement", () => {
     const { center, interiorIds, boundaryIds } = installPocket(state, 1);
     const battleTile = state.map.tiles[interiorIds[0]!]!;
     battleTile.owner = 1;
-    battleTile.troops = 6;
-    const battle = startBattle(state, battleTile, 0, 5, boundaryIds[0]!);
+    battleTile.units = unitsOf("ranged", 6);
+    const battle = startBattle(state, battleTile, 0, unitsOf("melee", 5), boundaryIds[0]!);
     const beforePlayerOneLosses = state.players[1]!.stats.troopsLost;
     const movingTile = interiorIds[1]!;
     state.stacks = [
@@ -339,7 +343,7 @@ describe("deterministic delayed encirclement", () => {
 
     expect(state.battles.some((candidate) => candidate.id === battle.id)).toBe(false);
     expect(battleTile.owner).toBe(0);
-    expect(battleTile.troops).toBe(5);
+    expect(battleTile.units).toEqual(unitsOf("melee", 5));
     expect(state.stacks.map((stack) => stack.owner)).toEqual([0]);
     expect(state.players[1]!.stats.troopsLost).toBeGreaterThanOrEqual(
       beforePlayerOneLosses + 6 + 7,

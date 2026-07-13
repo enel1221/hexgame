@@ -24,6 +24,7 @@ import {
 } from "../placement";
 import { hashSeed } from "../rng";
 import { tickStructures } from "../buildings";
+import { totalUnits } from "../units";
 import { tickVictory } from "../victory";
 import { parseEngineSnapshot } from "./snapshot";
 
@@ -103,15 +104,15 @@ export function refreshPlayerAggregates(state: GameState): void {
     const tile = state.map.tiles[tileId]!;
     if (tile.owner === null || !state.players[tile.owner]) continue;
     tiles[tile.owner] += 1;
-    troops[tile.owner] += tile.troops;
+    troops[tile.owner] += totalUnits(tile.units);
   }
   for (const stack of state.stacks) {
-    if (state.players[stack.owner]) troops[stack.owner] += stack.troops;
+    if (state.players[stack.owner]) troops[stack.owner] += totalUnits(stack.units);
   }
   for (const battle of state.battles) {
     for (const participant of battle.participants) {
       if (participant.playerId !== null && state.players[participant.playerId]) {
-        troops[participant.playerId] += participant.troops;
+        troops[participant.playerId] += totalUnits(participant.units);
       }
     }
   }
@@ -161,7 +162,7 @@ export function createInitialState(config: MatchConfig): GameState {
     emptyPlayer(normalizedConfig, id, humanSeatSet),
   );
   const state: GameState = {
-    version: 2,
+    version: 3,
     config: normalizedConfig,
     phase: "placement",
     placement: createPlacementState(normalizedConfig, players),

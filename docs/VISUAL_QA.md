@@ -4,29 +4,30 @@ Visual QA is a review process, not a screenshot-existence check. `npm run test:v
 
 ## Automated capture matrix
 
-| File                         | Viewport | Seed/scenario                                                                        | Review purpose                                                       |
-| ---------------------------- | -------- | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------- |
-| `title-setup.png`            | 1440×900 | Fresh local storage, default setup                                                   | Brand, hierarchy, realm cards, ledger, focus/spacing                 |
-| `placement-selection.png`    | 1440×900 | `VISUAL-PLACEMENT`, neutral map with human and AI provisional/locked footprints      | Candidate clarity, roster/status, seven-hex footprint hierarchy      |
-| `opening-handoff.png`        | 1440×900 | `VISUAL-OPENING`, center claim before the delayed surrounding ring                   | Local camera focus and center-first radial opening timing            |
-| `map-heartland.png`          | 1440×900 | `VISUAL-HEARTLAND`, 3 AI, first paused live state                                    | Open mainland, fitted framing, HUD/count contrast                    |
-| `map-broken-crown.png`       | 1440×900 | `VISUAL-BROKEN-CROWN`, 3 AI, first paused live state                                 | Bays/lobes/chokepoints, water/land readability                       |
-| `map-highland-basin.png`     | 1440×900 | `VISUAL-HIGHLAND-BASIN`, 3 AI, first paused live state                               | Forest/hill/lake density and terrain distinction                     |
-| `twenty-ai-overview.png`     | 1440×900 | `VISUAL-TWENTY-AI`, 20 AI, first responsive ticks                                    | 1,995-land overview, 21 colors, fitted camera, HUD load              |
-| `active-game.png`            | 1440×900 | `VISUAL-ACTIVE`, 3 AI, captured during a human stack move with another tile selected | Squad/count, selection, tile inspector, command dock                 |
-| `selected-path-preview.png`  | 1440×900 | `VISUAL-PATH-PREVIEW`, selected source plus hovered friendly destination             | Selection ring, route arrows, inspector, count layering              |
-| `multi-route-preview.png`    | 1440×900 | `VISUAL-MULTI-PREVIEW`, two aggregate sources and two staged targets                 | Source rings, numbered quotas, route fans, and Multi status          |
-| `multiple-stacks.png`        | 1440×900 | `VISUAL-MULTIPLE-STACKS`, two same-tick legal orders                                 | Multiple squad separation, exact badges, lane readability            |
-| `structures.png`             | 1440×900 | `debug-scenario-test`, frozen `structures` fixture                                   | Farm, Barracks, and Turret silhouettes together                      |
-| `battle-50-50.png`           | 1440×900 | `debug-scenario-test`, frozen 56-versus-56 `battle` fixture                          | Equal initial seam, fighters, opposing colors, exact live counts     |
-| `battle-reinforcement.png`   | 1440×900 | Same battle ID after a deterministic +40 attacker reinforcement                      | Reinforcement halo/count and delayed ghost/main seam separation      |
-| `battle-three-factions.png`  | 1440×900 | Frozen three-participant battle fixture                                              | Independent faction segments, patterns, counts, and inspector detail |
-| `encirclement-countdown.png` | 1440×900 | Frozen active enclosure around a developed interior                                  | Perimeter, offset countdown, structure/garrison legibility           |
-| `capture-transition.png`     | 1440×900 | Sequential `capture-before` then `capture` fixture                                   | Directional edge wipe and world-space capture/reward labels          |
-| `victory.png`                | 1440×900 | Frozen local-player `victory` fixture                                                | Crown treatment, result hierarchy, statistics, actions               |
-| `defeat.png`                 | 1440×900 | Frozen local-player `defeat` fixture                                                 | Defeat treatment, opponent attribution, statistics, actions          |
-| `tablet-title.png`           | 768×1024 | Fresh setup                                                                          | Stacked setup layout, touch sizes, clipping/scroll                   |
-| `tablet-active-game.png`     | 1024×768 | `VISUAL-TABLET`, 3 AI, first paused live state                                       | Compact HUD/dock, standings/events behavior, battlefield visibility  |
+| File                         | Viewport | Seed/scenario                                                                        | Review purpose                                                      |
+| ---------------------------- | -------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
+| `title-setup.png`            | 1440×900 | Fresh local storage, default setup                                                   | Brand, hierarchy, realm cards, ledger, focus/spacing                |
+| `placement-selection.png`    | 1440×900 | `VISUAL-PLACEMENT`, neutral map with human and AI provisional/locked footprints      | Candidate clarity, roster/status, seven-hex footprint hierarchy     |
+| `opening-handoff.png`        | 1440×900 | `VISUAL-OPENING`, center claim before the delayed surrounding ring                   | Local camera focus and center-first radial opening timing           |
+| `map-heartland.png`          | 1440×900 | `VISUAL-HEARTLAND`, 3 AI, first paused live state                                    | River Gates seam, two-hex crossing, fitted framing                  |
+| `map-broken-crown.png`       | 1440×900 | `VISUAL-BROKEN-CROWN`, 3 AI, first paused live state                                 | Shattered Crown one-hex gate and water/land readability             |
+| `map-highland-basin.png`     | 1440×900 | `VISUAL-HIGHLAND-BASIN`, 3 AI, first paused live state                               | Highland Passes seam, terrain density, and two-hex crossing         |
+| `twenty-ai-overview.png`     | 1440×900 | `VISUAL-TWENTY-AI`, 20 AI, first responsive ticks                                    | 1,092-land overview, 21 colors, gates, fitted camera, HUD load      |
+| `active-game.png`            | 1440×900 | `VISUAL-ACTIVE`, 3 AI, captured during a human stack move with another tile selected | Squad/count, selection, tile inspector, command dock                |
+| `selected-path-preview.png`  | 1440×900 | `VISUAL-PATH-PREVIEW`, selected source plus hovered friendly destination             | Selection ring, route arrows, inspector, count layering             |
+| `multi-route-preview.png`    | 1440×900 | `VISUAL-MULTI-PREVIEW`, two aggregate sources and two staged targets                 | Source rings, numbered quotas, route fans, and Multi status         |
+| `multiple-stacks.png`        | 1440×900 | `VISUAL-MULTIPLE-STACKS`, two same-tick legal orders                                 | Multiple squad separation, exact badges, lane readability           |
+| `structures.png`             | 1440×900 | `debug-scenario-test`, frozen `structures` fixture                                   | Barracks, Archery Range, Wizard Tower, typed plates, stacking       |
+| `battle-rps-counter.png`     | 1440×900 | Frozen pure counter battle fixture                                                   | Typed strip, exact M/R/W counts, explicit RPS advantage             |
+| `battle-typed-support.png`   | 1440×900 | Frozen defended producer battle                                                      | Local/adjacent typed support and effective-power explanation        |
+| `battle-reinforcement.png`   | 1440×900 | Same battle ID after a deterministic +40 attacker reinforcement                      | Reinforcement halo/count and delayed ghost/main seam separation     |
+| `battle-mixed-n-way.png`     | 1440×900 | Frozen three-participant mixed-composition fixture                                   | Independent factions, typed mixes, patterns, and inspector detail   |
+| `encirclement-countdown.png` | 1440×900 | Frozen active enclosure around a developed interior                                  | Perimeter, offset countdown, structure/garrison legibility          |
+| `capture-transition.png`     | 1440×900 | Sequential `capture-before` then `capture` fixture                                   | Directional edge wipe and world-space capture/reward labels         |
+| `victory.png`                | 1440×900 | Frozen local-player `victory` fixture                                                | Crown treatment, result hierarchy, statistics, actions              |
+| `defeat.png`                 | 1440×900 | Frozen local-player `defeat` fixture                                                 | Defeat treatment, opponent attribution, statistics, actions         |
+| `tablet-title.png`           | 768×1024 | Fresh setup                                                                          | Stacked setup layout, touch sizes, clipping/scroll                  |
+| `tablet-active-game.png`     | 1024×768 | `VISUAL-TABLET`, 3 AI, first paused live state                                       | Compact HUD/dock, standings/events behavior, battlefield visibility |
 
 The table records browser viewports. Because setup captures are full-page, the generated `title-setup.png` is 1440×931 and `tablet-title.png` is 768×1544; the taller tablet file is the expected scrollable document, not viewport overflow.
 
@@ -62,25 +63,28 @@ Open every PNG at 100% and inspect the following.
 - [ ] Color-pattern assistance remains supplementary and unobtrusive when tested manually.
 - [ ] Fitted maps are centered with useful margins and cannot appear lost offscreen.
 - [ ] Starting clusters, neutral land, and water boundaries remain readable at overview zoom.
+- [ ] Every archetype's impassable seam and one/two-hex gate read as intentional strategic topology rather than a rendering gap.
 - [ ] Selected and build-eligible tiles are obvious without hiding garrisons.
 - [ ] Provisional seven-hex footprints are translucent, locked footprints are solid, and overlapping/unsafe centers never look selectable.
 - [ ] The opening handoff claims the center first, expands to the six neighbors, and focuses the local camera without resembling seven simultaneous captures.
 - [ ] Multi source rings, numbered destination markers, valid/invalid route fans, and quota previews remain distinguishable on dense maps.
-- [ ] Active/blocked Barracks rally paths are persistent but visually quieter than a selected movement preview.
+- [ ] Active/blocked producer rally paths are persistent but visually quieter than a selected movement preview.
 - [ ] Encirclement perimeters and 150-tick countdowns identify the pocket and breach state without implying progressive authoritative capture.
 
 ### Units, structures, and effects
 
-- [ ] Stationary and moving troop counts are crisp, exact, and high contrast.
+- [ ] Stationary and moving M/R/W counts are crisp, exact, and high contrast.
 - [ ] Moving stacks read as small marching squads rather than static icons.
-- [ ] Farm, Barracks, and Turret silhouettes are distinguishable at normal zoom.
+- [ ] Sword, bow, and crystal composition glyphs remain distinguishable without emoji, letters, or color-only meaning.
+- [ ] Barracks, Archery Range, and Wizard Tower silhouettes are distinguishable at normal zoom.
 - [ ] Construction, seized damage, and repair state are visibly different when exercised.
 - [ ] x1 has no multiplier badge; x2 through x99 stay legible beside the structure and in the inspector.
-- [ ] A pending addition, completed count, integrity, Barracks production/rally state, and Turret shot/support state are not conflated.
-- [ ] Battle bars show one color/pattern segment and troop count per active faction, with integer segment targets totaling 10,000.
+- [ ] A pending addition, completed count, integrity, typed production/rally state, and battle support are not conflated.
+- [ ] Battle bars show one player color/pattern segment per faction, exact typed composition, and integer segment targets totaling 10,000.
+- [ ] RPS advantage uses an explicit up/down cue and percentage; local/adjacent support is labeled as power rather than real units.
 - [ ] A late third/fourth faction expands smoothly as itself rather than appearing inside a two-side coalition.
 - [ ] Reinforcement motion and impact remain visually separable from ordinary share easing.
-- [ ] Turret support identifies the aggregate xN source and uses at most one tracer/muzzle effect per stack volley.
+- [ ] Typed building support remains visually subordinate to actual units and never implies that a structure can fight alone.
 - [ ] Reinforcement halo/`+N`, combat effects, capture edge wipe, and reward labels do not cover counts.
 - [ ] Victory and defeat overlays are visually distinct, legible, and expose usable actions.
 - [ ] No jagged scaling, incorrect facing, excessive particles, or inconsistent light direction.
@@ -95,7 +99,7 @@ Open every PNG at 100% and inspect the following.
 
 ## Quality-setting differences
 
-All qualities preserve map geometry, ownership, troops, structures, orders, battle bars, and capture feedback.
+All qualities preserve map geometry, gates, ownership, typed units, structures, orders, battle bars, and capture feedback.
 
 | Detail                      | Low     | Medium         | High           |
 | --------------------------- | ------- | -------------- | -------------- |
@@ -108,24 +112,9 @@ Use Low for the 20-AI case if a device cannot maintain acceptable interaction, b
 
 ## Performance observations
 
-The automated 20-AI visual case requires the Worker to generate a 21-ruler, 1,995-land map, publish a non-empty state hash, mount the canvas, and advance at least one tick within the Playwright test timeout. That is a readiness smoke check, not a frame-rate benchmark.
+The automated 20-AI visual case requires the Worker to generate a 21-ruler, 1,092-land chokepoint map, publish a non-empty state hash, mount the canvas, and advance at least one tick within the Playwright test timeout. That is a readiness smoke check, not a frame-rate benchmark.
 
-The current review used `PERF-BATCHED-TWENTY` in a visible Chromium window. After a 30-second 1× warmup and a five-second sample window, the same match ran at 4× for another 26 seconds.
-
-| Observation                          | Result                                                    |
-| ------------------------------------ | --------------------------------------------------------- |
-| Browser / device / viewport          | Visible Chromium on macOS, 1440×900                       |
-| Graphics quality                     | Low                                                       |
-| Initial Worker-ready time            | 1,756 ms                                                  |
-| Typical render FPS after warmup      | 66–76 at 1×; 31–54 at 4×                                  |
-| Typical simulation ms                | 6.5–11.2 at 1×; 28.3–34.7 per four-tick 4× batch          |
-| Typical AI ms                        | 0.5–1.6 at 1×; 2.5–4.0 per four-tick 4× batch             |
-| Active stacks / battles at sample    | 5 / 31 at tick 344; 10 / 26 at final tick 1,407           |
-| Visible renderer objects at sample   | 3,061 at tick 344; 3,594 at final tick 1,407              |
-| Long main-thread stalls or tick debt | No tick debt; 4× sustained the full 40 simulation ticks/s |
-| Camera/input responsiveness          | 1× remained fluid; input latency was not instrumented     |
-
-These are observed diagnostic values, not a device-independent performance guarantee. At 4×, the Worker advances four deterministic ticks and publishes one state at the same fixed 10 Hz cadence used at 1×; the measured batch values are therefore about 7.1–8.7 simulation ms and 0.6–1.0 AI ms per tick. A separate headless Hard 21-ruler stress run reached 500 ticks with 522 unique moving-stack IDs, a peak of 55 simultaneously active stacks, and a peak of 97 battles. The overlay reports AI-phase time independently from whole-tick simulation time and labels the retained presentation count as `SPRITES`; both are diagnostic only and never enter deterministic state.
+Direct deterministic generation measurements for the 21-ruler cap on this Mac were 453 ms for River Gates, 442 ms for Shattered Crown, and 424 ms for Highland Passes. Every result contained exactly 1,092 land tiles, passed the full fairness report, and exposed 727–750 eligible spawn centers. These are single-run local diagnostics, not device-independent performance guarantees. The browser readiness case and full visual suite passed; no new frame-rate benchmark is claimed for this revision.
 
 ## Review log
 
@@ -182,5 +171,26 @@ Repairs made before the final pass: added an overview-fit debug capture; extract
 Remaining deliberate tradeoffs: live PixiJS states remain curated review artifacts rather than broad pixel-diff baselines; the extraction and frozen-layer path is development-only visual-test support. Low quality reduces decorative terrain density but preserves authoritative counts, ownership, routes, combat, structures, and result state.
 
 Performance observations: the 21-ruler readiness case passed. The placement-center cache measured 43.94 ms on its cold 21-player calculation and 0.0018 ms on the steady cached path. The longer visible-browser and headless stress observations remain recorded above.
+
+No broader visual state than the listed captures is claimed by this review.
+
+### 2026-07-12 — `codex/troop-counter-chokepoints` working tree — Codex
+
+Captures inspected: all 22 current curated PNGs in `docs/screenshots/` at original resolution, plus both deterministic setup baselines.
+
+Findings:
+
+- Desktop and tablet setup present River Gates, Shattered Crown, Highland Passes, the 180–1,092 land scale, and B/R/T controls without clipping or horizontal overflow.
+- Placement, opening, all three four-ruler maps, and the 1,092-land overview show intentional water seams and controlled one/two-hex crossings while preserving readable terrain, ownership, and exact M/R/W plates.
+- Selected routes, Multi staging, simultaneous moving stacks, producer stacking, rally state, and the inspector/command dock remain separated and legible.
+- Pure-counter, typed-support, three-faction, and reinforcement fixtures expose exact composition, explicit RPS percentages, effective power, and support as power rather than real units.
+- Encirclement, capture, `+5 Supply`, victory, and defeat effects preserve their labels and controls without blank compositor regions or obscured unit counts.
+- No stale Farm/Turret control, 1,995-land HUD, remote image, placeholder rectangle, jagged canvas edge, or clipped primary control remains in the current capture set.
+
+Repairs made before the final pass: regenerated the entire suite after the rules/UI migration; replaced the old 50/50 and three-faction battle evidence with RPS-counter, typed-support, and mixed N-way captures; corrected 44px camera fitting; and preserved code-native sword, bow, crystal, and producer silhouettes. The final `npm run test:visual` run passed 15/15.
+
+Remaining deliberate tradeoffs: the 21-ruler overview is intentionally dense, world-space battle labels stay compact while the inspector carries full arithmetic, and deterministic water seams have a visibly regular strategic shape. Live PixiJS states remain curated review artifacts rather than broad pixel-diff baselines.
+
+Performance observations: direct 21-ruler generation measured 424–453 ms across the three archetypes on this Mac; all produced 1,092 fair connected land tiles and the automated browser readiness case passed.
 
 No broader visual state than the listed captures is claimed by this review.

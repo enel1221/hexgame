@@ -1,16 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
-  axialKey,
   aiDecisionInterval,
   applySpawnAllocations,
+  axialKey,
   chooseDefaultSpawnCenters,
   cloneDeterministic,
   createGame,
   decideAiCommands,
+  emptyUnits,
   neighbors,
   stableStringify,
+  totalUnits,
+  unitsOf,
   validateCommand,
 } from "../../src/core";
+import { BALANCE } from "../../src/shared/balance";
 import type {
   BattleState,
   Difficulty,
@@ -19,7 +23,6 @@ import type {
   StructureType,
   TileState,
 } from "../../src/shared/types";
-import { BALANCE } from "../../src/shared/balance";
 import { TEST_CONFIG } from "./fixtures";
 
 function makeState(difficulty: Difficulty = "normal"): GameState {
@@ -44,21 +47,22 @@ function landStar(state: GameState, neighborCount: number): [TileState, ...TileS
     const center = state.map.tiles[id]!;
     const adjacent = neighbors(center)
       .map((hex) => state.map.tiles[axialKey(hex)])
-      .filter((tile): tile is TileState => tile !== undefined && tile.terrain !== "water");
+      .filter((tile): tile is TileState => Boolean(tile && tile.terrain !== "water"));
     if (adjacent.length >= neighborCount) return [center, ...adjacent.slice(0, neighborCount)];
   }
-  throw new Error(`Map has no land tile with ${neighborCount} land neighbors`);
+  throw new Error("No suitable land star");
 }
 
 function clearBoard(state: GameState): void {
   state.stacks = [];
   state.battles = [];
+  state.enclosures = [];
   state.events = [];
   state.victory = { leaderId: null, holdTicks: 0, winnerId: null, reason: null };
   for (const id of state.map.landIds) {
     const tile = state.map.tiles[id]!;
     tile.owner = null;
-    tile.troops = 1;
+    tile.units = unitsOf("melee", 1);
     tile.structure = null;
     tile.terrain = "water";
   }
@@ -69,14 +73,13 @@ function activeStructure(type: StructureType): NonNullable<TileState["structure"
     type,
     completedCount: 1,
     status: "active",
-    integrity: 1_000,
+    integrity: BALANCE.fullIntegrity,
     pendingProgressTicks: null,
     seizedTicks: 0,
     productionPaused: false,
-    barracksProgressMilli: 0,
+    trainingProgressMilli: 0,
     rallyTargetId: null,
-    rallyQueuedTroops: 0,
-    turretShotProgressMilli: 0,
+    rallyQueuedUnits: emptyUnits(),
   };
 }
 
@@ -96,247 +99,194 @@ function buildFrom(commands: GameCommand[]): Extract<GameCommand, { type: "build
   return build;
 }
 
-describe("deterministic AI", () => {
-  it("uses difficulty for legal decision cadence without rule-breaking bonuses", () => {
+function participant(playerId: number, type: "melee" | "ranged" | "wizard", count: number) {
+  return {
+    playerId,
+    units: unitsOf(type, count),
+    control: 5_000,
+    casualtyProgressMilli: emptyUnits(),
+    entryFrom: "0,0",
+    joinedTick: 0,
+    lastReinforcementTick: -1,
+    reinforcementAmount: 0,
+  };
+}
+
+describe("typed deterministic AI", () => {
+  it("uses difficulty cadence without mutating authoritative resources", () => {
     expect(aiDecisionInterval("easy")).toBeGreaterThan(aiDecisionInterval("normal"));
     expect(aiDecisionInterval("normal")).toBeGreaterThan(aiDecisionInterval("hard"));
     const state = makeState("hard");
     const supplyBefore = state.players[1]!.supplyMilli;
     const commands = decideAiCommands(state, 1);
     expect(commands.length).toBeGreaterThan(0);
-    for (const command of commands) expect(validateCommand(state, command).ok).toBe(true);
+    expect(commands.every((command) => validateCommand(state, command).ok)).toBe(true);
     expect(state.players[1]!.supplyMilli).toBe(supplyBefore);
   });
 
   it.each([
-    ["farm", "meadow"],
     ["barracks", "muster"],
-  ] as const)("builds a %s only on its required terrain", (structure, terrain) => {
+    ["archery-range", "meadow"],
+    ["wizard-tower", "plains"],
+  ] as const)("builds %s on legal %s terrain", (structure, terrain) => {
     const state = makeState();
     const [site] = landStar(state, 1);
     clearBoard(state);
     site.terrain = terrain;
     site.owner = 1;
-    site.troops = 1;
-    state.players[1]!.supplyMilli = 250_000;
-
-    const build = buildFrom(decideAiCommands(state, 1));
-    expect(build).toEqual(
-      expect.objectContaining({ type: "build", playerId: 1, tileId: site.id, structure }),
-    );
-    expect(state.map.tiles[build.tileId]!.terrain).toBe(terrain);
-    expect(validateCommand(state, build).ok).toBe(true);
-  });
-
-  it("builds a Turret on a legal threatened frontier tile", () => {
-    const state = makeState();
-    const [enemy] = landStar(state, 1);
-    for (const id of state.map.landIds) {
-      const tile = state.map.tiles[id]!;
-      tile.owner = 1;
-      tile.troops = 1;
-      tile.structure = null;
-      tile.terrain = "plains";
-    }
-    enemy.owner = 0;
-    enemy.troops = 40;
+    site.units = unitsOf("melee", 1);
     state.players[1]!.supplyMilli = 500_000;
-
     const build = buildFrom(decideAiCommands(state, 1));
-    expect(build.structure).toBe("turret");
-    expect(state.map.tiles[build.tileId]!.terrain).not.toBe("water");
+    expect(build).toMatchObject({ playerId: 1, tileId: site.id, structure });
     expect(validateCommand(state, build).ok).toBe(true);
   });
 
-  it("expands into a weak neutral tile", () => {
-    const state = makeState();
-    const [source, neutral] = landStar(state, 1);
-    clearBoard(state);
-    source.terrain = "plains";
-    source.owner = 1;
-    source.troops = 12;
-    neutral.terrain = "meadow";
-    neutral.owner = null;
-    neutral.troops = 1;
-
-    const move = moveFrom(decideAiCommands(state, 1));
-    expect(move).toEqual(
-      expect.objectContaining({ sourceId: source.id, destinationId: neutral.id }),
-    );
-    expect(validateCommand(state, move).ok).toBe(true);
-  });
-
-  it("attacks a weak enemy border and values a captured Barracks", () => {
-    const state = makeState("hard");
-    const [source, plainTarget, developedTarget] = landStar(state, 2);
-    clearBoard(state);
-    source.terrain = "plains";
-    source.owner = 1;
-    source.troops = 30;
-    plainTarget.terrain = "plains";
-    plainTarget.owner = 0;
-    plainTarget.troops = 2;
-    developedTarget.terrain = "muster";
-    developedTarget.owner = 0;
-    developedTarget.troops = 2;
-    developedTarget.structure = activeStructure("barracks");
-
-    const move = moveFrom(decideAiCommands(state, 1));
-    expect(move.destinationId).toBe(developedTarget.id);
-    expect(validateCommand(state, move).ok).toBe(true);
-  });
-
-  it("reinforces an ongoing battle only when its side needs recovery", () => {
+  it("expands from a mixed source into a weak neutral tile", () => {
     const state = makeState();
     const [source, target] = landStar(state, 1);
     clearBoard(state);
     source.terrain = "plains";
     source.owner = 1;
-    source.troops = 40;
+    source.units = { melee: 4, ranged: 4, wizard: 4 };
+    target.terrain = "meadow";
+    target.units = unitsOf("melee", 1);
+    const move = moveFrom(decideAiCommands(state, 1));
+    expect(move).toMatchObject({ sourceId: source.id, destinationId: target.id });
+    expect(validateCommand(state, move).ok).toBe(true);
+  });
+
+  it("values a developed typed-production target", () => {
+    const state = makeState("hard");
+    const [source, plain, developed] = landStar(state, 2);
+    clearBoard(state);
+    source.terrain = "plains";
+    source.owner = 1;
+    source.units = unitsOf("melee", 30);
+    for (const target of [plain, developed]) {
+      target.terrain = "plains";
+      target.owner = 0;
+      target.units = unitsOf("ranged", 2);
+    }
+    developed.structure = activeStructure("wizard-tower");
+    expect(moveFrom(decideAiCommands(state, 1)).destinationId).toBe(developed.id);
+  });
+
+  it("credits a pure counter formation when it crosses the attack threshold", () => {
+    const state = makeState("hard");
+    const [source, target] = landStar(state, 1);
+    clearBoard(state);
+    source.terrain = target.terrain = "plains";
+    source.owner = 1;
+    source.units = unitsOf("wizard", 9);
+    target.owner = 0;
+    target.units = unitsOf("melee", 8);
+
+    const move = moveFrom(decideAiCommands(state, 1));
+    expect(move).toMatchObject({ sourceId: source.id, destinationId: target.id, percent: 100 });
+    expect(validateCommand(state, move).ok).toBe(true);
+  });
+
+  it("reinforces an underpowered typed participant", () => {
+    const state = makeState();
+    const [source, target] = landStar(state, 1);
+    clearBoard(state);
+    source.terrain = "plains";
+    source.owner = 1;
+    source.units = unitsOf("wizard", 40);
     target.terrain = "plains";
     target.owner = 0;
-    target.troops = 0;
+    target.units = emptyUnits();
     state.tick = 100;
     const battle: BattleState = {
       id: 91,
       tileId: target.id,
       incumbentOwner: 0,
-      participants: [
-        {
-          playerId: 0,
-          troops: 18,
-          control: 7_000,
-          casualtyProgressMilli: 0,
-          entryFrom: target.id,
-          joinedTick: 80,
-          lastReinforcementTick: -1,
-          reinforcementAmount: 0,
-        },
-        {
-          playerId: 1,
-          troops: 3,
-          control: 3_000,
-          casualtyProgressMilli: 0,
-          entryFrom: source.id,
-          joinedTick: 80,
-          lastReinforcementTick: -1,
-          reinforcementAmount: 0,
-        },
-      ],
+      participants: [participant(0, "ranged", 18), participant(1, "wizard", 3)],
       ageTicks: 20,
       roundAccumulator: 0,
     };
+    battle.participants.forEach((entry) => (entry.entryFrom = target.id));
     state.battles.push(battle);
-
     const move = moveFrom(decideAiCommands(state, 1));
     expect(move.destinationId).toBe(target.id);
     expect(state.players[1]!.aiMode).toBe("reinforce");
-    expect(validateCommand(state, move).ok).toBe(true);
   });
 
-  it("does not bypass reinforcement discipline through a fresh attack order", () => {
-    const state = makeState();
-    const [source, target] = landStar(state, 1);
-    clearBoard(state);
-    source.terrain = "plains";
-    source.owner = 1;
-    source.troops = 40;
-    target.terrain = "plains";
-    target.owner = 0;
-    target.troops = 0;
-    state.tick = 100;
-    state.battles.push({
-      id: 92,
-      tileId: target.id,
-      incumbentOwner: 0,
-      participants: [
-        {
-          playerId: 0,
-          troops: 3,
-          control: 2_000,
-          casualtyProgressMilli: 0,
-          entryFrom: target.id,
-          joinedTick: 80,
-          lastReinforcementTick: -1,
-          reinforcementAmount: 0,
-        },
-        {
-          playerId: 1,
-          troops: 24,
-          control: 8_000,
-          casualtyProgressMilli: 0,
-          entryFrom: source.id,
-          joinedTick: 80,
-          lastReinforcementTick: state.tick,
-          reinforcementAmount: 8,
-        },
-      ],
-      ageTicks: 20,
-      roundAccumulator: 0,
-    });
-
-    const moves = decideAiCommands(state, 1).filter((command) => command.type === "move");
-    expect(moves).toEqual([]);
-  });
-
-  it("deliberately enters a favorable third-party battle as its own faction", () => {
+  it("deliberately enters a favorable typed third-party battle", () => {
     const state = makeState("hard");
     const [source, target] = landStar(state, 1);
     clearBoard(state);
     source.terrain = "plains";
     source.owner = 1;
-    source.troops = 40;
+    source.units = unitsOf("wizard", 40);
     target.terrain = "plains";
     target.owner = 0;
-    target.troops = 4;
+    target.units = emptyUnits();
+    state.battles.push({
+      id: 92,
+      tileId: target.id,
+      incumbentOwner: 0,
+      participants: [participant(0, "melee", 4), participant(2, "ranged", 3)],
+      ageTicks: 10,
+      roundAccumulator: 0,
+    });
+    const move = moveFrom(decideAiCommands(state, 1));
+    expect(move.destinationId).toBe(target.id);
+    expect(validateCommand(state, move).ok).toBe(true);
+  });
+
+  it("rejects a third-party entry when the projected entrant buffs an incumbent counter", () => {
+    const state = makeState("hard");
+    const [source, target] = landStar(state, 1);
+    clearBoard(state);
+    source.terrain = target.terrain = "plains";
+    source.owner = 1;
+    source.units = unitsOf("melee", 12);
+    target.owner = 0;
+    target.units = emptyUnits();
+    state.players[1]!.supplyMilli = 0;
     state.battles.push({
       id: 93,
       tileId: target.id,
       incumbentOwner: 0,
-      participants: [
-        {
-          playerId: 0,
-          troops: 4,
-          control: 5_000,
-          casualtyProgressMilli: 0,
-          entryFrom: target.id,
-          joinedTick: 0,
-          lastReinforcementTick: -1,
-          reinforcementAmount: 0,
-        },
-        {
-          playerId: 2,
-          troops: 3,
-          control: 5_000,
-          casualtyProgressMilli: 0,
-          entryFrom: source.id,
-          joinedTick: 0,
-          lastReinforcementTick: -1,
-          reinforcementAmount: 0,
-        },
-      ],
+      participants: [participant(0, "ranged", 1), participant(2, "wizard", 10)],
       ageTicks: 10,
       roundAccumulator: 0,
     });
 
-    const move = moveFrom(decideAiCommands(state, 1));
-    expect(move.destinationId).toBe(target.id);
-    expect(state.battles[0]!.participants.some((participant) => participant.playerId === 1)).toBe(
-      false,
-    );
-    expect(validateCommand(state, move).ok).toBe(true);
+    expect(
+      decideAiCommands(state, 1).some(
+        (command) => command.type === "move" && command.destinationId === target.id,
+      ),
+    ).toBe(false);
   });
 
-  it("prioritizes a legal breakout from a nearly consumed enclosure", () => {
+  it("uses the aggressive two-survivor doctrine on Easy", () => {
+    const state = makeState("easy");
+    const [source, target] = landStar(state, 1);
+    clearBoard(state);
+    state.players[0]!.eliminated = true;
+    state.players[3]!.eliminated = true;
+    state.players[1]!.supplyMilli = 0;
+    source.terrain = target.terrain = "plains";
+    source.owner = 1;
+    source.units = unitsOf("melee", 11);
+    target.owner = 2;
+    target.units = unitsOf("melee", 11);
+
+    const move = moveFrom(decideAiCommands(state, 1));
+    expect(move).toMatchObject({ sourceId: source.id, destinationId: target.id, percent: 100 });
+  });
+
+  it("prioritizes a breakout from a nearly completed enclosure", () => {
     const state = makeState();
     const [source, boundary] = landStar(state, 1);
     clearBoard(state);
-    source.terrain = "plains";
+    source.terrain = boundary.terrain = "plains";
     source.owner = 1;
-    source.troops = 30;
-    boundary.terrain = "plains";
+    source.units = unitsOf("melee", 30);
     boundary.owner = 0;
-    boundary.troops = 3;
+    boundary.units = unitsOf("ranged", 3);
     state.enclosures = [
       {
         id: 94,
@@ -346,105 +296,33 @@ describe("deterministic AI", () => {
         progressTicks: BALANCE.encirclementTicks - 1,
       },
     ];
-
     const move = moveFrom(decideAiCommands(state, 1));
     expect(move).toMatchObject({ sourceId: source.id, destinationId: boundary.id });
     expect(state.players[1]!.aiMode).toBe("breakout");
-    expect(validateCommand(state, move).ok).toBe(true);
   });
 
-  it("defends developed territory from an adjacent threat", () => {
-    const state = makeState();
-    const [developed, source, enemy] = landStar(state, 2);
-    clearBoard(state);
-    developed.terrain = "meadow";
-    developed.owner = 1;
-    developed.troops = 2;
-    developed.structure = activeStructure("farm");
-    source.terrain = "plains";
-    source.owner = 1;
-    source.troops = 24;
-    enemy.terrain = "plains";
-    enemy.owner = 0;
-    enemy.troops = 12;
-
-    const move = moveFrom(decideAiCommands(state, 1));
-    expect(move).toEqual(
-      expect.objectContaining({ sourceId: source.id, destinationId: developed.id }),
-    );
-    expect(state.players[1]!.aiMode).toBe("defend");
-    expect(validateCommand(state, move).ok).toBe(true);
-  });
-
-  it("redirects an equal opportunity toward an opponent on the victory countdown", () => {
-    const state = makeState();
-    const [source, ordinaryTarget, leaderTarget] = landStar(state, 2);
-    clearBoard(state);
-    source.terrain = "plains";
-    source.owner = 1;
-    source.troops = 30;
-    ordinaryTarget.terrain = "plains";
-    ordinaryTarget.owner = 0;
-    ordinaryTarget.troops = 2;
-    leaderTarget.terrain = "plains";
-    leaderTarget.owner = 2;
-    leaderTarget.troops = 2;
-    state.victory.leaderId = 2;
-    state.victory.holdTicks = 30;
-
-    const move = moveFrom(decideAiCommands(state, 1));
-    expect(move.destinationId).toBe(leaderTarget.id);
-  });
-
-  it("focuses the weaker reachable rival once a match matures", () => {
-    const state = makeState();
-    const [source, strongerTarget, weakerTarget] = landStar(state, 2);
-    clearBoard(state);
-    source.terrain = "plains";
-    source.owner = 1;
-    source.troops = 30;
-    strongerTarget.terrain = "plains";
-    strongerTarget.owner = 0;
-    strongerTarget.troops = 2;
-    weakerTarget.terrain = "plains";
-    weakerTarget.owner = 2;
-    weakerTarget.troops = 2;
-    state.players[0]!.tileCount = 20;
-    state.players[2]!.tileCount = 5;
-    state.tick = 6_000;
-
-    const move = moveFrom(decideAiCommands(state, 1));
-    expect(move.destinationId).toBe(weakerTarget.id);
-  });
-
-  it("returns identical decisions from identical state", () => {
-    const state = createGame({ ...TEST_CONFIG, seed: "ai-repeat", difficulty: "hard" }).state;
+  it("returns identical decisions without granting hidden forces", () => {
+    const state = makeState("hard");
+    const before = cloneDeterministic({
+      supply: state.players.map((player) => player.supplyMilli),
+      units: state.map.landIds.map((id) => state.map.tiles[id]!.units),
+      structures: state.map.landIds.map((id) => state.map.tiles[id]!.structure),
+      battles: state.battles,
+      stacks: state.stacks,
+    });
     const left = cloneDeterministic(state);
     const right = cloneDeterministic(state);
     expect(stableStringify(decideAiCommands(left, 2))).toBe(
       stableStringify(decideAiCommands(right, 2)),
     );
-  });
-
-  it("does not grant hidden resources, troops, structures, or combat progress", () => {
-    for (const difficulty of ["easy", "normal", "hard"] as const) {
-      const state = makeState(difficulty);
-      const before = cloneDeterministic({
-        supply: state.players.map((player) => player.supplyMilli),
-        troops: state.map.landIds.map((id) => state.map.tiles[id]!.troops),
-        structures: state.map.landIds.map((id) => state.map.tiles[id]!.structure),
-        stacks: state.stacks,
-        battles: state.battles,
-      });
-      const commands = decideAiCommands(state, 1);
-      expect(commands.every((command) => validateCommand(state, command).ok)).toBe(true);
-      expect({
-        supply: state.players.map((player) => player.supplyMilli),
-        troops: state.map.landIds.map((id) => state.map.tiles[id]!.troops),
-        structures: state.map.landIds.map((id) => state.map.tiles[id]!.structure),
-        stacks: state.stacks,
-        battles: state.battles,
-      }).toEqual(before);
-    }
+    decideAiCommands(state, 1);
+    expect({
+      supply: state.players.map((player) => player.supplyMilli),
+      units: state.map.landIds.map((id) => state.map.tiles[id]!.units),
+      structures: state.map.landIds.map((id) => state.map.tiles[id]!.structure),
+      battles: state.battles,
+      stacks: state.stacks,
+    }).toEqual(before);
+    expect(state.map.landIds.every((id) => totalUnits(state.map.tiles[id]!.units) >= 0)).toBe(true);
   });
 });

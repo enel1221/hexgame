@@ -1856,7 +1856,7 @@ kbd {
   z-index: 8;
   left: 15px;
   bottom: 100px;
-  width: 285px;
+  width: 350px;
   border: 1px solid var(--line);
   background: var(--panel);
   box-shadow: 0 14px 35px #0009;
@@ -1948,6 +1948,144 @@ kbd {
   font-size: 11px;
   text-transform: capitalize;
 }
+.tile-unit-roster {
+  margin: 0 10px 10px;
+  padding: 8px;
+  border: 1px solid rgba(216, 192, 139, 0.16);
+  background: #091419;
+}
+.tile-unit-roster > strong {
+  display: block;
+  margin-bottom: 7px;
+  color: #d9cdaf;
+  font-family: var(--serif);
+  font-size: 11px;
+}
+.unit-composition {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+}
+.unit-composition > span {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 20px 1fr;
+  grid-template-rows: auto auto;
+  align-items: center;
+  padding: 5px;
+  border: 1px solid rgba(215, 196, 153, 0.13);
+  background: #101d22;
+}
+.unit-composition b {
+  color: #f1e6cf;
+  font-family: var(--serif);
+  font-size: 14px;
+}
+.unit-composition small {
+  grid-column: 1 / 3;
+  margin-top: 2px;
+  color: #809194;
+  font-size: 8px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.unit-composition--compact {
+  display: flex;
+  margin: 4px 0;
+}
+.unit-composition--compact > span {
+  min-width: 64px;
+  grid-template-columns: 18px auto;
+  grid-template-rows: auto;
+  padding: 3px 5px;
+}
+.unit-composition--compact b {
+  font-size: 11px;
+}
+.unit-glyph {
+  position: relative;
+  width: 15px;
+  height: 15px;
+  display: block;
+}
+.unit-glyph--melee::before {
+  position: absolute;
+  left: 7px;
+  top: 0;
+  width: 2px;
+  height: 14px;
+  border-radius: 2px;
+  background: #e7bd68;
+  content: "";
+  rotate: 38deg;
+}
+.unit-glyph--melee::after {
+  position: absolute;
+  left: 3px;
+  top: 9px;
+  width: 9px;
+  height: 2px;
+  background: #f0dfb8;
+  content: "";
+  rotate: 38deg;
+}
+.unit-glyph--ranged::before {
+  position: absolute;
+  left: 1px;
+  top: 1px;
+  width: 10px;
+  height: 12px;
+  border: 2px solid #68c8ad;
+  border-left: 0;
+  border-radius: 0 100% 100% 0;
+  content: "";
+}
+.unit-glyph--ranged::after {
+  position: absolute;
+  left: 0;
+  top: 7px;
+  width: 15px;
+  height: 1px;
+  background: #efe5c8;
+  content: "";
+  clip-path: polygon(0 35%, 78% 35%, 78% 0, 100% 50%, 78% 100%, 78% 65%, 0 65%);
+}
+.unit-glyph--wizard::before,
+.unit-glyph--wizard::after {
+  position: absolute;
+  inset: 2px;
+  background: #b692ef;
+  content: "";
+  clip-path: polygon(50% 0, 62% 36%, 100% 50%, 62% 64%, 50% 100%, 38% 64%, 0 50%, 38% 36%);
+}
+.unit-glyph--wizard::after {
+  inset: 5px;
+  background: #f3e8ff;
+}
+.battle-advantage {
+  display: block;
+  margin-top: 3px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+.structure-status [role="listitem"] {
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid rgba(216, 192, 139, 0.12);
+  text-transform: none;
+}
+.structure-status [role="listitem"] > span:not(.unit-composition) {
+  display: block;
+}
+.battle-advantage--up {
+  color: #8fe1b2;
+}
+.battle-advantage--down {
+  color: #ffa09a;
+}
+.battle-advantage--even {
+  color: #c8bea6;
+}
 .structure-status {
   display: flex;
   flex-wrap: wrap;
@@ -1972,7 +2110,8 @@ kbd {
 }
 .structure-status small {
   color: #738285;
-  font-size: 7px;
+  font-size: 9px;
+  line-height: 1.35;
 }
 .structure-status button {
   padding: 5px 7px;
@@ -2231,45 +2370,38 @@ kbd {
   flex: 0 0 auto;
   filter: drop-shadow(0 4px 3px #0008);
 }
-.structure-glyph--farm::before {
+.structure-glyph--archery-range::before {
   position: absolute;
-  left: 3px;
-  bottom: 3px;
-  width: 24px;
-  height: 20px;
-  border: 1px solid #e0ba82;
-  background: #a75642;
+  left: 4px;
+  bottom: 4px;
+  width: 27px;
+  height: 25px;
+  border: 1px solid #dac49a;
+  background: linear-gradient(145deg, #836044, #4d573e);
   content: "";
-  clip-path: polygon(0 35%, 50% 0, 100% 35%, 100% 100%, 0 100%);
+  clip-path: polygon(0 28%, 45% 0, 100% 23%, 92% 100%, 8% 100%);
 }
-.structure-glyph--farm::after {
+.structure-glyph--archery-range::after {
   position: absolute;
-  right: 2px;
-  top: 4px;
-  width: 7px;
-  height: 29px;
-  border: 1px solid #6b604e;
-  background: #c9bd99;
+  right: 1px;
+  top: 5px;
+  width: 12px;
+  height: 12px;
+  border: 2px solid #68c8ad;
+  border-radius: 50%;
+  background: radial-gradient(circle, #68c8ad 0 20%, #e6dabc 22% 44%, #554434 46%);
   content: "";
 }
-.structure-glyph--farm i {
+.structure-glyph--archery-range i {
   position: absolute;
   z-index: 1;
-  right: -5px;
-  top: 2px;
-  width: 19px;
-  height: 19px;
-  border: 2px solid #e8d5a5;
-  border-radius: 50%;
-  background:
-    linear-gradient(90deg, transparent 45%, #e8d5a5 46% 54%, transparent 55%),
-    linear-gradient(0deg, transparent 45%, #e8d5a5 46% 54%, transparent 55%);
-  animation: millSpin 5s linear infinite;
-}
-@keyframes millSpin {
-  to {
-    rotate: 360deg;
-  }
+  left: 2px;
+  top: 17px;
+  width: 31px;
+  height: 2px;
+  background: #e8d5a5;
+  rotate: -10deg;
+  clip-path: polygon(0 35%, 82% 35%, 82% 0, 100% 50%, 82% 100%, 82% 65%, 0 65%);
 }
 .structure-glyph--barracks::before {
   position: absolute;
@@ -2313,14 +2445,14 @@ kbd {
   content: "";
   clip-path: polygon(0 0, 100% 30%, 0 100%);
 }
-.structure-glyph--turret::before {
+.structure-glyph--wizard-tower::before {
   position: absolute;
   left: 6px;
   bottom: 2px;
   width: 24px;
   height: 29px;
-  border: 1px solid #d0c5aa;
-  background: #707776;
+  border: 1px solid #d8cdec;
+  background: linear-gradient(145deg, #70617f, #3b3452);
   content: "";
   clip-path: polygon(
     0 15%,
@@ -2337,27 +2469,26 @@ kbd {
     10% 100%
   );
 }
-.structure-glyph--turret::after {
+.structure-glyph--wizard-tower::after {
   position: absolute;
-  left: 14px;
-  top: 8px;
-  width: 27px;
-  height: 5px;
-  border-radius: 3px;
-  background: #303b3e;
+  left: 8px;
+  top: -1px;
+  width: 20px;
+  height: 17px;
+  background: #493865;
   content: "";
-  transform-origin: 3px 50%;
-  rotate: -8deg;
+  clip-path: polygon(50% 0, 100% 100%, 0 100%);
 }
-.structure-glyph--turret i {
+.structure-glyph--wizard-tower i {
   position: absolute;
-  left: 10px;
-  top: 6px;
+  left: 12px;
+  top: 0;
   width: 12px;
   height: 12px;
-  border: 2px solid #d2b565;
+  border: 2px solid #efe3ff;
   border-radius: 50%;
-  background: #485457;
+  background: #b692ef;
+  box-shadow: 0 0 7px #b692ef;
 }
 
 .build-tooltip {

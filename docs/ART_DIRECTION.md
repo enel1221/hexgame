@@ -7,7 +7,7 @@ Hex Dominion uses an original stylized tabletop-diorama language: natural terrai
 - The camera reads as top-down with a light three-quarter miniature treatment rather than strict orthographic map symbols.
 - Hexes have a top face, darker offset edge, contact shadow, inset line, and selective ownership border.
 - Structures use compact silhouettes that fit inside one hex and remain recognizable at fitted-map zoom.
-- Soldiers are representative animated squads, not one sprite per troop. Exact strength always comes from the count badge.
+- Soldiers are representative animated squads, not one sprite per unit. Exact Melee/Ranged/Wizard composition always comes from the typed count plate.
 - UI silhouettes use clipped corners, crests, pins, flags, and restrained geometric ornament instead of default browser controls.
 
 Pointy-top geometry is the spatial contract. World details may overlap vertically inside a tile, but interactive centers and borders must never appear to change the underlying axial grid.
@@ -67,7 +67,7 @@ Terrain must remain identifiable after ownership tint, selection, build eligibil
 
 ## Soldiers and motion
 
-Each moving stack shows a 3–6-member squad assembled from locally authored PixiJS vector geometry: legs, cloak, torso, head/helm, shield, weapon, banner, shadow, and exact-count plate. The squad count varies logarithmically with strength; the numeric badge is authoritative.
+Each moving stack shows a representative squad assembled from locally authored PixiJS vector geometry: legs, cloak, torso, head/helm, shield, bow, staff/crystal, banner, shadow, and exact M/R/W plate. The representative count varies logarithmically with strength; the three numeric counts are authoritative.
 
 Movement principles:
 
@@ -78,15 +78,15 @@ Movement principles:
 - keep lane offsets small and deterministic when stacks share a route;
 - never replace movement with a tile-center teleport or sliding static icon.
 
-Stationary garrisons use a compact shield-shaped plate and pin. At distant zoom, non-border counts may hide to protect overview readability; selected and frontier counts remain visible.
+Stationary garrisons use a compact three-part plate with code-native sword, bow, and crystal marks. At distant zoom, non-border compositions may hide to protect overview readability; selected and frontier counts remain visible.
 
 ## Structures
 
 Structures are hand-authored composite vector forms in `GameRenderer.ts`, not emoji, icon fonts, labeled rectangles, or remote art.
 
-- **Farm:** field/barn/mill language with a rotating ambient component. Warm timber and crop colors distinguish economy.
-- **Barracks:** palisade/camp/flag language with a breathing flag animation. Its starting placement marks each spawn center.
-- **Turret:** compact defensive tower/weapon silhouette with a slow scan/aim motion.
+- **Barracks:** palisade/camp/sword-banner language for Melee production.
+- **Archery Range:** target, bow-rack, and stretched-canopy language for Ranged production.
+- **Wizard Tower:** faceted stone, crystal, and restrained arcane-light language for Wizard production.
 
 Construction uses a foundation/scaffold state. Captured completed buildings become visibly damaged/seized at 40% integrity, then repair toward full opacity. Structure silhouettes and state damage must remain legible beneath garrison badges.
 
@@ -98,11 +98,11 @@ The battlefield battle indicator is a designed, camera-anchored PixiJS object wi
 2. inset dark track;
 3. one canonical color/pattern segment per active faction;
 4. eased segment boundaries and a subtle delayed reinforcement trail;
-5. compact incumbent and Turret-support markers;
-6. exact participant counts where space permits;
+5. compact incumbent, typed-support, and explicit RPS advantage markers;
+6. exact M/R/W participant counts where space permits;
 7. reinforcement halo and temporary `+N` count.
 
-Segment targets are authoritative effective-power shares whose integer widths total exactly 10,000. A late third or fourth faction appears as its own smoothly expanding segment, never as part of a fake coalition. Small segments move detail into hover and the semantic tile inspector rather than rendering illegible labels. This must not be restyled as a generic HTML progress element.
+Segment targets are authoritative effective-power shares whose integer widths total exactly 10,000. Player color/pattern remains faction identity; a narrow typed strip and up/down advantage cue explain the Wizard > Melee > Ranged > Wizard cycle without recoloring the whole bar. A late third or fourth faction appears as its own smoothly expanding segment, never as part of a fake coalition. Small segments move full composition, support, and multiplier detail into the semantic tile inspector rather than rendering illegible labels. This must not be restyled as a generic HTML progress element.
 
 ## UI and responsive composition
 

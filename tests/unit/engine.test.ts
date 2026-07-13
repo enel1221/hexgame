@@ -43,7 +43,9 @@ describe("fixed-step game engine", () => {
     const startingSupply = engine.state.players[0]!.supplyMilli;
     engine.step(10);
     expect(engine.state.players[0]!.supplyMilli).toBe(
-      startingSupply + BALANCE.startingTiles * BALANCE.tileIncomeMilliPerSecond,
+      startingSupply +
+        BALANCE.passiveIncomeMilliPerSecond +
+        BALANCE.startingTiles * BALANCE.tileIncomeMilliPerSecond,
     );
   });
 

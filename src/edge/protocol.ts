@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { BALANCE } from "../shared/balance";
 
 export const ROOM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 export const MIN_MATCH_PARTICIPANTS = 2;
@@ -129,7 +130,7 @@ export const GameCommandSchema = z.discriminatedUnion("type", [
       type: z.literal("build"),
       playerId: PlayerIdSchema,
       tileId: TileIdSchema,
-      structure: z.enum(["farm", "barracks", "turret"]),
+      structure: z.enum(["barracks", "archery-range", "wizard-tower"]),
       scheduledTick: ScheduledTickSchema,
     })
     .strict(),
@@ -143,7 +144,7 @@ export const GameCommandSchema = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
-      type: z.literal("toggle-barracks"),
+      type: z.literal("toggle-production"),
       playerId: PlayerIdSchema,
       tileId: TileIdSchema,
       scheduledTick: ScheduledTickSchema,
@@ -179,7 +180,7 @@ export const PlacementCandidatesMessageSchema = z
     type: z.literal("placement-candidates"),
     generationAttempt: z.number().int().nonnegative(),
     candidateHash: StateHashSchema,
-    candidates: z.array(TileIdSchema).min(2).max(2_100),
+    candidates: z.array(TileIdSchema).min(2).max(BALANCE.maxLand),
     requestId: RequestIdSchema,
   })
   .strict()

@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { computeFinalSpawnVector, createGame, refreshPlayerAggregates } from "../../src/core";
+import {
+  computeFinalSpawnVector,
+  createGame,
+  refreshPlayerAggregates,
+  totalUnits,
+  unitsOf,
+} from "../../src/core";
 import type { Difficulty, MapArchetype, MatchConfig } from "../../src/shared/types";
 
 interface SmokeCase {
@@ -65,12 +71,12 @@ function runSmoke(testCase: SmokeCase): SmokeStats {
     maxBattles = Math.max(maxBattles, engine.state.battles.length);
 
     if (engine.state.tick % 100 === 0) {
-      expect(engine.state.stacks.every((stack) => stack.troops > 0)).toBe(true);
+      expect(engine.state.stacks.every((stack) => totalUnits(stack.units) > 0)).toBe(true);
       expect(
         engine.state.battles.every(
           (battle) =>
             battle.participants.length >= 1 &&
-            battle.participants.every((participant) => participant.troops >= 0),
+            battle.participants.every((participant) => totalUnits(participant.units) >= 0),
         ),
       ).toBe(true);
     }
@@ -179,7 +185,7 @@ describe("headless AI smoke simulations", () => {
     for (const [index, id] of engine.state.map.landIds.entries()) {
       const tile = engine.state.map.tiles[id]!;
       tile.owner = index < threshold ? 1 : 0;
-      tile.troops = 1;
+      tile.units = unitsOf("melee", 1);
       tile.structure = null;
     }
     engine.state.players[2]!.eliminated = true;
@@ -211,12 +217,12 @@ describe("headless AI smoke simulations", () => {
     for (const id of engine.state.map.landIds) {
       const tile = engine.state.map.tiles[id]!;
       tile.owner = 1;
-      tile.troops = 1;
+      tile.units = unitsOf("melee", 1);
       tile.structure = null;
     }
     engine.state.map.tiles[targetId]!.owner = 0;
-    engine.state.map.tiles[targetId]!.troops = 1;
-    engine.state.map.tiles[sourceId]!.troops = 50;
+    engine.state.map.tiles[targetId]!.units = unitsOf("ranged", 1);
+    engine.state.map.tiles[sourceId]!.units = unitsOf("melee", 50);
     engine.state.players[2]!.eliminated = true;
     engine.state.players[3]!.eliminated = true;
     engine.state.victory = { leaderId: null, holdTicks: 0, winnerId: null, reason: null };

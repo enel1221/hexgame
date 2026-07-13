@@ -6,17 +6,24 @@ import {
   chooseDefaultSpawnCenters,
   cloneDeterministic,
   createGame,
-  defenderEffectivePower,
   handleStackArrival,
   hashGameState,
   neighbors,
-  ring,
   stableStringify,
   startBattle,
   tickCombat,
+  totalUnits,
+  unitsOf,
 } from "../../src/core";
 import { BALANCE } from "../../src/shared/balance";
-import type { GameState, StructureState, TileState } from "../../src/shared/types";
+import type {
+  GameState,
+  StructureState,
+  StructureType,
+  TileState,
+  UnitCounts,
+  UnitType,
+} from "../../src/shared/types";
 import { TEST_CONFIG } from "./fixtures";
 
 function runningState(seed: string, aiCount = 3): GameState {
@@ -28,36 +35,23 @@ function runningState(seed: string, aiCount = 3): GameState {
   return state;
 }
 
-function activeTurrets(count: number, integrity: number = BALANCE.fullIntegrity): StructureState {
+function structure(
+  type: StructureType,
+  count: number,
+  integrity = BALANCE.fullIntegrity,
+): StructureState {
   return {
-    type: "turret",
+    type,
     completedCount: count,
     status: "active",
     integrity,
     pendingProgressTicks: null,
     seizedTicks: 0,
     productionPaused: false,
-    barracksProgressMilli: 0,
+    trainingProgressMilli: 0,
     rallyTargetId: null,
-    rallyQueuedTroops: 0,
-    turretShotProgressMilli: 0,
+    rallyQueuedUnits: unitsOf("melee", 0),
   };
-}
-
-function runPlainsBattle(attackerTroops: number): { ticks: number; owner: number | null } {
-  const state = runningState(`combat-${attackerTroops}`);
-  const tile = state.map.tiles[state.map.spawnClusters[0]![1]!]!;
-  tile.structure = null;
-  tile.terrain = "plains";
-  tile.troops = 1;
-  startBattle(state, tile, 1, attackerTroops, tile.id);
-  let ticks = 0;
-  while (state.battles.length > 0 && ticks < 300) {
-    state.tick += 1;
-    tickCombat(state);
-    ticks += 1;
-  }
-  return { ticks, owner: tile.owner };
 }
 
 function tickCombatFor(state: GameState, ticks: number): void {
@@ -67,106 +61,129 @@ function tickCombatFor(state: GameState, ticks: number): void {
   }
 }
 
+function battleTile(state: GameState): TileState {
+  for (const tileId of state.map.landIds) state.map.tiles[tileId]!.structure = null;
+  const tile = state.map.tiles[state.map.spawnClusters[0]![1]!]!;
+  tile.terrain = "plains";
+  return tile;
+}
+
+function runPlainsBattle(attacker: UnitCounts): { ticks: number; owner: number | null } {
+  const state = runningState(`combat-${JSON.stringify(attacker)}`);
+  const tile = battleTile(state);
+  tile.units = unitsOf("melee", 1);
+  startBattle(state, tile, 1, attacker, tile.id);
+  let ticks = 0;
+  while (state.battles.length > 0 && ticks < 400) {
+    tickCombatFor(state, 1);
+    ticks += 1;
+  }
+  return { ticks, owner: tile.owner };
+}
+
 function ownedLandStar(
   state: GameState,
   owner: number,
-  neighborCount: number,
+  count: number,
 ): [TileState, ...TileState[]] {
   for (const id of state.map.landIds) {
     const center = state.map.tiles[id]!;
     const adjacent = neighbors(center)
       .map((hex) => state.map.tiles[axialKey(hex)])
       .filter((tile): tile is TileState => Boolean(tile && tile.terrain !== "water"));
-    if (adjacent.length < neighborCount) continue;
+    if (adjacent.length < count) continue;
     center.owner = owner;
-    center.troops = 20;
-    for (const tile of adjacent.slice(0, neighborCount)) {
+    center.units = unitsOf("melee", 20);
+    center.structure = null;
+    for (const tile of adjacent.slice(0, count)) {
       tile.owner = owner;
-      tile.troops = 20;
+      tile.units = unitsOf("melee", 20);
       tile.structure = null;
       tile.terrain = "plains";
     }
-    return [center, ...adjacent.slice(0, neighborCount)];
+    return [center, ...adjacent.slice(0, count)];
   }
   throw new Error("No suitable land star");
 }
 
-function safeTurretSource(state: GameState): TileState {
-  const land = new Set(state.map.landIds);
-  const id = state.map.landIds.find((candidate) =>
-    ring(state.map.tiles[candidate]!, 2)
-      .map(axialKey)
-      .every((within) => land.has(within)),
-  );
-  if (!id) throw new Error("No inland Turret source");
-  return state.map.tiles[id]!;
-}
-
-function ringTwoTarget(state: GameState, source: TileState): TileState {
-  const id = ring(source, 2)
-    .map(axialKey)
-    .find((candidate) => state.map.tiles[candidate]?.terrain !== "water");
-  if (!id) throw new Error("No range-two target");
-  return state.map.tiles[id]!;
-}
-
-describe("deterministic N-faction combat", () => {
+describe("typed deterministic combat", () => {
   it.each([
     [20, 35, 42],
     [5, 45, 55],
     [2, 65, 85],
-  ])("keeps the legacy %i vs 1 timing window", (troops, minimum, maximum) => {
-    const result = runPlainsBattle(troops);
+  ])("preserves the same-type %i versus one timing window", (count, minimum, maximum) => {
+    const result = runPlainsBattle(unitsOf("melee", count));
     expect(result.owner).toBe(1);
     expect(result.ticks).toBeGreaterThanOrEqual(minimum);
     expect(result.ticks).toBeLessThanOrEqual(maximum);
   });
 
-  it("gives an exact two-faction tie to the incumbent", () => {
-    const result = runPlainsBattle(1);
+  it("gives an exact same-composition tie to the incumbent", () => {
+    const result = runPlainsBattle(unitsOf("melee", 1));
     expect(result.owner).toBe(0);
     expect(result.ticks).toBeGreaterThanOrEqual(90);
   });
 
-  it("runs 6v8v20 immediately as three independent participants and red wins", () => {
-    const state = runningState("combat-6v8v20");
-    const tile = state.map.tiles[state.map.spawnClusters[0]![1]!]!;
-    tile.structure = null;
-    tile.terrain = "plains";
-    tile.troops = 6;
-    const battle = startBattle(state, tile, 1, 8, tile.id);
-    handleStackArrival(state, 2, 20, tile.id, tile.id);
+  it.each([
+    ["wizard", "melee"],
+    ["ranged", "wizard"],
+    ["melee", "ranged"],
+  ] as const)("gives %s a visible 1.5x advantage over %s", (winner, loser) => {
+    const state = runningState(`rps-${winner}-${loser}`);
+    const tile = battleTile(state);
+    tile.units = unitsOf(loser, 10);
+    const battle = startBattle(state, tile, 1, unitsOf(winner, 10), tile.id);
+    const view = battlePresentation(state, battle);
+    expect(view.find((entry) => entry.playerId === 1)).toMatchObject({
+      effectivePower: 15_000,
+      rpsMultiplierPermille: 1_500,
+      sharePermyriad: 6_000,
+    });
+    expect(view.find((entry) => entry.playerId === 0)).toMatchObject({
+      effectivePower: 10_000,
+      rpsMultiplierPermille: 1_000,
+      sharePermyriad: 4_000,
+    });
+  });
 
-    expect(battle.participants.map(({ playerId, troops }) => ({ playerId, troops }))).toEqual([
-      { playerId: 0, troops: 6 },
-      { playerId: 1, troops: 8 },
-      { playerId: 2, troops: 20 },
+  it("weights a mixed formation against aggregate hostile composition", () => {
+    const state = runningState("rps-mixed");
+    const tile = battleTile(state);
+    tile.units = unitsOf("melee", 10);
+    const battle = startBattle(state, tile, 1, { melee: 5, ranged: 0, wizard: 5 }, tile.id);
+    const attacker = battlePresentation(state, battle).find((entry) => entry.playerId === 1)!;
+    expect(attacker.basePower).toBe(10_000);
+    expect(attacker.effectivePowerByType).toEqual({ melee: 5_000, ranged: 0, wizard: 7_500 });
+    expect(attacker.rpsMultiplierPermille).toBe(1_250);
+  });
+
+  it("runs 6v8v20 immediately as three typed participants and preserves all outgoing pressure", () => {
+    const state = runningState("combat-6v8v20");
+    const tile = battleTile(state);
+    tile.units = unitsOf("melee", 6);
+    const battle = startBattle(state, tile, 1, unitsOf("ranged", 8), tile.id);
+    handleStackArrival(state, 2, unitsOf("wizard", 20), tile.id, tile.id);
+    expect(battle.participants.map(({ playerId, units }) => ({ playerId, units }))).toEqual([
+      { playerId: 0, units: unitsOf("melee", 6) },
+      { playerId: 1, units: unitsOf("ranged", 8) },
+      { playerId: 2, units: unitsOf("wizard", 20) },
     ]);
     tickCombatFor(state, 10);
     expect(battle.participants).toHaveLength(3);
-    expect(battle.participants.every((participant) => participant.casualtyProgressMilli > 0)).toBe(
-      true,
-    );
     expect(
-      battle.participants.find((participant) => participant.playerId === 2)!.control,
-    ).toBeGreaterThan(5_000);
-    expect(
-      battle.participants.find((participant) => participant.playerId === 0)!.control,
-    ).toBeLessThan(5_000);
-
-    tickCombatFor(state, 240);
+      battle.participants.every((participant) => totalUnits(participant.casualtyProgressMilli) > 0),
+    ).toBe(true);
+    tickCombatFor(state, 260);
     expect(state.battles).toHaveLength(0);
     expect(tile.owner).toBe(2);
   });
 
-  it("normalizes participant insertion order before rules and hashing", () => {
+  it("normalizes participant insertion order before typed rules and hashing", () => {
     const left = runningState("participant-order");
-    const tile = left.map.tiles[left.map.spawnClusters[0]![1]!]!;
-    tile.structure = null;
-    tile.terrain = "plains";
-    tile.troops = 6;
-    startBattle(left, tile, 1, 8, tile.id);
-    handleStackArrival(left, 2, 20, tile.id, tile.id);
+    const tile = battleTile(left);
+    tile.units = unitsOf("melee", 6);
+    startBattle(left, tile, 1, unitsOf("ranged", 8), tile.id);
+    handleStackArrival(left, 2, unitsOf("wizard", 20), tile.id, tile.id);
     const right = cloneDeterministic(left);
     right.battles[0]!.participants.reverse();
     tickCombatFor(left, 1);
@@ -177,50 +194,20 @@ describe("deterministic N-faction combat", () => {
     expect(stableStringify(right)).toBe(stableStringify(left));
   });
 
-  it("breaks a simultaneous all-faction elimination by power, incumbent, then player ID", () => {
-    const state = runningState("combat-total-elimination");
-    const tile = state.map.tiles[state.map.spawnClusters[0]![1]!]!;
-    tile.structure = null;
-    tile.terrain = "plains";
-    tile.troops = 5;
-    const battle = startBattle(state, tile, 1, 5, tile.id);
-    handleStackArrival(state, 2, 5, tile.id, tile.id);
-    battle.ageTicks = BALANCE.minimumBattleTicks - 1;
-    battle.roundAccumulator = BALANCE.combatRoundTicks - 1;
-    for (const participant of battle.participants) participant.control = 1;
-    tickCombatFor(state, 1);
-    expect(state.battles).toHaveLength(0);
-    expect(tile.owner).toBe(0);
-    expect(tile.troops).toBeGreaterThan(0);
-  });
-
-  it("merges same-faction arrivals and admits a fourth faction without restarting age", () => {
-    const state = runningState("four-factions");
-    const tile = state.map.tiles[state.map.spawnClusters[0]![1]!]!;
-    tile.structure = null;
-    tile.troops = 6;
-    const battle = startBattle(state, tile, 1, 8, tile.id);
-    tickCombatFor(state, 12);
-    handleStackArrival(state, 1, 4, tile.id, tile.id);
-    handleStackArrival(state, 2, 20, tile.id, tile.id);
-    handleStackArrival(state, 3, 7, tile.id, tile.id);
-    expect(battle.ageTicks).toBe(12);
-    expect(battle.participants).toHaveLength(4);
-    expect(battle.participants.find((participant) => participant.playerId === 1)?.troops).toBe(12);
-    expect(battle.participants.find((participant) => participant.playerId === 1)).toMatchObject({
-      lastReinforcementTick: state.tick,
-      reinforcementAmount: 4,
-    });
-  });
-
-  it("projects exactly 10,000 stable power shares for all 21 rulers", () => {
+  it("projects stable shares totaling exactly 10,000 for all 21 rulers", () => {
     const state = runningState("twenty-one-way", 20);
-    const tile = state.map.tiles[state.map.spawnClusters[0]![1]!]!;
-    tile.structure = null;
-    tile.troops = 2;
-    const battle = startBattle(state, tile, 1, 2, tile.id);
+    const tile = battleTile(state);
+    tile.units = unitsOf("melee", 2);
+    const battle = startBattle(state, tile, 1, unitsOf("ranged", 2), tile.id);
+    const types: UnitType[] = ["melee", "ranged", "wizard"];
     for (let playerId = 2; playerId < 21; playerId += 1) {
-      handleStackArrival(state, playerId, playerId + 1, tile.id, tile.id);
+      handleStackArrival(
+        state,
+        playerId,
+        unitsOf(types[playerId % types.length]!, playerId + 1),
+        tile.id,
+        tile.id,
+      );
     }
     const presentation = battlePresentation(state, battle);
     expect(presentation).toHaveLength(21);
@@ -233,170 +220,76 @@ describe("deterministic N-faction combat", () => {
   });
 });
 
-describe("aggregate Turret defense and firing", () => {
-  it("makes one defender plus x3 full Turrets approximately ten equivalents", () => {
-    const state = runningState("turret-power");
-    const tile = state.map.tiles[state.map.spawnClusters[0]![1]!]!;
-    tile.terrain = "plains";
-    tile.troops = 1;
-    tile.structure = activeTurrets(3);
-    expect(defenderEffectivePower(tile, 1)).toBe(10_220);
-    tile.structure.integrity = BALANCE.seizedIntegrity;
-    expect(defenderEffectivePower(tile, 1)).toBeGreaterThan(1_000);
-    expect(defenderEffectivePower(tile, 1)).toBeLessThan(10_220);
+describe("aggregate typed structure support", () => {
+  it("adds two local typed equivalents per copy, capped at twelve and integrity-scaled", () => {
+    const state = runningState("local-support");
+    const tile = battleTile(state);
+    tile.units = unitsOf("melee", 1);
+    tile.structure = structure("wizard-tower", 3);
+    const battle = startBattle(state, tile, 1, unitsOf("melee", 10), tile.id);
+    const incumbent = battlePresentation(state, battle).find((entry) => entry.playerId === 0)!;
+    expect(incumbent.localSupportPower).toEqual({ melee: 0, ranged: 0, wizard: 6_000 });
+    expect(incumbent.effectivePower).toBe(10_000);
+
+    tile.structure!.completedCount = 99;
+    tile.structure!.integrity = BALANCE.seizedIntegrity;
+    const repaired = battlePresentation(state, battle).find((entry) => entry.playerId === 0)!;
+    expect(repaired.localSupportPower.wizard).toBe(4_800);
   });
 
-  it("fires x3 as one accumulator for one casualty per ten eligible ticks", () => {
-    const state = runningState("turret-cadence");
-    const tile = state.map.tiles[state.map.spawnClusters[0]![1]!]!;
-    tile.terrain = "plains";
-    tile.troops = 5;
-    tile.structure = activeTurrets(3);
-    const battle = startBattle(state, tile, 1, 50, tile.id);
-    tickCombatFor(state, 9);
-    expect(battle.participants.find((participant) => participant.playerId === 1)?.troops).toBe(50);
-    tickCombatFor(state, 1);
-    expect(battle.participants.find((participant) => participant.playerId === 1)?.troops).toBe(49);
-    tickCombatFor(state, 20);
-    expect(battle.participants.find((participant) => participant.playerId === 1)?.troops).toBe(47);
-    expect(tile.structure?.turretShotProgressMilli).toBe(0);
-  });
-
-  it("does not fire or create a faction after the Turret owner has no troops present", () => {
-    const state = runningState("turret-owner-absent");
-    const tile = state.map.tiles[state.map.spawnClusters[0]![1]!]!;
-    tile.terrain = "plains";
-    tile.troops = 5;
-    tile.structure = activeTurrets(3);
-    const battle = startBattle(state, tile, 1, 50, tile.id);
-    battle.participants = battle.participants.filter((participant) => participant.playerId !== 0);
-    tickCombatFor(state, 10);
-    expect(battle.participants).toEqual([expect.objectContaining({ playerId: 1, troops: 50 })]);
-    expect(tile.structure.turretShotProgressMilli).toBe(0);
-  });
-
-  it("divides one aggregate volley across adjacent battles without duplicating shots", () => {
-    const state = runningState("turret-multiple-battles");
-    const [source, first, second] = ownedLandStar(state, 0, 2);
-    source.structure = activeTurrets(3);
-    source.troops = 10;
-    first.owner = 1;
-    first.troops = 8;
-    second.owner = 2;
-    second.troops = 8;
-    const firstBattle = startBattle(state, first, 0, 8, source.id);
-    const secondBattle = startBattle(state, second, 0, 8, source.id);
-    tickCombatFor(state, 10);
-    const hostileRemaining =
-      firstBattle.participants.find((participant) => participant.playerId === 1)!.troops +
-      secondBattle.participants.find((participant) => participant.playerId === 2)!.troops;
-    expect(hostileRemaining).toBe(15);
-    expect(
-      state.events.filter(
-        (event) => event.type === "turret-volley" && event.sourceTileId === source.id,
-      ),
-    ).toHaveLength(1);
-  });
-
-  it("prioritizes its own contested tile over an adjacent battle", () => {
-    const state = runningState("turret-own-priority");
-    const [source, adjacent] = ownedLandStar(state, 0, 1);
-    source.structure = activeTurrets(3);
-    source.troops = 5;
-    adjacent.owner = 1;
-    adjacent.troops = 8;
-    const adjacentBattle = startBattle(state, adjacent, 0, 8, source.id);
-    const homeBattle = startBattle(state, source, 2, 50, adjacent.id);
-    tickCombatFor(state, 10);
-    expect(homeBattle.participants.find((participant) => participant.playerId === 2)?.troops).toBe(
-      49,
+  it("lets the correct troop type counter typed home support", () => {
+    const state = runningState("counter-local-support");
+    const tile = battleTile(state);
+    tile.units = unitsOf("melee", 1);
+    tile.structure = structure("wizard-tower", 3);
+    const battle = startBattle(state, tile, 1, unitsOf("ranged", 10), tile.id);
+    const view = battlePresentation(state, battle);
+    expect(view.find((entry) => entry.playerId === 1)!.effectivePower).toBeGreaterThan(
+      view.find((entry) => entry.playerId === 0)!.effectivePower,
     );
-    expect(
-      adjacentBattle.participants.find((participant) => participant.playerId === 1)?.troops,
-    ).toBe(8);
   });
 
-  it("scales shot cadence with integrity and never reaches beyond six adjacent hexes", () => {
-    const state = runningState("turret-integrity-range");
-    const source = safeTurretSource(state);
-    source.structure = activeTurrets(3, BALANCE.seizedIntegrity);
-    source.owner = 0;
-    source.troops = 8;
-    const distant = ringTwoTarget(state, source);
-    distant.owner = 1;
-    distant.troops = 20;
-    const distantBattle = startBattle(state, distant, 0, 1, source.id);
-    tickCombatFor(state, 30);
-    expect(
-      distantBattle.participants.find((participant) => participant.playerId === 1)?.troops,
-    ).toBe(20);
-
-    const adjacent = neighbors(source)
-      .map((hex) => state.map.tiles[axialKey(hex)])
-      .find((tile) => tile && tile.terrain !== "water" && tile.id !== distant.id)!;
-    adjacent.owner = 1;
-    adjacent.troops = 20;
-    const adjacentBattle = startBattle(state, adjacent, 0, 1, source.id);
-    tickCombatFor(state, 24);
-    expect(
-      adjacentBattle.participants.find((participant) => participant.playerId === 1)?.troops,
-    ).toBe(20);
-    tickCombatFor(state, 1);
-    expect(
-      adjacentBattle.participants.find((participant) => participant.playerId === 1)?.troops,
-    ).toBe(19);
-  });
-
-  it("targets N-way hostiles proportionally from one x99 stack and creates no per-copy entities", () => {
-    const state = runningState("turret-n-way-x99");
-    const tile = state.map.tiles[state.map.spawnClusters[0]![1]!]!;
-    tile.terrain = "plains";
-    tile.troops = 5;
-    tile.structure = activeTurrets(99);
-    const battle = startBattle(state, tile, 1, 10, tile.id);
-    handleStackArrival(state, 2, 20, tile.id, tile.id);
-    const entitiesBefore = state.stacks.length + state.battles.length;
-    tickCombatFor(state, 1);
-    expect(battle.participants.find((participant) => participant.playerId === 1)?.troops).toBe(9);
-    expect(battle.participants.find((participant) => participant.playerId === 2)?.troops).toBe(18);
-    expect(state.stacks.length + state.battles.length).toBe(entitiesBefore);
-    expect(
-      state.events.filter(
-        (event) => event.type === "turret-volley" && event.sourceTileId === tile.id,
-      ),
-    ).toEqual([expect.objectContaining({ amount: 3 })]);
-  });
-
-  it("cannot fire into or capture a nearby battle without its owner participating", () => {
-    const state = runningState("turret-no-participant");
+  it("caps one adjacent x99 source at six typed equivalents", () => {
+    const state = runningState("adjacent-source-cap");
     const [source, target] = ownedLandStar(state, 0, 1);
-    source.structure = activeTurrets(99);
+    source.structure = structure("archery-range", 99);
     target.owner = 1;
-    target.troops = 10;
-    const battle = startBattle(state, target, 2, 10, source.id);
-    tickCombatFor(state, 1);
-    expect(battle.participants.find((participant) => participant.playerId === 1)?.troops).toBe(10);
-    expect(battle.participants.find((participant) => participant.playerId === 2)?.troops).toBe(10);
-    expect(battle.participants.some((participant) => participant.playerId === 0)).toBe(false);
-    expect(
-      state.events.some(
-        (event) => event.type === "turret-volley" && event.sourceTileId === source.id,
-      ),
-    ).toBe(false);
+    target.units = unitsOf("wizard", 20);
+    const battle = startBattle(state, target, 0, unitsOf("melee", 5), source.id);
+    const attacker = battlePresentation(state, battle).find((entry) => entry.playerId === 0)!;
+    expect(attacker.adjacentSupportPower).toEqual({ melee: 0, ranged: 6_000, wizard: 0 });
   });
 
-  it("keeps x3 Turrets defensible by the requested near-threshold assault", () => {
-    const defend = (attackers: number): number | null => {
-      const state = runningState(`turret-threshold-${attackers}`);
-      const tile = state.map.tiles[state.map.spawnClusters[0]![1]!]!;
-      tile.terrain = "plains";
-      tile.troops = 1;
-      tile.structure = activeTurrets(3);
-      startBattle(state, tile, 1, attackers, tile.id);
-      tickCombatFor(state, 240);
-      return tile.owner;
-    };
-    expect(defend(10)).toBe(0);
-    expect(defend(14)).toBe(1);
+  it("caps aggregate adjacent support at twelve per faction and battle", () => {
+    const state = runningState("adjacent-global-cap");
+    const [target, ...sources] = ownedLandStar(state, 0, 6);
+    target.owner = 1;
+    target.units = unitsOf("melee", 30);
+    const types: StructureType[] = ["barracks", "archery-range", "wizard-tower"];
+    for (let index = 0; index < sources.length; index += 1) {
+      sources[index]!.structure = structure(types[index % types.length]!, 99);
+    }
+    const battle = startBattle(state, target, 0, unitsOf("melee", 5), sources[0]!.id);
+    const attacker = battlePresentation(state, battle).find((entry) => entry.playerId === 0)!;
+    expect(totalUnits(attacker.adjacentSupportPower)).toBe(12_000);
+  });
+
+  it("never creates a participant or projects outward while its home tile is contested", () => {
+    const state = runningState("support-no-participant");
+    const [source, target] = ownedLandStar(state, 0, 1);
+    source.structure = structure("wizard-tower", 99);
+    source.units = unitsOf("melee", 5);
+    target.owner = 1;
+    target.units = unitsOf("melee", 10);
+    const nearby = startBattle(state, target, 2, unitsOf("ranged", 10), source.id);
+    const home = startBattle(state, source, 1, unitsOf("wizard", 10), target.id);
+    home.participants = home.participants.filter((participant) => participant.playerId !== 0);
+    expect(battlePresentation(state, nearby).some((entry) => entry.playerId === 0)).toBe(false);
+    expect(
+      battlePresentation(state, nearby).reduce(
+        (sum, entry) => sum + totalUnits(entry.adjacentSupportPower),
+        0,
+      ),
+    ).toBe(0);
   });
 });

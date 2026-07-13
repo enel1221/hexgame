@@ -1,4 +1,6 @@
 import type { GameEvent, GameEventType, GameState } from "@/src/shared/types";
+import { battlePresentation } from "@/src/core/combat";
+import { totalUnits } from "@/src/core/units";
 
 interface ToneSpec {
   frequency: number;
@@ -24,6 +26,13 @@ const TONES: Partial<Record<GameEventType, ToneSpec>> = {
     gain: 0.045,
     wave: "triangle",
   },
+  "typed-support": {
+    frequency: 360,
+    endFrequency: 610,
+    duration: 0.16,
+    gain: 0.035,
+    wave: "triangle",
+  },
   capture: { frequency: 260, endFrequency: 520, duration: 0.32, gain: 0.055, wave: "triangle" },
   "construction-complete": {
     frequency: 520,
@@ -41,7 +50,9 @@ export class AudioDirector {
   private enabled: boolean;
   private lastEventId = -1;
   private lastBattleImpactTick = -100;
-  private lastTurretTick = -100;
+  private lastSupportTick = -100;
+  private lastAdvantageTick = -100;
+  private battleMatchups = new Map<number, string>();
 
   constructor(enabled: boolean) {
     this.enabled = enabled;
@@ -73,19 +84,52 @@ export class AudioDirector {
           : TONES[event.type];
       if (tone) this.play(tone);
     }
-    if (!state || state.battles.length === 0) return;
+    if (!state) return;
+    if (state.battles.length === 0) {
+      this.battleMatchups.clear();
+      return;
+    }
     if (state.tick - this.lastBattleImpactTick >= 18) {
       this.lastBattleImpactTick = state.tick;
       this.play({ frequency: 118, endFrequency: 74, duration: 0.09, gain: 0.022, wave: "square" });
     }
-    const defendedByTurret = state.battles.some((battle) => {
-      const structure = state.map.tiles[battle.tileId]?.structure;
-      return (
-        structure?.type === "turret" && structure.completedCount > 0 && structure.status !== null
+    const activeBattleIds = new Set<number>();
+    let typedSupportActive = false;
+    for (const battle of state.battles) {
+      activeBattleIds.add(battle.id);
+      const presentation = battlePresentation(state, battle);
+      typedSupportActive ||= presentation.some(
+        (participant) =>
+          totalUnits(participant.localSupportPower) + totalUnits(participant.adjacentSupportPower) >
+          0,
       );
-    });
-    if (defendedByTurret && state.tick - this.lastTurretTick >= 26) {
-      this.lastTurretTick = state.tick;
+      const signature = presentation
+        .map(
+          (participant) =>
+            `${participant.playerId ?? "n"}:${participant.rpsMultiplierPermille}:${participant.units.melee}:${participant.units.ranged}:${participant.units.wizard}`,
+        )
+        .join("|");
+      const prior = this.battleMatchups.get(battle.id);
+      this.battleMatchups.set(battle.id, signature);
+      if (prior === undefined || prior === signature || state.tick - this.lastAdvantageTick < 30) {
+        continue;
+      }
+      const local =
+        presentation.find((participant) => participant.playerId === localPlayerId) ??
+        presentation[0];
+      if (!local || local.rpsMultiplierPermille === 1000) continue;
+      this.lastAdvantageTick = state.tick;
+      this.play(
+        local.rpsMultiplierPermille > 1000
+          ? { frequency: 470, endFrequency: 790, duration: 0.14, gain: 0.03, wave: "triangle" }
+          : { frequency: 260, endFrequency: 145, duration: 0.16, gain: 0.032, wave: "sawtooth" },
+      );
+    }
+    for (const battleId of this.battleMatchups.keys()) {
+      if (!activeBattleIds.has(battleId)) this.battleMatchups.delete(battleId);
+    }
+    if (typedSupportActive && state.tick - this.lastSupportTick >= 26) {
+      this.lastSupportTick = state.tick;
       this.play({
         frequency: 210,
         endFrequency: 52,
@@ -99,6 +143,7 @@ export class AudioDirector {
   destroy(): void {
     if (this.context) void this.context.close();
     this.context = null;
+    this.battleMatchups.clear();
   }
 
   private play(spec: ToneSpec): void {

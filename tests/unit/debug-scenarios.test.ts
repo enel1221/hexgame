@@ -12,6 +12,7 @@ import {
   neighbors,
   parseEngineSnapshot,
   stepGame,
+  totalUnits,
 } from "../../src/core";
 import { SimulationWorkerController } from "../../src/worker";
 import { TEST_CONFIG } from "./fixtures";
@@ -56,30 +57,27 @@ describe("deterministic debug scenarios", () => {
     );
 
     expect(structures.map((tile) => tile.structure!.type).sort()).toEqual([
+      "archery-range",
       "barracks",
-      "farm",
-      "turret",
+      "wizard-tower",
     ]);
     expect(structures.every((tile) => tile.owner === 0)).toBe(true);
     expect(structures.every((tile) => tile.structure!.status === "active")).toBe(true);
-    const farm = structures.find((tile) => tile.structure!.type === "farm")!;
+    const range = structures.find((tile) => tile.structure!.type === "archery-range")!;
     const barracks = structures.find((tile) => tile.structure!.type === "barracks")!;
-    const turret = structures.find((tile) => tile.structure!.type === "turret")!;
-    expect(farm.terrain).toBe("meadow");
-    expect(farm.structure).toMatchObject({
+    const tower = structures.find((tile) => tile.structure!.type === "wizard-tower")!;
+    expect(range.terrain).toBe("meadow");
+    expect(range.structure).toMatchObject({
       completedCount: 2,
-      pendingProgressTicks: Math.floor(BALANCE.farm.buildTicks / 2),
+      pendingProgressTicks: Math.floor(BALANCE.archeryRange.buildTicks / 2),
     });
     expect(barracks.terrain).toBe("muster");
     expect(barracks.structure).toMatchObject({
       completedCount: 3,
-      barracksProgressMilli: Math.floor((BALANCE.barracks.trainTicks * BALANCE.fullIntegrity) / 2),
+      trainingProgressMilli: Math.floor((BALANCE.barracks.trainTicks * BALANCE.fullIntegrity) / 2),
       rallyTargetId: expect.any(String),
     });
-    expect(turret.structure).toMatchObject({
-      completedCount: 99,
-      turretShotProgressMilli: Math.floor(BALANCE.turret.shotTicks / 2) * BALANCE.fullIntegrity,
-    });
+    expect(tower.structure).toMatchObject({ completedCount: 99 });
     expect(state.players[0]!.supplyMilli).toBeGreaterThanOrEqual(500_000);
     expect(state.players[0]!.stats.structuresBuilt).toBeGreaterThanOrEqual(104);
     expectValidHash(state);
@@ -97,8 +95,8 @@ describe("deterministic debug scenarios", () => {
     expect(battle.participants).toHaveLength(2);
     expect(attacker.control).toBe(5_000);
     expect(battle.ageTicks).toBe(0);
-    expect(attacker.troops).toBe(defender.troops);
-    expect(battleState.map.tiles[battle.tileId]!.troops).toBe(0);
+    expect(totalUnits(attacker.units)).toBe(totalUnits(defender.units));
+    expect(totalUnits(battleState.map.tiles[battle.tileId]!.units)).toBe(0);
     expectValidHash(battleState);
 
     const reinforced = createDebugScenario(battleState, "reinforcement");
@@ -108,7 +106,7 @@ describe("deterministic debug scenarios", () => {
     expect(shiftedAttacker.reinforcementAmount).toBe(40);
     expect(shiftedAttacker.lastReinforcementTick).toBe(reinforced.tick);
     expect(shiftedAttacker.control).toBe(5_800);
-    expect(shiftedAttacker.troops).toBe(96);
+    expect(totalUnits(shiftedAttacker.units)).toBe(96);
     expect(reinforced.events.at(-1)?.type).toBe("reinforcement");
     expectValidHash(reinforced);
   });
@@ -124,10 +122,10 @@ describe("deterministic debug scenarios", () => {
       battle.participants.find((participant) => participant.playerId === attackerId),
     ).toMatchObject({
       control: 9_900,
-      troops: 96,
+      units: { melee: 96, ranged: 0, wizard: 0 },
     });
     expect(prepared.map.tiles[battle.tileId]!.structure).toMatchObject({
-      type: "turret",
+      type: "wizard-tower",
       completedCount: 3,
       status: "active",
     });
@@ -135,22 +133,13 @@ describe("deterministic debug scenarios", () => {
       battlePresentation(prepared, battle).find(
         (participant) => participant.playerId === battle.incumbentOwner,
       ),
-    ).toMatchObject({ turretSupportCount: 3, incumbent: true });
+    ).toMatchObject({ localSupportPower: { wizard: 6_000 }, incumbent: true });
 
     let running = cloneDeterministic(prepared);
     running.paused = false;
     running.stateHash = hashGameState(running);
     const startingTick = running.tick;
     running = stepGame(running);
-    expect(running.events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "turret-volley",
-          sourceTileId: battle.tileId,
-          amount: 1,
-        }),
-      ]),
-    );
     for (let tick = 1; tick < BALANCE.minimumBattleTicks - 1; tick += 1) {
       running = stepGame(running);
     }
@@ -203,7 +192,11 @@ describe("deterministic debug scenarios", () => {
     const target = prepared.map.tiles[battle.tileId]!;
     const supplyBefore = prepared.players[0]!.supplyMilli;
     expect(prepared.tick).toBe(210);
-    expect(target.structure).toMatchObject({ type: "farm", status: "active", integrity: 1_000 });
+    expect(target.structure).toMatchObject({
+      type: "archery-range",
+      status: "active",
+      integrity: 1_000,
+    });
 
     const running = cloneDeterministic(prepared);
     running.paused = false;
@@ -212,18 +205,18 @@ describe("deterministic debug scenarios", () => {
     const captured = resolved.map.tiles[battle.tileId]!;
     expect(captured.owner).toBe(0);
     expect(captured.structure).toMatchObject({
-      type: "farm",
+      type: "archery-range",
       status: "seized",
       integrity: BALANCE.seizedIntegrity,
     });
     expect(resolved.players[0]!.supplyMilli).toBe(
-      supplyBefore + BALANCE.captureRewardMilli + BALANCE.farmCaptureRewardMilli,
+      supplyBefore + BALANCE.captureRewardMilli + BALANCE.archeryRangeCaptureRewardMilli,
     );
     expect(resolved.events).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           type: "reward",
-          amount: BALANCE.captureRewardMilli + BALANCE.farmCaptureRewardMilli,
+          amount: BALANCE.captureRewardMilli + BALANCE.archeryRangeCaptureRewardMilli,
         }),
         expect.objectContaining({ type: "structure-seized", tileId: battle.tileId }),
       ]),
@@ -250,7 +243,10 @@ describe("deterministic debug scenarios", () => {
     });
     expect(eliminated.battles).toHaveLength(1);
     expect(
-      eliminated.battles[0]!.participants.map(({ playerId, troops }) => ({ playerId, troops })),
+      eliminated.battles[0]!.participants.map(({ playerId, units }) => ({
+        playerId,
+        troops: totalUnits(units),
+      })),
     ).toEqual([
       { playerId: 0, troops: 6 },
       { playerId: 2, troops: 8 },
@@ -283,14 +279,14 @@ describe("deterministic debug scenarios", () => {
     const trappedId = enclosure.tileIds[0]!;
     expect(interior.map.tiles[trappedId]).toMatchObject({
       owner: 1,
-      troops: 6,
       terrain: "meadow",
       structure: {
-        type: "farm",
+        type: "archery-range",
         completedCount: 2,
-        pendingProgressTicks: Math.floor(BALANCE.farm.buildTicks / 2),
+        pendingProgressTicks: Math.floor(BALANCE.archeryRange.buildTicks / 2),
       },
     });
+    expect(totalUnits(interior.map.tiles[trappedId]!.units)).toBe(6);
     expect(interior.players[0]!.supplyMilli).toBeGreaterThanOrEqual(500_000);
     expectValidHash(interior);
 
@@ -299,7 +295,8 @@ describe("deterministic debug scenarios", () => {
     completing.stateHash = hashGameState(completing);
     const enclosed = stepGame(completing);
     expect(enclosed.enclosures).toHaveLength(0);
-    expect(enclosed.map.tiles[trappedId]).toMatchObject({ owner: 0, troops: 0 });
+    expect(enclosed.map.tiles[trappedId]).toMatchObject({ owner: 0 });
+    expect(totalUnits(enclosed.map.tiles[trappedId]!.units)).toBe(0);
     expect(enclosed.events).toEqual(
       expect.arrayContaining([
         expect.objectContaining({

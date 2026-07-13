@@ -3,6 +3,7 @@ import {
   ClientMessageSchema,
   CreateRoomRequestSchema,
   GameCommandSchema,
+  PlacementCandidatesMessageSchema,
   RoomCodeSchema,
   RoomConfigSchema,
   ServerMessageSchema,
@@ -134,6 +135,22 @@ describe("multiplayer protocol schemas", () => {
     ).toBe(false);
   });
 
+  it("bounds placement candidates to the compressed-map land ceiling", () => {
+    const message = {
+      type: "placement-candidates" as const,
+      generationAttempt: 0,
+      candidateHash: "12345678abcdef00",
+      candidates: Array.from({ length: 1_092 }, (_, index) => `${index},0`),
+    };
+    expect(PlacementCandidatesMessageSchema.safeParse(message).success).toBe(true);
+    expect(
+      PlacementCandidatesMessageSchema.safeParse({
+        ...message,
+        candidates: [...message.candidates, "1092,0"],
+      }).success,
+    ).toBe(false);
+  });
+
   it("validates ordered command batches from the relay", () => {
     const result = ServerMessageSchema.safeParse({
       type: "command-batch",
@@ -148,7 +165,7 @@ describe("multiplayer protocol schemas", () => {
             type: "build",
             playerId: 0,
             tileId: "2,-1",
-            structure: "turret",
+            structure: "wizard-tower",
             scheduledTick: 27,
           },
         },
@@ -159,5 +176,40 @@ describe("multiplayer protocol schemas", () => {
       hasMore: false,
     });
     expect(result.success).toBe(true);
+  });
+
+  it("accepts the three typed producers and rejects retired structure commands", () => {
+    for (const structure of ["barracks", "archery-range", "wizard-tower"] as const) {
+      expect(
+        GameCommandSchema.safeParse({
+          type: "build",
+          playerId: 0,
+          tileId: "0,0",
+          structure,
+        }).success,
+      ).toBe(true);
+    }
+    expect(
+      GameCommandSchema.safeParse({
+        type: "toggle-production",
+        playerId: 0,
+        tileId: "0,0",
+      }).success,
+    ).toBe(true);
+    expect(
+      GameCommandSchema.safeParse({
+        type: "build",
+        playerId: 0,
+        tileId: "0,0",
+        structure: "turret",
+      }).success,
+    ).toBe(false);
+    expect(
+      GameCommandSchema.safeParse({
+        type: "toggle-barracks",
+        playerId: 0,
+        tileId: "0,0",
+      }).success,
+    ).toBe(false);
   });
 });

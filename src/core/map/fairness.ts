@@ -1,6 +1,11 @@
 import { BALANCE, TERRAIN_DISTRIBUTION } from "../../shared/balance";
 import type { GeneratedMap, TerrainType } from "../../shared/types";
 import { axialKey, distance, neighbors, parseAxialKey } from "../hex/coordinates";
+import { totalUnits } from "../units";
+
+function compareIds(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
 
 export interface SpawnFairnessMetrics {
   playerId: number;
@@ -24,12 +29,18 @@ export interface TerrainDistributionReport {
   hills: number;
 }
 
+export interface ControlledChokepoint {
+  tileIds: string[];
+  separatedLandCount: number;
+}
+
 export interface MapFairnessReport {
   valid: boolean;
   reasons: string[];
   connectedLandCount: number;
   disconnectedLandIds: string[];
   criticalChokepoints: string[];
+  controlledChokepoints: ControlledChokepoint[];
   minimumSpawnDistance: number;
   maximumNearestSpawnDistance: number;
   landRatioPermille: number;
@@ -110,6 +121,93 @@ export function findCriticalChokepoints(map: GeneratedMap): string[] {
   return [...articulation].sort();
 }
 
+interface LandTopology {
+  ids: string[];
+  adjacency: Map<string, string[]>;
+}
+
+const controlledChokepointCache = new WeakMap<GeneratedMap, ControlledChokepoint[]>();
+
+function landTopology(map: GeneratedMap): LandTopology {
+  const ids = [...map.landIds].sort();
+  const land = new Set(ids);
+  return {
+    ids,
+    adjacency: new Map(ids.map((id) => [id, landNeighborIds(map, id, land).sort()])),
+  };
+}
+
+function topologyComponents(topology: LandTopology, excluded: ReadonlySet<string>): string[][] {
+  const unvisited = new Set(topology.ids.filter((id) => !excluded.has(id)));
+  const components: string[][] = [];
+  while (unvisited.size > 0) {
+    const start = unvisited.values().next().value as string;
+    unvisited.delete(start);
+    const component = [start];
+    for (let index = 0; index < component.length; index += 1) {
+      for (const next of topology.adjacency.get(component[index]!) ?? []) {
+        if (excluded.has(next) || !unvisited.delete(next)) continue;
+        component.push(next);
+      }
+    }
+    components.push(component);
+  }
+  return components.sort(
+    (left, right) => right.length - left.length || compareIds(left[0]!, right[0]!),
+  );
+}
+
+export function minimumChokepointRegionSize(landCount: number): number {
+  return Math.max(18, Math.ceil((landCount * 80) / 1000));
+}
+
+function touchesWater(map: GeneratedMap, id: string): boolean {
+  return neighbors(parseAxialKey(id)).some((hex) => map.tiles[axialKey(hex)]?.terrain === "water");
+}
+
+/**
+ * Find strategically meaningful one- and two-tile vertex cuts. Tiny coastal
+ * nubs are intentionally ignored: both sides must contain a useful province.
+ */
+export function findControlledChokepoints(map: GeneratedMap): ControlledChokepoint[] {
+  const cached = controlledChokepointCache.get(map);
+  if (cached) return cached;
+
+  const topology = landTopology(map);
+  const minimumRegion = minimumChokepointRegionSize(map.landCount);
+  const articulation = new Set(findCriticalChokepoints(map));
+  const output: ControlledChokepoint[] = [];
+
+  for (const id of [...articulation].sort()) {
+    if (!touchesWater(map, id)) continue;
+    const components = topologyComponents(topology, new Set([id]));
+    if (components.length !== 2 || components[1]!.length < minimumRegion) continue;
+    output.push({ tileIds: [id], separatedLandCount: components[1]!.length });
+  }
+
+  for (const left of topology.ids) {
+    if (articulation.has(left) || !touchesWater(map, left)) continue;
+    for (const right of topology.adjacency.get(left) ?? []) {
+      if (right <= left || articulation.has(right) || !touchesWater(map, right)) continue;
+      const components = topologyComponents(topology, new Set([left, right]));
+      if (components.length !== 2 || components[1]!.length < minimumRegion) continue;
+      output.push({
+        tileIds: [left, right],
+        separatedLandCount: components[1]!.length,
+      });
+    }
+  }
+
+  output.sort(
+    (left, right) =>
+      left.tileIds.length - right.tileIds.length ||
+      compareIds(left.tileIds[0]!, right.tileIds[0]!) ||
+      compareIds(left.tileIds[1] ?? "", right.tileIds[1] ?? ""),
+  );
+  controlledChokepointCache.set(map, output);
+  return output;
+}
+
 function clusterIsConnected(map: GeneratedMap, cluster: readonly string[]): boolean {
   if (cluster.length === 0) return false;
   const allowed = new Set(cluster);
@@ -175,6 +273,12 @@ export function analyzeMapFairness(
   const connectedSet = new Set(connected);
   const disconnectedLandIds = map.landIds.filter((id) => !connectedSet.has(id));
   const criticalChokepoints = findCriticalChokepoints(map);
+  const controlledChokepoints = findControlledChokepoints(map);
+  const controlledOneTileIds = new Set(
+    controlledChokepoints
+      .filter((chokepoint) => chokepoint.tileIds.length === 1)
+      .map((chokepoint) => chokepoint.tileIds[0]!),
+  );
   const terrainPermille = terrainDistribution(map);
   const totalCells = map.tileIds.length;
   const landRatioPermille = totalCells ? Math.round((map.landCount * 1000) / totalCells) : 0;
@@ -185,8 +289,17 @@ export function analyzeMapFairness(
   if (connected.length !== map.landCount) {
     reasons.push(`${map.landCount - connected.length} land tiles are disconnected`);
   }
-  if (criticalChokepoints.length > 0) {
-    reasons.push("playable land contains a one-tile critical bridge");
+  const uncontrolledCritical = criticalChokepoints.filter((id) => !controlledOneTileIds.has(id));
+  if (uncontrolledCritical.length > 0) {
+    reasons.push("playable land contains an uncontrolled one-tile bridge");
+  }
+  if (controlledChokepoints.length === 0) {
+    reasons.push("playable land lacks a meaningful one- or two-tile gate");
+  }
+  if (controlledChokepoints.length > 6) {
+    reasons.push(
+      `playable land contains ${controlledChokepoints.length} chokepoints; maximum is 6`,
+    );
   }
   if (landRatioPermille < 720 || landRatioPermille > 820) {
     reasons.push(`land ratio ${landRatioPermille}permille is outside 720-820`);
@@ -221,7 +334,10 @@ export function analyzeMapFairness(
           : Math.min(minimum, distance(parseAxialKey(centerId), parseAxialKey(otherId))),
       Number.POSITIVE_INFINITY,
     );
-    const clusterTroops = cluster.reduce((sum, id) => sum + (map.tiles[id]?.troops ?? 0), 0);
+    const clusterTroops = cluster.reduce(
+      (sum, id) => sum + (map.tiles[id] ? totalUnits(map.tiles[id]!.units) : 0),
+      0,
+    );
     const metric: SpawnFairnessMetrics = {
       playerId,
       centerId,
@@ -229,7 +345,7 @@ export function analyzeMapFairness(
       landWithinSix: idsWithinRadius(map, centerId, 6).length,
       openExpansionTiles: outsideClusterExpansion(map, cluster).length,
       neutralDefenseWithinThree: withinThree.reduce(
-        (sum, id) => sum + (map.tiles[id]?.owner === null ? map.tiles[id]!.troops : 0),
+        (sum, id) => sum + (map.tiles[id]?.owner === null ? totalUnits(map.tiles[id]!.units) : 0),
         0,
       ),
       meadowsWithinTwo: withinTwo.filter((id) => map.tiles[id]?.terrain === "meadow").length,
@@ -241,6 +357,14 @@ export function analyzeMapFairness(
       clusterTroops,
     };
     spawnMetrics.push(metric);
+
+    if (
+      controlledChokepoints.some((chokepoint) =>
+        chokepoint.tileIds.some((id) => distance(parseAxialKey(centerId), parseAxialKey(id)) < 3),
+      )
+    ) {
+      reasons.push(`player ${playerId} starts too close to a chokepoint`);
+    }
 
     if (cluster.length !== BALANCE.startingTiles) {
       reasons.push(`player ${playerId} does not have a seven-tile cluster`);
@@ -305,6 +429,7 @@ export function analyzeMapFairness(
     connectedLandCount: connected.length,
     disconnectedLandIds,
     criticalChokepoints,
+    controlledChokepoints,
     minimumSpawnDistance,
     maximumNearestSpawnDistance,
     landRatioPermille,

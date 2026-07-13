@@ -1,12 +1,12 @@
 import type { GameCommand, GameState } from "../../shared/types";
 import {
   canPlaceStructure,
-  canSetBarracksRally,
+  canSetRally,
   cancelConstruction,
   startConstruction,
-  clearBarracksRally,
-  setBarracksRally,
-  toggleBarracksProduction,
+  clearRally,
+  setRally,
+  toggleProduction,
 } from "../buildings";
 import { executeMultiMove, issueMoveOrder, planMultiMove, validateMoveOrder } from "../movement";
 import { applyPlacementCommand, validateSpawnChoice } from "../placement";
@@ -68,29 +68,27 @@ export function validateCommand(state: GameState, command: GameCommand): Command
       }
       return { ok: true };
     }
-    case "toggle-barracks": {
+    case "toggle-production": {
       if (state.phase !== "running") return { ok: false, reason: "Match is not running" };
       const tile = state.map.tiles[command.tileId];
       if (!tile || tile.owner !== command.playerId) {
         return { ok: false, reason: "Tile is not owned by player" };
       }
-      if (!tile.structure || tile.structure.type !== "barracks") {
-        return { ok: false, reason: "Tile has no Barracks" };
-      }
+      if (!tile.structure) return { ok: false, reason: "Tile has no production structure" };
       if (tile.structure.completedCount <= 0 || tile.structure.status === "seized") {
-        return { ok: false, reason: "Barracks is not operational" };
+        return { ok: false, reason: "Production structure is not operational" };
       }
       return { ok: true };
     }
     case "set-rally": {
-      return canSetBarracksRally(state, command.playerId, command.tileId, command.destinationId);
+      return canSetRally(state, command.playerId, command.tileId, command.destinationId);
     }
     case "clear-rally": {
       if (state.phase !== "running") return { ok: false, reason: "Match is not running" };
       const tile = state.map.tiles[command.tileId];
-      return tile?.owner === command.playerId && tile.structure?.type === "barracks"
+      return tile?.owner === command.playerId && tile.structure
         ? { ok: true }
-        : { ok: false, reason: "Tile has no owned Barracks" };
+        : { ok: false, reason: "Tile has no owned production structure" };
     }
   }
 }
@@ -124,11 +122,11 @@ export function applyCommand(state: GameState, command: GameCommand): CommandRes
       return startConstruction(state, command.playerId, command.tileId, command.structure);
     case "cancel-build":
       return cancelConstruction(state, command.playerId, command.tileId);
-    case "toggle-barracks":
-      return toggleBarracksProduction(state, command.playerId, command.tileId);
+    case "toggle-production":
+      return toggleProduction(state, command.playerId, command.tileId);
     case "set-rally":
-      return setBarracksRally(state, command.playerId, command.tileId, command.destinationId);
+      return setRally(state, command.playerId, command.tileId, command.destinationId);
     case "clear-rally":
-      return clearBarracksRally(state, command.playerId, command.tileId);
+      return clearRally(state, command.playerId, command.tileId);
   }
 }

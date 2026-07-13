@@ -3,7 +3,7 @@
 [![CI](https://github.com/enel1221/hexgame/actions/workflows/ci.yml/badge.svg)](https://github.com/enel1221/hexgame/actions/workflows/ci.yml)
 [![Security](https://github.com/enel1221/hexgame/actions/workflows/security.yml/badge.svg)](https://github.com/enel1221/hexgame/actions/workflows/security.yml)
 
-Hex Dominion is a real-time browser strategy game about expanding a local army across a seeded, procedural hex realm. One human commander faces 3–20 deterministic AI rulers on one of three connected map archetypes. Commanders choose their own fair seven-hex opening, move exact-count armies singly or as atomic groups, stack structures up to x99, and fight true multi-ruler battles. Barracks rally trained troops, Turrets defend nearby battles, and a fully sealed pocket falls after a visible 150-tick encirclement.
+Hex Dominion is a real-time browser strategy game about commanding Melee, Ranged, and Wizard armies across a compact seeded hex realm. One human commander faces 3–20 deterministic AI rulers on one of three connected chokepoint archetypes. Commanders choose a fair seven-hex opening, move exact typed armies singly or as atomic groups, stack military structures up to x99, and fight true multi-ruler battles. Wizard beats Melee, Ranged beats Wizard, and Melee beats Ranged. Every producer trains its own type, fortifies its home tile, supports adjacent battles, and can rally new units toward the front.
 
 The game uses a React/vinext-on-Vite application shell, a PixiJS 8 battlefield, a pure TypeScript simulation running at 10 Hz in a Web Worker, and an optional Cloudflare Durable Object command relay for casual room-code multiplayer.
 
@@ -15,9 +15,9 @@ The visual suite writes deterministic, named captures to `docs/screenshots/`. Ru
 | ------------------------------------------------------- | -------------------------------------------------------------- |
 | ![Hex Dominion setup](docs/screenshots/title-setup.png) | ![Hex Dominion active match](docs/screenshots/active-game.png) |
 
-| Heartland                                        | Broken Crown                                           | Highland Basin                                             |
-| ------------------------------------------------ | ------------------------------------------------------ | ---------------------------------------------------------- |
-| ![Heartland](docs/screenshots/map-heartland.png) | ![Broken Crown](docs/screenshots/map-broken-crown.png) | ![Highland Basin](docs/screenshots/map-highland-basin.png) |
+| River Gates                                        | Shattered Crown                                           | Highland Passes                                             |
+| -------------------------------------------------- | --------------------------------------------------------- | ----------------------------------------------------------- |
+| ![River Gates](docs/screenshots/map-heartland.png) | ![Shattered Crown](docs/screenshots/map-broken-crown.png) | ![Highland Passes](docs/screenshots/map-highland-basin.png) |
 
 | Structures                                     | Reinforced battle                                               | Capture transition                                             |
 | ---------------------------------------------- | --------------------------------------------------------------- | -------------------------------------------------------------- |
@@ -95,12 +95,12 @@ The relay is an experimental deterministic command sequencer, not an authoritati
 | Focus canvas, then arrows + Enter/Space | Move the hex cursor and select a source, destination, or Multi tile  |
 | Double-click                            | Center the clicked tile                                              |
 | Right-click or `Esc`                    | Safely cancel selection, build mode, or Multi mode                   |
-| `1`, `2`, `3`, `4`                      | Send 25%, 50%, 75%, or 100% (every source retains one troop)         |
-| `F`, `B`, `T`                           | Build or add a Farm, Barracks, or Turret copy                        |
-| Barracks **Set/Clear Rally Point**      | Route only newly trained troops to a persistent destination          |
+| `1`, `2`, `3`, `4`                      | Send 25%, 50%, 75%, or 100% (every source retains one unit)          |
+| `B`, `R`, `T`                           | Build/add a Barracks, Archery Range, or Wizard Tower copy            |
+| Producer **Set/Clear Rally Point**      | Route only newly trained typed units to a persistent destination     |
 | `Space`                                 | Pause/resume single-player                                           |
 
-The HUD also provides pause, 1x, 2x, and 4x controls. Farm placement requires an owned Fertile Meadow; Barracks require an owned Muster Ground; Turrets allow any owned land tile. A tile may hold x1 through x99 completed copies of one structure type, with at most one additional copy under construction; structure types never mix on one tile.
+The HUD also provides pause, 1x, 2x, and 4x controls. Barracks require an owned Muster Ground and train Melee; Archery Ranges require an owned Fertile Meadow and train Ranged; Wizard Towers train Wizards on any owned land. A tile may hold x1 through x99 completed copies of one structure type, with at most one additional copy under construction; structure types never mix on one tile. Exact M/R/W counts remain visible in the tile inspector, moving-army plates, and battle details.
 
 ## Test and verify
 
@@ -157,7 +157,7 @@ Read [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) before deploying; it covers creden
 - Multiplayer is a casual alpha. The relay validates identity, ordering, and message shape, but each browser simulates the match and a modified client can cheat.
 - Rooms are ephemeral and expire; there is no account system, matchmaking, spectator mode, chat, or permanent replay archive.
 - Local autosaves are browser-local, schema-versioned snapshots. Clearing site storage removes them.
-- Large 21-player maps have a heavier initial generation/render cost than ordinary 4–8-player matches.
+- A 21-player match still has a heavier initial generation/render cost than an ordinary 4–8-player match, although the compact cap is now 1,092 land tiles.
 - The MVP has no teams, alliances, diplomacy, fog of war, naval units, campaign, or ranked play.
 
 Hex Dominion is available under the [MIT License](LICENSE).

@@ -471,13 +471,16 @@ test("captures deterministic structures, combat, capture, and victory fixtures",
       )
       .map((tile) => tile.structure!.type)
       .sort(),
-  ).toEqual(["barracks", "farm", "turret"]);
+  ).toEqual(["archery-range", "barracks", "wizard-tower"]);
   const pendingStructure = structures.map.tiles.find(
     (tile) => tile.structure?.pendingProgressTicks !== null && tile.structure !== null,
   );
   expect(pendingStructure).toBeTruthy();
   await selectTile(page, pendingStructure!.id);
   await expect(page.getByTestId("structure-progress-text")).toContainText(/Construction 50%/i);
+  await expect(page.getByTestId("tile-unit-roster")).toContainText(/Melee/i);
+  await expect(page.getByTestId("tile-unit-roster")).toContainText(/Ranged/i);
+  await expect(page.getByTestId("tile-unit-roster")).toContainText(/Wizard/i);
   await capture(page, "structures.png", { hideDebug: true });
 
   const battle = await loadDebugScenario(page, "battle");
@@ -493,12 +496,29 @@ test("captures deterministic structures, combat, capture, and victory fixtures",
         .battles.some(
           (candidate) =>
             candidate.id === battleId &&
-            candidate.actual === 0.5 &&
-            Math.abs(candidate.displayed - 0.5) < 0.001,
+            candidate.actual > 0.5 &&
+            Math.abs(candidate.displayed - candidate.actual) < 0.001,
         ),
     battle.battles[0]!.id,
   );
-  await capture(page, "battle-50-50.png", { hideDebug: true });
+  await inspectTile(page, battle.battles[0]!.tileId);
+  await expect(page.getByTestId("battle-participant-roster")).toContainText(/Type advantage/i);
+  await expect(
+    page
+      .getByTestId("battle-participant-roster")
+      .getByLabel(/Melee.*Ranged.*Wizard/i)
+      .first(),
+  ).toBeVisible();
+  await capture(page, "battle-rps-counter.png", { hideDebug: true });
+
+  const typedSupport = await loadDebugScenario(page, "battle-minimum");
+  expect(
+    typedSupport.map.tiles.find((tile) => tile.id === typedSupport.battles[0]!.tileId)?.structure
+      ?.type,
+  ).toBe("wizard-tower");
+  await inspectTile(page, typedSupport.battles[0]!.tileId);
+  await expect(page.getByTestId("battle-participant-roster")).toContainText(/Typed support/i);
+  await capture(page, "battle-typed-support.png", { hideDebug: true });
 
   const captureBefore = await loadDebugScenario(page, "capture-before");
   expect(captureBefore.battles[0]?.actualControl).toBe(9_900);
@@ -522,7 +542,10 @@ test("captures deterministic structures, combat, capture, and victory fixtures",
   expect(nWay.battles[0]?.participants).toHaveLength(3);
   await inspectTile(page, nWay.battles[0]!.tileId);
   await expect(page.getByTestId("battle-participant-roster").getByRole("listitem")).toHaveCount(3);
-  await capture(page, "battle-three-factions.png", { hideDebug: true });
+  await expect(
+    page.getByTestId("battle-participant-roster").getByLabel(/Melee.*Ranged.*Wizard/i),
+  ).toHaveCount(3);
+  await capture(page, "battle-mixed-n-way.png", { hideDebug: true });
 
   const enclosure = await loadDebugScenario(page, "interior-build");
   expect(enclosure.enclosures).toHaveLength(1);

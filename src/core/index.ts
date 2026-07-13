@@ -13,4 +13,5 @@ export * from "./movement";
 export * from "./placement";
 export * from "./rewards";
 export * from "./rng";
+export * from "./units";
 export * from "./victory";

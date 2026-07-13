@@ -2,12 +2,15 @@ import { describe, expect, it } from "vitest";
 import type { EngineSnapshot, WorkerResponse } from "../../src/shared/types";
 import {
   cloneDeterministic,
+  emptyUnits,
   hashGameState,
   importSnapshot,
   parseEngineSnapshot,
   SnapshotValidationError,
   stableHash,
+  totalUnits,
 } from "../../src/core";
+import { BALANCE } from "../../src/shared/balance";
 import { SimulationWorkerController } from "../../src/worker";
 import { createRunningGame, TEST_CONFIG } from "./fixtures";
 
@@ -17,13 +20,258 @@ function validSnapshot(): EngineSnapshot {
   return engine.exportSnapshot();
 }
 
+function snapshotWithBattle(): EngineSnapshot {
+  const snapshot = validSnapshot();
+  const occupiedTile = snapshot.state.map.landIds
+    .map((id) => snapshot.state.map.tiles[id]!)
+    .find(
+      (tile) =>
+        tile.owner !== null && !snapshot.state.battles.some((battle) => battle.tileId === tile.id),
+    )!;
+  const units = occupiedTile.units;
+  occupiedTile.units = emptyUnits();
+  snapshot.state.battles.push({
+    id: snapshot.state.nextEntityId,
+    tileId: occupiedTile.id,
+    incumbentOwner: occupiedTile.owner,
+    participants: [
+      {
+        playerId: occupiedTile.owner,
+        units,
+        control: 10_000,
+        casualtyProgressMilli: emptyUnits(),
+        entryFrom: occupiedTile.id,
+        joinedTick: snapshot.state.tick,
+        lastReinforcementTick: -1,
+        reinforcementAmount: 0,
+      },
+    ],
+    ageTicks: BALANCE.minimumBattleTicks,
+    roundAccumulator: 0,
+  });
+  snapshot.state.nextEntityId += 1;
+  snapshot.state.stateHash = hashGameState(snapshot.state);
+  return snapshot;
+}
+
+function asVersion2Snapshot(snapshot: EngineSnapshot): unknown {
+  const migrateCommand = (command: EngineSnapshot["commandHistory"][number]): unknown => {
+    if (command.type === "build") {
+      const structure =
+        command.structure === "archery-range"
+          ? "farm"
+          : command.structure === "wizard-tower"
+            ? "turret"
+            : "barracks";
+      return { ...command, structure };
+    }
+    if (command.type === "toggle-production") {
+      return { ...command, type: "toggle-barracks" };
+    }
+    return command;
+  };
+  const state = {
+    ...snapshot.state,
+    version: 2,
+    map: {
+      ...snapshot.state.map,
+      tiles: Object.fromEntries(
+        Object.entries(snapshot.state.map.tiles).map(([id, tile]) => {
+          const type =
+            tile.structure?.type === "archery-range"
+              ? "farm"
+              : tile.structure?.type === "wizard-tower"
+                ? "turret"
+                : tile.structure?.type;
+          return [
+            id,
+            {
+              id: tile.id,
+              q: tile.q,
+              r: tile.r,
+              terrain: tile.terrain,
+              owner: tile.owner,
+              troops: totalUnits(tile.units),
+              structure: tile.structure
+                ? {
+                    type,
+                    completedCount: tile.structure.completedCount,
+                    status: tile.structure.status,
+                    integrity: tile.structure.integrity,
+                    pendingProgressTicks: tile.structure.pendingProgressTicks,
+                    seizedTicks: tile.structure.seizedTicks,
+                    productionPaused: tile.structure.productionPaused,
+                    barracksProgressMilli:
+                      tile.structure.type === "barracks" ? tile.structure.trainingProgressMilli : 0,
+                    rallyTargetId: tile.structure.rallyTargetId,
+                    rallyQueuedTroops: totalUnits(tile.structure.rallyQueuedUnits),
+                    turretShotProgressMilli:
+                      tile.structure.type === "wizard-tower"
+                        ? Math.floor((tile.structure.trainingProgressMilli * 30) / 25)
+                        : 0,
+                  }
+                : null,
+              controlledSinceTick: tile.controlledSinceTick,
+              lastRewardTick: tile.lastRewardTick,
+              decorationSeed: tile.decorationSeed,
+            },
+          ];
+        }),
+      ),
+    },
+    stacks: snapshot.state.stacks.map((stack) => ({
+      id: stack.id,
+      owner: stack.owner,
+      troops: totalUnits(stack.units),
+      path: stack.path,
+      pathIndex: stack.pathIndex,
+      segmentProgress: stack.segmentProgress,
+      segmentDuration: stack.segmentDuration,
+      originId: stack.originId,
+      destinationId: stack.destinationId,
+      lane: stack.lane,
+      issuedTick: stack.issuedTick,
+    })),
+    battles: snapshot.state.battles.map((battle) => ({
+      id: battle.id,
+      tileId: battle.tileId,
+      incumbentOwner: battle.incumbentOwner,
+      participants: battle.participants.map((participant) => ({
+        playerId: participant.playerId,
+        troops: totalUnits(participant.units),
+        control: participant.control,
+        casualtyProgressMilli: Math.min(999, totalUnits(participant.casualtyProgressMilli)),
+        entryFrom: participant.entryFrom,
+        joinedTick: participant.joinedTick,
+        lastReinforcementTick: participant.lastReinforcementTick,
+        reinforcementAmount: participant.reinforcementAmount,
+      })),
+      ageTicks: battle.ageTicks,
+      roundAccumulator: battle.roundAccumulator,
+    })),
+    events: snapshot.state.events.filter((event) => event.type !== "typed-support"),
+    stateHash: "",
+  } as Record<string, unknown> & { stateHash: string };
+  state.stateHash = hashGameState(state as unknown as EngineSnapshot["state"]);
+  return {
+    state,
+    commandHistory: snapshot.commandHistory.map(migrateCommand),
+    pendingCommands: snapshot.pendingCommands?.map(migrateCommand),
+  };
+}
+
 describe("runtime EngineSnapshot validation", () => {
-  it("accepts and restores a complete version-2 snapshot", () => {
+  it("accepts and restores a complete version-3 snapshot", () => {
     const snapshot = validSnapshot();
     expect(parseEngineSnapshot(snapshot)).toEqual(snapshot);
     const restored = importSnapshot(snapshot);
     expect(restored.state.stateHash).toBe(snapshot.state.stateHash);
     expect(restored.state.tick).toBe(snapshot.state.tick);
+  });
+
+  it("strictly verifies and migrates a complete version-2 snapshot", () => {
+    const current = validSnapshot();
+    const migrated = parseEngineSnapshot(asVersion2Snapshot(current));
+    expect(migrated.state.version).toBe(3);
+    expect(migrated.state.tick).toBe(current.state.tick);
+    expect(migrated.state.players.map((player) => player.troopCount)).toEqual(
+      current.state.players.map((player) => player.troopCount),
+    );
+    expect(parseEngineSnapshot(migrated)).toEqual(migrated);
+  });
+
+  it("preserves a blocked version-2 Barracks rally queue as Melee", () => {
+    const legacy = asVersion2Snapshot(validSnapshot()) as {
+      state: EngineSnapshot["state"] & {
+        map: EngineSnapshot["state"]["map"] & {
+          tiles: Record<
+            string,
+            {
+              troops: number;
+              structure: null | {
+                type: "farm" | "barracks" | "turret";
+                rallyTargetId: string | null;
+                rallyQueuedTroops: number;
+              };
+            }
+          >;
+        };
+      };
+    };
+    const [tileId, tile] = Object.entries(legacy.state.map.tiles).find(
+      ([, candidate]) => candidate.structure?.type === "barracks" && candidate.troops >= 2,
+    )!;
+    const targetId = legacy.state.map.landIds.find((id) => id !== tileId)!;
+    const queuedTroops = Math.min(5, tile.troops);
+    tile.structure!.rallyTargetId = targetId;
+    tile.structure!.rallyQueuedTroops = queuedTroops;
+    legacy.state.stateHash = hashGameState(legacy.state);
+
+    const migrated = parseEngineSnapshot(legacy);
+    const migratedTile = migrated.state.map.tiles[tileId]!;
+    expect(totalUnits(migratedTile.units)).toBe(tile.troops);
+    expect(migratedTile.structure?.rallyQueuedUnits).toEqual({
+      melee: queuedTroops,
+      ranged: 0,
+      wizard: 0,
+    });
+
+    const malformed = cloneDeterministic(legacy);
+    malformed.state.map.tiles[tileId]!.structure!.rallyQueuedTroops = tile.troops + 1;
+    malformed.state.stateHash = hashGameState(malformed.state);
+    expect(() => parseEngineSnapshot(malformed)).toThrow(/rallyQueuedTroops.*retained local/i);
+  });
+
+  it("rejects hash-consistent combat accumulators outside runtime bounds", () => {
+    const casualty = snapshotWithBattle();
+    casualty.state.battles.at(-1)!.participants[0]!.casualtyProgressMilli.melee = 1_000;
+    casualty.state.stateHash = hashGameState(casualty.state);
+    expect(() => parseEngineSnapshot(casualty)).toThrow(/casualtyProgressMilli\.melee/i);
+
+    const rounds = snapshotWithBattle();
+    rounds.state.battles.at(-1)!.roundAccumulator = BALANCE.combatRoundTicks;
+    rounds.state.stateHash = hashGameState(rounds.state);
+    expect(() => parseEngineSnapshot(rounds)).toThrow(/roundAccumulator/i);
+  });
+
+  it("rejects hash-consistent structure timers outside their runtime phase", () => {
+    const training = validSnapshot();
+    const trainingTile = Object.values(training.state.map.tiles).find(
+      (tile) => tile.structure !== null,
+    )!;
+    trainingTile.structure!.trainingProgressMilli = 999_999_999;
+    training.state.stateHash = hashGameState(training.state);
+    expect(() => parseEngineSnapshot(training)).toThrow(/trainingProgressMilli/i);
+
+    const construction = validSnapshot();
+    const constructionTile = Object.values(construction.state.map.tiles).find(
+      (tile) => tile.structure !== null,
+    )!;
+    const constructionTiming =
+      constructionTile.structure!.type === "barracks"
+        ? BALANCE.barracks
+        : constructionTile.structure!.type === "archery-range"
+          ? BALANCE.archeryRange
+          : BALANCE.wizardTower;
+    constructionTile.structure!.pendingProgressTicks = constructionTiming.buildTicks;
+    construction.state.stateHash = hashGameState(construction.state);
+    expect(() => parseEngineSnapshot(construction)).toThrow(/pendingProgressTicks/i);
+
+    const seizure = validSnapshot();
+    const seizureTile = Object.values(seizure.state.map.tiles).find(
+      (tile) => tile.structure !== null,
+    )!;
+    Object.assign(seizureTile.structure!, {
+      status: "seized",
+      pendingProgressTicks: null,
+      integrity: BALANCE.seizedIntegrity,
+      seizedTicks: BALANCE.seizedTicks,
+      trainingProgressMilli: 0,
+      rallyTargetId: null,
+      rallyQueuedUnits: emptyUnits(),
+    });
+    seizure.state.stateHash = hashGameState(seizure.state);
+    expect(() => parseEngineSnapshot(seizure)).toThrow(/seizedTicks/i);
   });
 
   it("accepts a multiplayer checkpoint with multiple configured human seats", () => {
@@ -43,17 +291,21 @@ describe("runtime EngineSnapshot validation", () => {
     const snapshot = validSnapshot();
     const tile = snapshot.state.map.tiles[snapshot.state.map.spawnCenters[0]!]!;
     const destinationId = snapshot.state.map.spawnClusters[0]!.find((id) => id !== tile.id)!;
-    tile.troops = Math.max(tile.troops, 4);
+    tile.units.melee = Math.max(tile.units.melee, 4);
     tile.structure!.rallyTargetId = destinationId;
-    tile.structure!.rallyQueuedTroops = 3;
+    tile.structure!.rallyQueuedUnits = { melee: 3, ranged: 0, wizard: 0 };
     snapshot.state.stateHash = hashGameState(snapshot.state);
     expect(parseEngineSnapshot(snapshot)).toEqual(snapshot);
 
     const impossible = cloneDeterministic(snapshot);
-    impossible.state.map.tiles[tile.id]!.structure!.rallyQueuedTroops = tile.troops + 1;
+    impossible.state.map.tiles[tile.id]!.structure!.rallyQueuedUnits = {
+      melee: tile.units.melee + 1,
+      ranged: 0,
+      wizard: 0,
+    };
     impossible.state.stateHash = hashGameState(impossible.state);
     expect(() => parseEngineSnapshot(impossible)).toThrow(
-      /rallyQueuedTroops.*retained local troops/i,
+      /rallyQueuedUnits.*retained local units/i,
     );
   });
 
@@ -102,7 +354,7 @@ describe("runtime EngineSnapshot validation", () => {
     const malformed = cloneDeterministic(validSnapshot()) as unknown as {
       state: { version: number };
     };
-    malformed.state.version = 3;
+    malformed.state.version = 4;
     expect(() => parseEngineSnapshot(malformed)).toThrow("Unsupported snapshot version");
   });
 
@@ -211,26 +463,55 @@ describe("runtime EngineSnapshot validation", () => {
       map: {
         ...current.state.map,
         tiles: Object.fromEntries(
-          Object.entries(current.state.map.tiles).map(([id, tile]) => [
-            id,
-            {
-              ...tile,
-              structure: tile.structure
-                ? {
-                    type: tile.structure.type,
-                    status: tile.structure.status ?? "constructing",
-                    integrity: tile.structure.integrity,
-                    progressTicks:
-                      tile.structure.pendingProgressTicks ??
-                      Math.floor(tile.structure.barracksProgressMilli / 1_000),
-                    seizedTicks: tile.structure.seizedTicks,
-                    productionPaused: tile.structure.productionPaused,
-                  }
-                : null,
-            },
-          ]),
+          Object.entries(current.state.map.tiles).map(([id, tile]) => {
+            const legacyType =
+              tile.structure?.type === "archery-range"
+                ? "farm"
+                : tile.structure?.type === "wizard-tower"
+                  ? "turret"
+                  : tile.structure?.type;
+            return [
+              id,
+              {
+                id: tile.id,
+                q: tile.q,
+                r: tile.r,
+                terrain: tile.terrain,
+                owner: tile.owner,
+                troops: totalUnits(tile.units),
+                structure: tile.structure
+                  ? {
+                      type: legacyType,
+                      status: tile.structure.status ?? "constructing",
+                      integrity: tile.structure.integrity,
+                      progressTicks:
+                        tile.structure.pendingProgressTicks ??
+                        Math.floor(tile.structure.trainingProgressMilli / 1_000),
+                      seizedTicks: tile.structure.seizedTicks,
+                      productionPaused: tile.structure.productionPaused,
+                    }
+                  : null,
+                controlledSinceTick: tile.controlledSinceTick,
+                lastRewardTick: tile.lastRewardTick,
+                decorationSeed: tile.decorationSeed,
+              },
+            ];
+          }),
         ),
       },
+      stacks: current.state.stacks.map((stack) => ({
+        id: stack.id,
+        owner: stack.owner,
+        troops: totalUnits(stack.units),
+        path: stack.path,
+        pathIndex: stack.pathIndex,
+        segmentProgress: stack.segmentProgress,
+        segmentDuration: stack.segmentDuration,
+        originId: stack.originId,
+        destinationId: stack.destinationId,
+        lane: stack.lane,
+        issuedTick: stack.issuedTick,
+      })),
       events: [],
       stateHash: "",
     };
@@ -303,15 +584,16 @@ describe("runtime EngineSnapshot validation", () => {
       commandHistory: [],
       pendingCommands: [],
     });
-    expect(migrated.state.version).toBe(2);
+    expect(migrated.state.version).toBe(3);
     expect(migrated.state.phase).toBe("running");
     expect(migrated.state.config.startingCenters).toEqual(migrated.state.map.spawnCenters);
     expect(migrated.state.map.tiles[migrated.state.map.spawnCenters[0]!]!.structure).toMatchObject({
       completedCount: 1,
       pendingProgressTicks: null,
-      rallyQueuedTroops: 0,
+      rallyQueuedUnits: { melee: 0, ranged: 0, wizard: 0 },
     });
     expect(migrated.state.map.tiles[pendingTileId]!.structure).toMatchObject({
+      type: "archery-range",
       completedCount: 0,
       status: null,
       pendingProgressTicks: 17,
@@ -320,9 +602,14 @@ describe("runtime EngineSnapshot validation", () => {
       incumbentOwner: 0,
       ageTicks: 5,
       participants: [
-        { playerId: 0, troops: 6, control: 4_000 },
-        { playerId: 1, troops: 8, control: 6_000, reinforcementAmount: 2 },
-        { playerId: 2, troops: 20, control: 5_000 },
+        { playerId: 0, units: { melee: 2, ranged: 2, wizard: 2 }, control: 4_000 },
+        {
+          playerId: 1,
+          units: { melee: 3, ranged: 3, wizard: 2 },
+          control: 6_000,
+          reinforcementAmount: 2,
+        },
+        { playerId: 2, units: { melee: 7, ranged: 7, wizard: 6 }, control: 5_000 },
       ],
     });
     expect(parseEngineSnapshot(migrated)).toEqual(migrated);

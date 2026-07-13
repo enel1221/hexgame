@@ -12,15 +12,11 @@ export const BALANCE = {
   maxStructureCount: 99,
   maxMultiMoveSources: 64,
   maxMultiMoveDestinations: 16,
-  landPerPlayer: 95,
-  minLand: 380,
-  maxLand: 2100,
-  tileIncomeMilliPerSecond: 35,
-  farm: {
-    costMilli: 45 * SUPPLY_SCALE,
-    buildTicks: 6 * TICKS_PER_SECOND,
-    incomeMilliPerSecond: 1100,
-  },
+  landPerPlayer: 52,
+  minLand: 180,
+  maxLand: 1092,
+  passiveIncomeMilliPerSecond: 1 * SUPPLY_SCALE,
+  tileIncomeMilliPerSecond: 50,
   barracks: {
     costMilli: 70 * SUPPLY_SCALE,
     buildTicks: 8 * TICKS_PER_SECOND,
@@ -28,15 +24,26 @@ export const BALANCE = {
     troopCostMilli: 1000,
     localTarget: 40,
   },
-  turret: {
+  archeryRange: {
+    costMilli: 75 * SUPPLY_SCALE,
+    buildTicks: 9 * TICKS_PER_SECOND,
+    trainTicks: 25,
+    troopCostMilli: 1000,
+    localTarget: 40,
+  },
+  wizardTower: {
     costMilli: 90 * SUPPLY_SCALE,
     buildTicks: 10 * TICKS_PER_SECOND,
-    virtualDefendersPerCopy: 3,
-    baseDefensePermille: 180,
-    additionalDefensePermille: 20,
-    maxDefensePermille: 500,
-    shotTicks: 30,
+    trainTicks: 25,
+    troopCostMilli: 1000,
+    localTarget: 40,
   },
+  localSupportPerCopyMilli: 2 * 1000,
+  localSupportCapMilli: 12 * 1000,
+  adjacentSupportPerCopyMilli: 1 * 1000,
+  adjacentSupportSourceCapMilli: 6 * 1000,
+  adjacentSupportBattleCapMilli: 12 * 1000,
+  rpsAdvantagePermille: 1_500,
   cancelRefundPermille: 650,
   seizedTicks: 6 * TICKS_PER_SECOND,
   repairTicks: 12 * TICKS_PER_SECOND,
@@ -51,10 +58,11 @@ export const BALANCE = {
   minimumBattleTicks: 35,
   battleBaseControlPerRound: 100,
   battleAdvantageControlPerRound: 225,
-  captureRewardMilli: 3 * SUPPLY_SCALE,
-  farmCaptureRewardMilli: 6 * SUPPLY_SCALE,
-  barracksCaptureRewardMilli: 10 * SUPPLY_SCALE,
-  turretCaptureRewardMilli: 8 * SUPPLY_SCALE,
+  neutralCaptureRewardMilli: 2 * SUPPLY_SCALE,
+  captureRewardMilli: 5 * SUPPLY_SCALE,
+  barracksCaptureRewardMilli: 8 * SUPPLY_SCALE,
+  archeryRangeCaptureRewardMilli: 8 * SUPPLY_SCALE,
+  wizardTowerCaptureRewardMilli: 10 * SUPPLY_SCALE,
   rewardCooldownTicks: 45 * TICKS_PER_SECOND,
   minimumOwnershipRewardTicks: 20 * TICKS_PER_SECOND,
   encirclementTicks: 15 * TICKS_PER_SECOND,
@@ -66,6 +74,13 @@ export const BALANCE = {
   autosaveTicks: 15 * TICKS_PER_SECOND,
   maxRecentEvents: 24,
 } as const;
+
+export function targetLandCount(totalPlayers: number): number {
+  if (!Number.isInteger(totalPlayers) || totalPlayers <= 0) {
+    throw new Error("totalPlayers must be a positive integer");
+  }
+  return Math.max(BALANCE.minLand, Math.min(BALANCE.maxLand, totalPlayers * BALANCE.landPerPlayer));
+}
 
 export const TERRAIN_DISTRIBUTION = {
   meadow: [180, 230],

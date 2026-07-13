@@ -7,6 +7,7 @@ import {
   isStructureOperational,
 } from "@/src/core/buildings";
 import { battlePresentation } from "@/src/core/combat";
+import { emptyUnits, formatUnits, totalUnits, UNIT_TYPES } from "@/src/core/units";
 import { placementPresentationSignature } from "../placementSignature";
 import { axialKey, axialToPixel, neighbors, pixelToAxial } from "@/src/core/hex";
 import { eligibleSpawnCenters } from "@/src/core/map";
@@ -19,12 +20,23 @@ import type {
   StructureState,
   StructureType,
   TileState,
+  UnitCounts,
+  UnitType,
 } from "@/src/shared/types";
 import { bindWebGlContextRecovery, type RendererContextStatus } from "./contextRecovery";
 
-const HEX_SIZE = 36;
-const BAR_WIDTH = 92;
+const HEX_SIZE = 44;
+const MIN_ZOOM = 0.13;
+const MAX_ZOOM = 1.6;
+const FOCUS_MIN_ZOOM = 0.34;
+const FOCUS_MAX_ZOOM = 1.35;
+const BAR_WIDTH = 148;
 const BAR_HEIGHT = 12;
+const UNIT_COLORS: Record<UnitType, number> = {
+  melee: 0xe7bd68,
+  ranged: 0x68c8ad,
+  wizard: 0xb692ef,
+};
 
 type TileCallback = (tileId: string | null) => void;
 
@@ -47,7 +59,7 @@ interface StackVisual {
   container: Container;
   squad: SoldierVisual[];
   dust: Graphics;
-  badge: BitmapText;
+  unitPlate: UnitPlateVisual;
   lastX: number;
   lastY: number;
   targetX: number;
@@ -82,7 +94,17 @@ interface BattleSegmentVisual {
   displayed: number;
   ghost: number;
   troops: number;
-  turretSupportCount: number;
+  units: UnitCounts;
+  effectivePowerByType: UnitCounts;
+  localSupportPower: UnitCounts;
+  adjacentSupportPower: UnitCounts;
+  rpsMultiplierPermille: number;
+}
+
+interface UnitPlateVisual {
+  container: Container;
+  counts: Record<UnitType, BitmapText>;
+  signature: string;
 }
 
 interface BattleVisual {
@@ -161,6 +183,79 @@ function formatTroops(value: number): string {
   return `${(value / 1000).toFixed(value >= 10_000 ? 0 : 1)}k`;
 }
 
+function unitSignature(units: UnitCounts): string {
+  return `${units.melee}:${units.ranged}:${units.wizard}`;
+}
+
+function drawUnitGlyph(type: UnitType, size = 7): Graphics {
+  const graphics = new Graphics();
+  const color = UNIT_COLORS[type];
+  if (type === "melee") {
+    graphics
+      .moveTo(-size * 0.48, size * 0.48)
+      .lineTo(size * 0.35, -size * 0.55)
+      .stroke({ color, width: 1.7, cap: "round" })
+      .poly([size * 0.28, -size * 0.66, size * 0.52, -size * 0.38, size * 0.15, -size * 0.32])
+      .fill({ color })
+      .moveTo(-size * 0.42, size * 0.18)
+      .lineTo(-size * 0.1, size * 0.48)
+      .stroke({ color: 0xf4e5bd, width: 1.25 });
+  } else if (type === "ranged") {
+    graphics
+      .arc(-size * 0.15, 0, size * 0.55, -Math.PI / 2, Math.PI / 2)
+      .stroke({ color, width: 1.5 })
+      .moveTo(-size * 0.15, -size * 0.55)
+      .lineTo(-size * 0.15, size * 0.55)
+      .moveTo(-size * 0.55, 0)
+      .lineTo(size * 0.55, 0)
+      .stroke({ color: 0xe9e0c6, width: 1.15 })
+      .poly([size * 0.58, 0, size * 0.3, -size * 0.16, size * 0.32, size * 0.16])
+      .fill({ color });
+  } else {
+    graphics
+      .star(0, 0, 4, size * 0.58, size * 0.23, Math.PI / 4)
+      .fill({ color })
+      .circle(0, 0, size * 0.16)
+      .fill({ color: 0xf6e7ff });
+  }
+  return graphics;
+}
+
+function createUnitPlate(units: UnitCounts, scale = 1): UnitPlateVisual {
+  const container = new Container();
+  const width = 72;
+  const back = new Graphics()
+    .roundRect(-width / 2, -9, width, 18, 6)
+    .fill({ color: 0x081117, alpha: 0.96 })
+    .stroke({ color: 0xd8c18d, width: 1, alpha: 0.74 });
+  container.addChild(back);
+  const counts = {} as Record<UnitType, BitmapText>;
+  UNIT_TYPES.forEach((type, index) => {
+    const x = -25 + index * 25;
+    if (index > 0) {
+      container.addChild(
+        new Graphics().rect(x - 12.5, -6, 1, 12).fill({ color: 0xd8c18d, alpha: 0.18 }),
+      );
+    }
+    const glyph = drawUnitGlyph(type, 6);
+    glyph.position.set(x - 5, 0);
+    const count = createBadge(formatTroops(units[type]), 9);
+    count.anchor.set(0, 0.5);
+    count.position.set(x + 2, 0);
+    container.addChild(glyph, count);
+    counts[type] = count;
+  });
+  container.scale.set(scale);
+  return { container, counts, signature: unitSignature(units) };
+}
+
+function updateUnitPlate(plate: UnitPlateVisual, units: UnitCounts): void {
+  const signature = unitSignature(units);
+  if (signature === plate.signature) return;
+  plate.signature = signature;
+  for (const type of UNIT_TYPES) plate.counts[type].text = formatTroops(units[type]);
+}
+
 function garrisonTier(troops: number): number {
   if (troops >= 96) return 5;
   if (troops >= 48) return 4;
@@ -183,11 +278,11 @@ function createBadge(text: string, size = 12): BitmapText {
 }
 
 function structureBuildTicks(type: StructureType): number {
-  return type === "farm"
-    ? BALANCE.farm.buildTicks
-    : type === "barracks"
-      ? BALANCE.barracks.buildTicks
-      : BALANCE.turret.buildTicks;
+  return type === "barracks"
+    ? BALANCE.barracks.buildTicks
+    : type === "archery-range"
+      ? BALANCE.archeryRange.buildTicks
+      : BALANCE.wizardTower.buildTicks;
 }
 
 function structurePendingProgress(structure: StructureState): number {
@@ -426,7 +521,7 @@ function drawFoundation(type: StructureType): Container {
     .lineTo(14, 3)
     .stroke({ color: 0x5f4933, width: 2 });
   scaffold.moveTo(-11, -12).lineTo(10, -12).stroke({ color: 0xc29358, width: 1.5 });
-  const marker = createBadge(type === "farm" ? "F" : type === "barracks" ? "B" : "T", 9);
+  const marker = createBadge(type === "barracks" ? "B" : type === "archery-range" ? "A" : "W", 9);
   marker.position.set(0, 4);
   container.addChild(base, scaffold, marker);
   return container;
@@ -457,40 +552,7 @@ function createStructureVisual(structure: StructureState, color: number): Struct
   const shadow = new Graphics().ellipse(0, 12, 22, 8).fill({ color: 0x071017, alpha: 0.48 });
   container.addChild(shadow);
 
-  if (structure.type === "farm") {
-    const field = new Graphics();
-    for (let row = -2; row <= 2; row += 1) {
-      field
-        .moveTo(-23, 7 + row * 3)
-        .lineTo(-7, 1 + row * 3)
-        .stroke({ color: 0xd0b65d, width: 1.6, alpha: 0.85 });
-    }
-    const barn = new Graphics()
-      .roundRect(-9, -9, 20, 21, 2)
-      .fill({ color: 0xa44f3e })
-      .stroke({ color: 0xf0c79c, width: 1.2 })
-      .poly([-12, -8, 1, -20, 14, -8])
-      .fill({ color: 0x593d32 })
-      .stroke({ color: 0xc18d62, width: 1 })
-      .roundRect(-2, 2, 7, 10, 1)
-      .fill({ color: 0x4b352b });
-    const tower = new Graphics()
-      .roundRect(13, -13, 6, 24, 2)
-      .fill({ color: 0xc9b98f })
-      .stroke({ color: 0x5c5142, width: 1 });
-    const blades = new Graphics();
-    for (let blade = 0; blade < 4; blade += 1) {
-      const angle = blade * (Math.PI / 2) - Math.PI / 2;
-      const tipX = Math.cos(angle) * 10;
-      const tipY = Math.sin(angle) * 10;
-      const wingX = Math.cos(angle + 0.38) * 7;
-      const wingY = Math.sin(angle + 0.38) * 7;
-      blades.poly([0, 0, tipX, tipY, wingX, wingY]).fill({ color: 0xe5d4a7, alpha: 0.95 });
-    }
-    blades.position.set(16, -11);
-    animated = blades;
-    container.addChild(field, barn, tower, blades);
-  } else if (structure.type === "barracks") {
+  if (structure.type === "barracks") {
     const yard = new Graphics()
       .poly([-22, 11, -17, -9, 17, -9, 22, 11])
       .fill({ color: 0x796047 })
@@ -514,35 +576,64 @@ function createStructureVisual(structure: StructureState, color: number): Struct
       .stroke({ color: lighten(color, 35), width: 0.8 });
     animated = flag;
     container.addChild(yard, keep, flag);
+  } else if (structure.type === "archery-range") {
+    const yard = new Graphics()
+      .poly([-23, 11, -19, -7, 19, -7, 23, 11])
+      .fill({ color: 0x6f6046 })
+      .stroke({ color: 0xd9c59b, width: 1.1 });
+    for (let lane = -1; lane <= 1; lane += 1) {
+      yard
+        .moveTo(-18, 7 + lane * 5)
+        .lineTo(8, 1 + lane * 5)
+        .stroke({ color: 0xcbb575, width: 1.2, alpha: 0.75 });
+    }
+    const shelter = new Graphics()
+      .roundRect(-15, -12, 19, 20, 2)
+      .fill({ color: 0x80553d })
+      .stroke({ color: 0xe3c59b, width: 1.1 })
+      .poly([-18, -11, -5, -22, 8, -11])
+      .fill({ color: 0x3e4b3b });
+    const targets = new Graphics();
+    for (const y of [-12, 2]) {
+      targets
+        .circle(16, y, 6)
+        .fill({ color: 0xe4d7b4 })
+        .stroke({ color: 0x4c3a2d, width: 1.2 })
+        .circle(16, y, 2.3)
+        .fill({ color: UNIT_COLORS.ranged });
+    }
+    const arrow = new Graphics()
+      .moveTo(-6, 0)
+      .lineTo(17, 0)
+      .stroke({ color: 0xefe3bd, width: 1.6 })
+      .poly([20, 0, 14, -3, 15, 3])
+      .fill({ color: UNIT_COLORS.ranged });
+    arrow.position.set(-2, -17);
+    animated = arrow;
+    container.addChild(yard, shelter, targets, arrow);
   } else {
     const tower = new Graphics()
-      .poly([-15, 12, -12, -10, -7, -15, 8, -15, 13, -10, 16, 12])
-      .fill({ color: 0x777b79 })
-      .stroke({ color: 0xd0c7ad, width: 1.3 })
-      .rect(-16, -17, 32, 7)
-      .fill({ color: 0x555b59 })
-      .stroke({ color: 0xb7ae98, width: 1 })
-      .rect(-13, -22, 6, 7)
-      .fill({ color: 0x646a68 })
-      .rect(-2, -22, 6, 7)
-      .fill({ color: 0x646a68 })
-      .rect(9, -22, 6, 7)
-      .fill({ color: 0x646a68 });
-    const cannon = new Graphics()
-      .roundRect(-2, -4, 24, 5, 2)
-      .fill({ color: 0x333c40 })
-      .circle(-2, -1.5, 6)
-      .fill({ color: darken(color, 0.7) })
-      .stroke({ color, width: 1.5 });
-    cannon.pivot.set(-2, -1.5);
-    cannon.position.set(0, -15);
-    animated = cannon;
-    const flag = new Graphics()
-      .rect(-1, -31, 2, 11)
-      .fill({ color: 0xd7c9a5 })
-      .poly([1, -31, 12, -27, 1, -23])
-      .fill({ color });
-    container.addChild(tower, cannon, flag);
+      .poly([-16, 12, -12, -12, -7, -18, 7, -18, 12, -12, 16, 12])
+      .fill({ color: 0x645b78 })
+      .stroke({ color: 0xd8cdec, width: 1.3 })
+      .poly([-13, -17, 0, -31, 13, -17])
+      .fill({ color: 0x3f3456 })
+      .stroke({ color: 0xb99ce4, width: 1.1 })
+      .roundRect(-4, 1, 8, 11, 2)
+      .fill({ color: 0x211d2e });
+    const runes = new Graphics()
+      .circle(-7, -8, 2)
+      .circle(7, -8, 2)
+      .fill({ color: UNIT_COLORS.wizard, alpha: 0.78 });
+    const orb = new Graphics()
+      .circle(0, 0, 7)
+      .fill({ color: UNIT_COLORS.wizard, alpha: 0.72 })
+      .stroke({ color: 0xf2e5ff, width: 1.2 })
+      .star(0, 0, 4, 4, 1.6, Math.PI / 4)
+      .fill({ color: 0xf7edff });
+    orb.position.set(0, -33);
+    animated = orb;
+    container.addChild(tower, runes, orb);
   }
 
   if (structure.status === "seized" || structure.status === "repairing") {
@@ -632,7 +723,8 @@ export class GameRenderer {
     {
       container: Container;
       plate: Graphics;
-      text: BitmapText;
+      unitPlate: UnitPlateVisual;
+      unitSignature: string;
       troops: number;
       owner: number | null;
       tier: number;
@@ -768,6 +860,7 @@ export class GameRenderer {
     this.drawEnclosures();
     this.drawMultiPreview();
     this.drawHighlights();
+    this.updateCanvasAccessibilityLabel();
   }
 
   setSelected(tileId: string | null): void {
@@ -808,7 +901,7 @@ export class GameRenderer {
       (this.host.clientHeight - padding * 2) / this.mapBounds.height,
       1,
     );
-    this.world.scale.set(Math.max(0.16, scale));
+    this.world.scale.set(Math.max(MIN_ZOOM, scale));
     this.world.position.set(
       this.host.clientWidth / 2 -
         (this.mapBounds.x + this.mapBounds.width / 2) * this.world.scale.x,
@@ -854,7 +947,7 @@ export class GameRenderer {
 
   focusOn(tileId: string, scale = 0.82): void {
     this.lastFocusedTileId = tileId;
-    this.world.scale.set(Math.max(0.42, Math.min(1.35, scale)));
+    this.world.scale.set(Math.max(FOCUS_MIN_ZOOM, Math.min(FOCUS_MAX_ZOOM, scale)));
     this.centerOn(tileId);
     this.clampCamera();
     this.callbacks.onZoom?.(this.world.scale.x);
@@ -873,7 +966,14 @@ export class GameRenderer {
   }
 
   inspectPresentation(): {
-    stacks: Array<{ id: number; x: number; y: number; targetX: number; targetY: number }>;
+    stacks: Array<{
+      id: number;
+      x: number;
+      y: number;
+      targetX: number;
+      targetY: number;
+      units: UnitCounts;
+    }>;
     battles: Array<{
       id: number;
       actual: number;
@@ -885,7 +985,9 @@ export class GameRenderer {
         actual: number;
         displayed: number;
         troops: number;
-        turretSupportCount: number;
+        units: UnitCounts;
+        rpsMultiplierPermille: number;
+        supportPower: number;
       }>;
     }>;
     captures: Array<{ tileId: string; age: number }>;
@@ -900,6 +1002,7 @@ export class GameRenderer {
         y: visual.container.y,
         targetX: visual.targetX,
         targetY: visual.targetY,
+        units: this.state?.stacks.find((stack) => stack.id === id)?.units ?? emptyUnits(),
       })),
       battles: [...this.battles.entries()].map(([id, visual]) => ({
         id,
@@ -912,7 +1015,10 @@ export class GameRenderer {
           actual: segment.target,
           displayed: segment.displayed,
           troops: segment.troops,
-          turretSupportCount: segment.turretSupportCount,
+          units: segment.units,
+          rpsMultiplierPermille: segment.rpsMultiplierPermille,
+          supportPower:
+            totalUnits(segment.localSupportPower) + totalUnits(segment.adjacentSupportPower),
         })),
       })),
       captures: this.captures.map((capture) => ({ tileId: capture.tileId, age: capture.age })),
@@ -1101,7 +1207,7 @@ export class GameRenderer {
     for (const tileId of this.state.map.landIds) {
       const tile = this.state.map.tiles[tileId]!;
       const structure = tile.structure;
-      if (structure?.type !== "barracks" || !structure.rallyTargetId) continue;
+      if (!structure?.rallyTargetId) continue;
       const path = barracksRallyPath(this.state, tile, structure);
       const blocked = isBarracksRallyBlocked(this.state, tile, structure);
       const drawPath = path ?? [tile.id, structure.rallyTargetId];
@@ -1365,16 +1471,17 @@ export class GameRenderer {
     const wanted = new Set<string>();
     for (const tileId of this.state.map.landIds) {
       const tile = this.state.map.tiles[tileId]!;
-      if (tile.troops <= 0) continue;
+      const troops = totalUnits(tile.units);
+      if (troops <= 0) continue;
       const shouldRender =
         tile.owner !== null ||
         this.options.fullCounts ||
         tileId === this.selectedId ||
-        (tile.troops > 1 && this.world.scale.x >= 0.72);
+        (troops > 1 && this.world.scale.x >= 0.62);
       if (!shouldRender) continue;
       wanted.add(tileId);
       let visual = this.labels.get(tileId);
-      const tier = tile.owner === null ? 0 : garrisonTier(tile.troops);
+      const tier = tile.owner === null ? 0 : garrisonTier(troops);
       if (visual && (visual.owner !== tile.owner || visual.tier !== tier)) {
         visual.container.destroy({ children: true });
         this.labels.delete(tileId);
@@ -1383,7 +1490,7 @@ export class GameRenderer {
       if (!visual) {
         const container = new Container();
         const plate = new Graphics()
-          .poly([-16, -8, -11, -13, 11, -13, 16, -8, 13, 7, 0, 11, -13, 7])
+          .poly([-38, -9, -32, -15, 32, -15, 38, -9, 34, 10, 0, 14, -34, 10])
           .fill({ color: 0x101921, alpha: 0.9 })
           .stroke({ color: 0xe7d3a3, width: 1.1, alpha: 0.76 });
         const ownerColor =
@@ -1401,21 +1508,22 @@ export class GameRenderer {
           sentinel.container.position.set((index - (tier - 1) / 2) * 5.2, -17 - (index % 2) * 2.2);
           sentinels.push(sentinel.container);
         }
-        const text = createBadge(formatTroops(tile.troops), 11);
-        text.position.set(0, -2);
+        const unitPlate = createUnitPlate(tile.units, 0.92);
+        unitPlate.container.position.set(0, -2);
         const pin = new Graphics()
-          .poly([-4, -15, 0, -21, 4, -15])
+          .poly([-4, -16, 0, -23, 4, -16])
           .fill({ color: 0xf0d28c, alpha: 0.9 });
-        container.addChild(...sentinels, plate, pin, text);
+        container.addChild(...sentinels, plate, pin, unitPlate.container);
         const position = tilePosition(tile);
-        const baseY = position.y + (tile.structure ? 26 : 15);
+        const baseY = position.y + (tile.structure ? 31 : 21);
         container.position.set(position.x, baseY);
         this.garrisonLayer.addChild(container);
         visual = {
           container,
           plate,
-          text,
-          troops: tile.troops,
+          unitPlate,
+          unitSignature: unitSignature(tile.units),
+          troops,
           owner: tile.owner,
           tier,
           baseY,
@@ -1423,9 +1531,10 @@ export class GameRenderer {
         };
         this.labels.set(tileId, visual);
       }
-      if (visual.troops !== tile.troops) {
-        visual.troops = tile.troops;
-        visual.text.text = formatTroops(tile.troops);
+      if (visual.unitSignature !== unitSignature(tile.units)) {
+        visual.unitSignature = unitSignature(tile.units);
+        visual.troops = troops;
+        updateUnitPlate(visual.unitPlate, tile.units);
       }
       const owner = tile.owner;
       const color =
@@ -1433,18 +1542,19 @@ export class GameRenderer {
           ? 0xa7a394
           : (this.state.players[owner]?.color ?? PLAYER_COLORS[owner % PLAYER_COLORS.length]!);
       visual.plate.tint = color;
-      const desiredBaseY = tilePosition(tile).y + (tile.structure ? 26 : 15);
+      const desiredBaseY = tilePosition(tile).y + (tile.structure ? 31 : 21);
       visual.baseY = desiredBaseY;
       visual.container.visible =
         tile.owner === null
           ? this.options.fullCounts ||
             tileId === this.selectedId ||
-            (tile.troops > 1 && this.world.scale.x >= 0.72)
+            (troops > 1 && this.world.scale.x >= 0.62)
           : this.options.fullCounts ||
-            this.world.scale.x >= 0.29 ||
+            this.world.scale.x >= 0.27 ||
             tileId === this.selectedId ||
             this.isBorderTile(tile);
-      visual.container.scale.set(this.world.scale.x < 0.3 ? 1.22 : 1);
+      const overviewScale = this.world.scale.x < 0.27 ? 1.18 : this.world.scale.x < 0.44 ? 0.9 : 1;
+      visual.container.scale.set(overviewScale);
     }
     for (const [tileId, visual] of this.labels) {
       if (!wanted.has(tileId)) {
@@ -1454,11 +1564,11 @@ export class GameRenderer {
     }
   }
 
-  private turretAimAngle(tile: TileState): number | null {
+  private supportAimAngle(tile: TileState): number | null {
     if (
       !this.state ||
       tile.owner === null ||
-      tile.structure?.type !== "turret" ||
+      !tile.structure ||
       !isStructureOperational(tile.structure)
     ) {
       return null;
@@ -1466,7 +1576,7 @@ export class GameRenderer {
     const adjacentIds = new Set(neighbors(tile).map(axialKey));
     const ownerParticipates = (battle: GameState["battles"][number]): boolean =>
       battle.participants.some(
-        (participant) => participant.playerId === tile.owner && participant.troops > 0,
+        (participant) => participant.playerId === tile.owner && totalUnits(participant.units) > 0,
       );
     const ownBattle = this.state.battles.find((battle) => battle.tileId === tile.id);
     const candidates = (
@@ -1511,7 +1621,7 @@ export class GameRenderer {
           existing.container.alpha = 0.55 + (tile.structure.integrity / 1000) * 0.45;
           if (existing.pendingRing) drawPendingRing(existing.pendingRing, tile.structure);
         }
-        if (existing.volleyPulse <= 0) existing.aimAngle = this.turretAimAngle(tile);
+        if (existing.volleyPulse <= 0) existing.aimAngle = this.supportAimAngle(tile);
         continue;
       }
       existing?.container.destroy({ children: true });
@@ -1522,7 +1632,7 @@ export class GameRenderer {
           : (this.state.players[tile.owner]?.color ??
             PLAYER_COLORS[tile.owner % PLAYER_COLORS.length]!);
       const visual = createStructureVisual(tile.structure, ownerColor);
-      visual.aimAngle = this.turretAimAngle(tile);
+      visual.aimAngle = this.supportAimAngle(tile);
       const position = tilePosition(tile);
       visual.container.position.set(position.x, position.y - 1);
       this.structureLayer.addChild(visual.container);
@@ -1542,13 +1652,14 @@ export class GameRenderer {
     for (const stack of this.state.stacks) {
       wanted.add(stack.id);
       const point = this.stackPoint(stack);
+      const troops = totalUnits(stack.units);
       let visual = this.stacks.get(stack.id);
       if (!visual) {
         const container = new Container();
         const dust = new Graphics();
         container.addChild(dust);
         const squad: SoldierVisual[] = [];
-        const count = Math.max(3, Math.min(6, 2 + Math.ceil(Math.log2(Math.max(2, stack.troops)))));
+        const count = Math.max(3, Math.min(6, 2 + Math.ceil(Math.log2(Math.max(2, troops)))));
         const color =
           this.state.players[stack.owner]?.color ??
           PLAYER_COLORS[stack.owner % PLAYER_COLORS.length]!;
@@ -1565,19 +1676,19 @@ export class GameRenderer {
           .fill({ color })
           .stroke({ color: 0xf4e4bb, width: 0.7 });
         const badgeBack = new Graphics()
-          .roundRect(-17, 9, 34, 16, 7)
+          .roundRect(-38, 8, 76, 21, 7)
           .fill({ color: 0x0b141c, alpha: 0.94 })
           .stroke({ color, width: 1.5 });
-        const badge = createBadge(String(stack.troops), 11);
-        badge.position.set(0, 17);
-        container.addChild(banner, badgeBack, badge);
+        const unitPlate = createUnitPlate(stack.units, 0.92);
+        unitPlate.container.position.set(0, 18.5);
+        container.addChild(banner, badgeBack, unitPlate.container);
         container.position.set(point.x, point.y);
         this.stackLayer.addChild(container);
         visual = {
           container,
           squad,
           dust,
-          badge,
+          unitPlate,
           lastX: point.x,
           lastY: point.y,
           targetX: point.x,
@@ -1590,7 +1701,7 @@ export class GameRenderer {
       visual.lastY = visual.container.y;
       visual.targetX = point.x;
       visual.targetY = point.y;
-      visual.badge.text = String(stack.troops);
+      updateUnitPlate(visual.unitPlate, stack.units);
       const dx = visual.targetX - visual.lastX;
       const dy = visual.targetY - visual.lastY;
       if (Math.abs(dx) + Math.abs(dy) > 0.01) {
@@ -1621,7 +1732,7 @@ export class GameRenderer {
         const fighters: SoldierVisual[] = [];
         const combatEffects = new Graphics();
         const frame = new Graphics();
-        const counts = createBadge("", 10);
+        const counts = createBadge("", 8);
         counts.position.set(0, -2);
         const sideCount = this.options.quality === "low" ? 1 : 2;
         for (let index = 0; index < sideCount; index += 1) {
@@ -1647,7 +1758,7 @@ export class GameRenderer {
         const tile = this.state.map.tiles[battle.tileId];
         if (tile) {
           const point = tilePosition(tile);
-          container.position.set(point.x, point.y - 47);
+          container.position.set(point.x, point.y - 58);
         }
         visual = {
           container,
@@ -1668,7 +1779,11 @@ export class GameRenderer {
             displayed: participant.sharePermyriad / 10_000,
             ghost: participant.sharePermyriad / 10_000,
             troops: participant.troops,
-            turretSupportCount: participant.turretSupportCount,
+            units: participant.units,
+            effectivePowerByType: participant.effectivePowerByType,
+            localSupportPower: participant.localSupportPower,
+            adjacentSupportPower: participant.adjacentSupportPower,
+            rpsMultiplierPermille: participant.rpsMultiplierPermille,
           })),
           reinforcementSignature: presentation
             .map((participant) => {
@@ -1702,16 +1817,26 @@ export class GameRenderer {
           displayed: existing?.displayed ?? 0,
           ghost: existing?.ghost ?? 0,
           troops: participant.troops,
-          turretSupportCount: participant.turretSupportCount,
+          units: participant.units,
+          effectivePowerByType: participant.effectivePowerByType,
+          localSupportPower: participant.localSupportPower,
+          adjacentSupportPower: participant.adjacentSupportPower,
+          rpsMultiplierPermille: participant.rpsMultiplierPermille,
         };
       });
       const shown = presentation
-        .slice(0, 4)
+        .slice(0, 3)
         .map(
           (participant) =>
-            `${participant.troops}${participant.turretSupportCount > 0 ? `+T${participant.turretSupportCount}` : ""}`,
+            `${participant.troops}${
+              participant.rpsMultiplierPermille === 1000
+                ? ""
+                : ` ${participant.rpsMultiplierPermille > 1000 ? "+" : "-"}${Math.abs(
+                    Math.round((participant.rpsMultiplierPermille - 1000) / 10),
+                  )}%`
+            }`,
         );
-      visual.baseCounts = `${shown.join(" · ")}${presentation.length > 4 ? ` · +${presentation.length - 4}` : ""}`;
+      visual.baseCounts = `${shown.join(" · ")}${presentation.length > 3 ? ` · +${presentation.length - 3}` : ""}`;
       const reinforcementSignature = presentation
         .map((participant) => {
           const source = battle.participants.find(
@@ -1744,8 +1869,12 @@ export class GameRenderer {
             target: 1,
             displayed: 0,
             ghost: 0,
-            troops: this.state.map.tiles[visual.tileId]?.troops ?? 0,
-            turretSupportCount: 0,
+            troops: totalUnits(this.state.map.tiles[visual.tileId]?.units ?? emptyUnits()),
+            units: this.state.map.tiles[visual.tileId]?.units ?? emptyUnits(),
+            effectivePowerByType: emptyUnits(),
+            localSupportPower: emptyUnits(),
+            adjacentSupportPower: emptyUnits(),
+            rpsMultiplierPermille: 1000,
           };
           visual.segments.push(winner);
         }
@@ -1848,7 +1977,7 @@ export class GameRenderer {
     }
   }
 
-  private beginTurretVolley(state: GameState, sourceTileId: string, targetTileId: string): void {
+  private beginTypedSupport(state: GameState, sourceTileId: string, targetTileId: string): void {
     const source = state.map.tiles[sourceTileId];
     const target = state.map.tiles[targetTileId];
     if (!source || !target) return;
@@ -1872,7 +2001,7 @@ export class GameRenderer {
       color,
     });
     const structure = this.structures.get(sourceTileId);
-    if (structure?.type === "turret") {
+    if (structure) {
       structure.aimAngle = Math.atan2(targetPoint.y - sourcePoint.y, targetPoint.x - sourcePoint.x);
       structure.volleyPulse = 1;
     }
@@ -1883,11 +2012,15 @@ export class GameRenderer {
     for (const event of state.events) {
       if (event.id <= this.lastEventId) continue;
       this.lastEventId = Math.max(this.lastEventId, event.id);
-      if (event.type === "turret-volley" && event.sourceTileId && event.tileId) {
+      if (
+        (event.type === "turret-volley" || event.type === "typed-support") &&
+        event.sourceTileId &&
+        event.tileId
+      ) {
         const volleyKey = `${event.tick}:${event.sourceTileId}`;
         if (!renderedVolleys.has(volleyKey)) {
           renderedVolleys.add(volleyKey);
-          this.beginTurretVolley(state, event.sourceTileId, event.tileId);
+          this.beginTypedSupport(state, event.sourceTileId, event.tileId);
         }
         continue;
       }
@@ -1951,15 +2084,19 @@ export class GameRenderer {
 
     for (const visual of this.structures.values()) {
       if (!visual.animated) continue;
-      if (visual.type === "farm") visual.animated.rotation += dt * 0.7;
-      else if (visual.type === "barracks")
+      if (visual.type === "barracks")
         visual.animated.scale.x = 0.93 + Math.sin(this.elapsed * 2.2) * 0.07;
-      else {
+      else if (visual.type === "archery-range") {
         visual.volleyPulse = Math.max(0, visual.volleyPulse - dt * 4.5);
         visual.animated.rotation =
           (visual.aimAngle ?? Math.sin(this.elapsed * 0.8) * 0.23) -
           Math.sin(visual.volleyPulse * Math.PI) * 0.05;
         visual.animated.scale.x = 1 - Math.sin(visual.volleyPulse * Math.PI) * 0.12;
+      } else {
+        visual.volleyPulse = Math.max(0, visual.volleyPulse - dt * 3.5);
+        visual.animated.rotation += dt * 0.65;
+        const pulse = 1 + Math.sin(this.elapsed * 2.6) * 0.08 + visual.volleyPulse * 0.16;
+        visual.animated.scale.set(pulse);
       }
     }
     for (const visual of this.stacks.values()) {
@@ -2104,7 +2241,7 @@ export class GameRenderer {
   private drawBattleBar(visual: BattleVisual): void {
     visual.frame.clear();
     visual.frame
-      .roundRect(-BAR_WIDTH / 2 - 6, -BAR_HEIGHT / 2 - 8, BAR_WIDTH + 12, BAR_HEIGHT + 22, 7)
+      .roundRect(-BAR_WIDTH / 2 - 6, -BAR_HEIGHT / 2 - 11, BAR_WIDTH + 12, BAR_HEIGHT + 34, 7)
       .fill({ color: 0x111820, alpha: 0.96 })
       .stroke({ color: 0xb9a879, width: 1.5, alpha: 0.9 });
     visual.frame
@@ -2132,6 +2269,42 @@ export class GameRenderer {
               : (this.state?.players[segment.playerId]?.pattern ?? segment.playerId % 7);
           drawBattleSegmentPattern(visual.frame, cursor, width, pattern, segment.color);
         }
+        const unitTotal = Math.max(1, totalUnits(segment.units));
+        let typeCursor = cursor;
+        UNIT_TYPES.forEach((type, typeIndex) => {
+          const typeWidth =
+            typeIndex === UNIT_TYPES.length - 1
+              ? cursor + width - typeCursor
+              : (segment.units[type] / unitTotal) * width;
+          if (typeWidth > 0.25) {
+            visual.frame
+              .rect(typeCursor, BAR_HEIGHT / 2 + 2, typeWidth, 4)
+              .fill({ color: UNIT_COLORS[type], alpha: 0.98 });
+          }
+          typeCursor += typeWidth;
+        });
+        const middle = cursor + width / 2;
+        if (width >= 11 && segment.rpsMultiplierPermille !== 1000) {
+          const advantaged = segment.rpsMultiplierPermille > 1000;
+          visual.frame
+            .poly(
+              advantaged
+                ? [middle - 4, -10, middle, -15, middle + 4, -10]
+                : [middle - 4, -15, middle, -10, middle + 4, -15],
+            )
+            .stroke({
+              color: advantaged ? 0x8fe1b2 : 0xffa09a,
+              width: 1.8,
+              alpha: 0.98,
+            });
+        }
+        const support =
+          totalUnits(segment.localSupportPower) + totalUnits(segment.adjacentSupportPower);
+        if (width >= 8 && support > 0) {
+          visual.frame
+            .star(middle, BAR_HEIGHT / 2 + 4, 4, 3.2, 1.4, Math.PI / 4)
+            .fill({ color: 0xf4e1a4, alpha: 0.96 });
+        }
       }
       cursor += width;
       if (index < visual.segments.length - 1) {
@@ -2156,7 +2329,7 @@ export class GameRenderer {
       });
       if (visual.amount > 0) visual.counts.text = `${visual.baseCounts}  +${visual.amount}`;
     }
-    visual.counts.position.y = 13;
+    visual.counts.position.y = 20;
   }
 
   private bindInput(): void {
@@ -2366,11 +2539,28 @@ export class GameRenderer {
         ? "neutral"
         : (this.state?.players[tile.owner]?.name ?? `player ${tile.owner + 1}`);
     const current = tile
-      ? ` Current hex ${tile.id}, ${tile.terrain}, ${owner}, ${tile.troops} troops.`
+      ? ` Current hex ${tile.id}, ${tile.terrain}, ${owner}, ${formatUnits(tile.units)}; ${totalUnits(tile.units)} total units.`
       : "";
+    const battle = tile
+      ? this.state?.battles.find((candidate) => candidate.tileId === tile.id)
+      : null;
+    const battleSummary =
+      battle && this.state
+        ? ` Active battle: ${battlePresentation(this.state, battle)
+            .map((participant) => {
+              const name =
+                participant.playerId === null
+                  ? "neutral defenders"
+                  : (this.state?.players[participant.playerId]?.name ??
+                    `player ${participant.playerId + 1}`);
+              const modifier = Math.round((participant.rpsMultiplierPermille - 1000) / 10);
+              return `${name}, ${formatUnits(participant.units)}, ${modifier > 0 ? `${modifier} percent type advantage` : modifier < 0 ? `${Math.abs(modifier)} percent type disadvantage` : "even type matchup"}`;
+            })
+            .join("; ")}.`
+        : "";
     this.app.canvas.setAttribute(
       "aria-label",
-      `Hex Dominion battlefield.${current} Use arrow keys to move the hex cursor, Enter or Space to select, and Escape to cancel.`,
+      `Hex Dominion battlefield.${current}${battleSummary} Use arrow keys to move the hex cursor, Enter or Space to select, and Escape to cancel.`,
     );
   }
 
@@ -2402,7 +2592,7 @@ export class GameRenderer {
     const x = clientX - rect.left;
     const y = clientY - rect.top;
     const old = this.world.scale.x;
-    const next = Math.max(0.16, Math.min(1.6, old * factor));
+    const next = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, old * factor));
     const wx = (x - this.world.x) / old;
     const wy = (y - this.world.y) / old;
     this.world.scale.set(next);
@@ -2424,17 +2614,30 @@ export class GameRenderer {
   }
 
   private clampCamera(): void {
-    const margin = 110;
+    const margin = Math.max(
+      48,
+      Math.min(110, Math.round(Math.min(this.host.clientWidth, this.host.clientHeight) * 0.12)),
+    );
     const scale = this.world.scale.x;
-    const left = this.mapBounds.x * scale + this.world.x;
-    const right = (this.mapBounds.x + this.mapBounds.width) * scale + this.world.x;
-    const top = this.mapBounds.y * scale + this.world.y;
-    const bottom = (this.mapBounds.y + this.mapBounds.height) * scale + this.world.y;
-    if (right < margin) this.world.x += margin - right;
-    if (left > this.host.clientWidth - margin)
-      this.world.x -= left - (this.host.clientWidth - margin);
-    if (bottom < margin) this.world.y += margin - bottom;
-    if (top > this.host.clientHeight - margin)
-      this.world.y -= top - (this.host.clientHeight - margin);
+    const scaledWidth = this.mapBounds.width * scale;
+    const scaledHeight = this.mapBounds.height * scale;
+    if (scaledWidth <= this.host.clientWidth - margin * 2) {
+      this.world.x =
+        this.host.clientWidth / 2 - (this.mapBounds.x + this.mapBounds.width / 2) * scale;
+    } else {
+      const minimumX =
+        this.host.clientWidth - margin - (this.mapBounds.x + this.mapBounds.width) * scale;
+      const maximumX = margin - this.mapBounds.x * scale;
+      this.world.x = Math.max(minimumX, Math.min(maximumX, this.world.x));
+    }
+    if (scaledHeight <= this.host.clientHeight - margin * 2) {
+      this.world.y =
+        this.host.clientHeight / 2 - (this.mapBounds.y + this.mapBounds.height / 2) * scale;
+    } else {
+      const minimumY =
+        this.host.clientHeight - margin - (this.mapBounds.y + this.mapBounds.height) * scale;
+      const maximumY = margin - this.mapBounds.y * scale;
+      this.world.y = Math.max(minimumY, Math.min(maximumY, this.world.y));
+    }
   }
 }

@@ -1,15 +1,10 @@
 import { z } from "zod";
 import { BALANCE } from "../../shared/balance";
-import type {
-  BattleParticipant,
-  EngineSnapshot,
-  GameCommand,
-  GameState,
-  StructureState,
-} from "../../shared/types";
+import type { EngineSnapshot, GameCommand, GameState, UnitCounts } from "../../shared/types";
 import { hashGameState, stableHash } from "../hash";
 import { axialKey, distance, neighbors, parseAxialKey } from "../hex";
 import { isEligibleSpawnCenter } from "../map";
+import { UNIT_TYPES, totalUnits, unitsContainedBy, unitsOf, unitTypeForStructure } from "../units";
 
 const nonNegativeInteger = z.number().int().nonnegative();
 const positiveInteger = z.number().int().positive();
@@ -17,7 +12,30 @@ const playerReference = z.number().int().min(0).max(20);
 const optionalTick = nonNegativeInteger.optional();
 const sendPercentSchema = z.union([z.literal(25), z.literal(50), z.literal(75), z.literal(100)]);
 const terrainSchema = z.enum(["meadow", "muster", "plains", "forest", "hills", "water"]);
-const structureTypeSchema = z.enum(["farm", "barracks", "turret"]);
+const v2StructureTypeSchema = z.enum(["farm", "barracks", "turret"]);
+const structureTypeSchema = z.enum(["barracks", "archery-range", "wizard-tower"]);
+const unitCountsSchema = z
+  .object({
+    melee: nonNegativeInteger,
+    ranged: nonNegativeInteger,
+    wizard: nonNegativeInteger,
+  })
+  .strict();
+const casualtyRemainderSchema = z
+  .object({
+    melee: z.number().int().min(0).max(999),
+    ranged: z.number().int().min(0).max(999),
+    wizard: z.number().int().min(0).max(999),
+  })
+  .strict();
+const combatRoundAccumulatorSchema = z
+  .number()
+  .int()
+  .min(0)
+  .max(BALANCE.combatRoundTicks - 1);
+const positiveUnitCountsSchema = unitCountsSchema.refine((units) => totalUnits(units) > 0, {
+  message: "must contain at least one unit",
+});
 
 const configFields = {
   seed: z.string().min(1).max(128),
@@ -66,7 +84,7 @@ const playerSchema = z
   })
   .strict();
 
-const stackSchema = z
+const v2StackSchema = z
   .object({
     id: positiveInteger,
     owner: playerReference,
@@ -93,7 +111,7 @@ const victorySchema = z
 
 const legacyStructureSchema = z
   .object({
-    type: structureTypeSchema,
+    type: v2StructureTypeSchema,
     status: z.enum(["constructing", "active", "seized", "repairing"]),
     integrity: z.number().int().min(0).max(1_000),
     progressTicks: nonNegativeInteger,
@@ -150,7 +168,7 @@ const legacyBattleSchema = z
     attackerTroops: positiveInteger,
     control: z.number().int().min(0).max(10_000),
     ageTicks: nonNegativeInteger,
-    roundAccumulator: nonNegativeInteger,
+    roundAccumulator: combatRoundAccumulatorSchema,
     entryFrom: z.string().min(1),
     waiting: z.array(legacyWaitingSchema),
     lastReinforcementTick: z.number().int().min(-1),
@@ -200,7 +218,7 @@ const legacyCommandSchema = z.discriminatedUnion("type", [
       type: z.literal("build"),
       playerId: playerReference,
       tileId: z.string().min(1),
-      structure: structureTypeSchema,
+      structure: v2StructureTypeSchema,
       scheduledTick: optionalTick,
     })
     .strict(),
@@ -229,7 +247,7 @@ const legacyStateSchema = z
     tick: nonNegativeInteger,
     map: z.object(mapFields(legacyTileSchema)).strict(),
     players: z.array(playerSchema).min(2).max(21),
-    stacks: z.array(stackSchema),
+    stacks: z.array(v2StackSchema),
     battles: z.array(legacyBattleSchema),
     events: z.array(legacyEventSchema),
     nextEntityId: positiveInteger,
@@ -251,9 +269,9 @@ type LegacySnapshot = z.infer<typeof legacySnapshotSchema>;
 type LegacyStructure = z.infer<typeof legacyStructureSchema>;
 type LegacyBattle = z.infer<typeof legacyBattleSchema>;
 
-const structureSchema = z
+const v2StructureSchema = z
   .object({
-    type: structureTypeSchema,
+    type: v2StructureTypeSchema,
     completedCount: z.number().int().min(0).max(BALANCE.maxStructureCount),
     status: z.enum(["active", "seized", "repairing"]).nullable(),
     integrity: z.number().int().min(0).max(BALANCE.fullIntegrity),
@@ -267,7 +285,7 @@ const structureSchema = z
   })
   .strict();
 
-const tileSchema = z
+const v2TileSchema = z
   .object({
     id: z.string().min(1),
     q: z.number().int(),
@@ -275,14 +293,14 @@ const tileSchema = z
     terrain: terrainSchema,
     owner: playerReference.nullable(),
     troops: nonNegativeInteger,
-    structure: structureSchema.nullable(),
+    structure: v2StructureSchema.nullable(),
     controlledSinceTick: z.number().int(),
     lastRewardTick: z.number().int(),
     decorationSeed: nonNegativeInteger,
   })
   .strict();
 
-const participantSchema = z
+const v2ParticipantSchema = z
   .object({
     playerId: playerReference.nullable(),
     troops: nonNegativeInteger,
@@ -295,14 +313,14 @@ const participantSchema = z
   })
   .strict();
 
-const battleSchema = z
+const v2BattleSchema = z
   .object({
     id: positiveInteger,
     tileId: z.string().min(1),
     incumbentOwner: playerReference.nullable(),
-    participants: z.array(participantSchema).min(1).max(22),
+    participants: z.array(v2ParticipantSchema).min(1).max(22),
     ageTicks: nonNegativeInteger,
-    roundAccumulator: nonNegativeInteger,
+    roundAccumulator: combatRoundAccumulatorSchema,
   })
   .strict();
 
@@ -320,7 +338,7 @@ const enclosureSchema = z
   })
   .strict();
 
-const eventTypes = [
+const v2EventTypes = [
   "order",
   "route-interrupted",
   "battle-started",
@@ -343,6 +361,227 @@ const eventTypes = [
   "victory",
 ] as const;
 
+const v2EventSchema = z
+  .object({
+    id: positiveInteger,
+    tick: nonNegativeInteger,
+    type: z.enum(v2EventTypes),
+    playerId: playerReference.optional(),
+    tileId: z.string().min(1).optional(),
+    tileIds: z.array(z.string().min(1)).optional(),
+    sourceTileId: z.string().min(1).optional(),
+    amount: z.number().int().optional(),
+    message: z.string(),
+  })
+  .strict();
+
+const v2GameCommandSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("choose-spawn"),
+      playerId: playerReference,
+      centerId: z.string().min(1),
+      scheduledTick: optionalTick,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("lock-spawn"),
+      playerId: playerReference,
+      scheduledTick: optionalTick,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("move"),
+      playerId: playerReference,
+      sourceId: z.string().min(1),
+      destinationId: z.string().min(1),
+      percent: sendPercentSchema,
+      scheduledTick: optionalTick,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("multi-move"),
+      playerId: playerReference,
+      sourceIds: z.array(z.string().min(1)).min(1).max(BALANCE.maxMultiMoveSources),
+      destinationIds: z.array(z.string().min(1)).min(1).max(BALANCE.maxMultiMoveDestinations),
+      percent: sendPercentSchema,
+      scheduledTick: optionalTick,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("build"),
+      playerId: playerReference,
+      tileId: z.string().min(1),
+      structure: v2StructureTypeSchema,
+      scheduledTick: optionalTick,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("cancel-build"),
+      playerId: playerReference,
+      tileId: z.string().min(1),
+      scheduledTick: optionalTick,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("toggle-barracks"),
+      playerId: playerReference,
+      tileId: z.string().min(1),
+      scheduledTick: optionalTick,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("set-rally"),
+      playerId: playerReference,
+      tileId: z.string().min(1),
+      destinationId: z.string().min(1),
+      scheduledTick: optionalTick,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("clear-rally"),
+      playerId: playerReference,
+      tileId: z.string().min(1),
+      scheduledTick: optionalTick,
+    })
+    .strict(),
+]);
+
+const placementSchema = z
+  .object({
+    elapsedTicks: nonNegativeInteger,
+    maxTicks: nonNegativeInteger.nullable(),
+    placements: z.array(
+      z
+        .object({
+          playerId: playerReference,
+          centerId: z.string().min(1).nullable(),
+          locked: z.boolean(),
+          relocationCount: nonNegativeInteger,
+          aiTargetRelocations: nonNegativeInteger,
+          nextAiActionTick: nonNegativeInteger.nullable(),
+        })
+        .strict(),
+    ),
+  })
+  .strict();
+
+const v2StateSchema = z
+  .object({
+    version: z.literal(2),
+    config: z
+      .object({ ...configFields, startingCenters: z.array(z.string().min(1)).optional() })
+      .strict(),
+    phase: z.enum(["placement", "opening", "running", "complete"]),
+    placement: placementSchema,
+    tick: nonNegativeInteger,
+    map: z.object(mapFields(v2TileSchema)).strict(),
+    players: z.array(playerSchema).min(2).max(21),
+    stacks: z.array(v2StackSchema),
+    battles: z.array(v2BattleSchema),
+    enclosures: z.array(enclosureSchema),
+    events: z.array(v2EventSchema),
+    nextEntityId: positiveInteger,
+    victory: victorySchema,
+    stateHash: z.string().regex(/^[0-9a-f]{16}$/),
+    paused: z.boolean(),
+  })
+  .strict();
+
+const v2SnapshotSchema = z
+  .object({
+    state: v2StateSchema,
+    commandHistory: z.array(v2GameCommandSchema),
+    pendingCommands: z.array(v2GameCommandSchema).optional(),
+  })
+  .strict();
+
+type V2Snapshot = z.infer<typeof v2SnapshotSchema>;
+type V2Structure = z.infer<typeof v2StructureSchema>;
+type V2Battle = z.infer<typeof v2BattleSchema>;
+type V2Participant = V2Battle["participants"][number];
+type V2Command = z.infer<typeof v2GameCommandSchema>;
+type CurrentStructure = NonNullable<GameState["map"]["tiles"][string]["structure"]>;
+
+const structureSchema = z
+  .object({
+    type: structureTypeSchema,
+    completedCount: z.number().int().min(0).max(BALANCE.maxStructureCount),
+    status: z.enum(["active", "seized", "repairing"]).nullable(),
+    integrity: z.number().int().min(0).max(BALANCE.fullIntegrity),
+    pendingProgressTicks: nonNegativeInteger.nullable(),
+    seizedTicks: nonNegativeInteger,
+    productionPaused: z.boolean(),
+    trainingProgressMilli: nonNegativeInteger,
+    rallyTargetId: z.string().min(1).nullable(),
+    rallyQueuedUnits: unitCountsSchema,
+  })
+  .strict();
+
+const tileSchema = z
+  .object({
+    id: z.string().min(1),
+    q: z.number().int(),
+    r: z.number().int(),
+    terrain: terrainSchema,
+    owner: playerReference.nullable(),
+    units: unitCountsSchema,
+    structure: structureSchema.nullable(),
+    controlledSinceTick: z.number().int(),
+    lastRewardTick: z.number().int(),
+    decorationSeed: nonNegativeInteger,
+  })
+  .strict();
+
+const stackSchema = z
+  .object({
+    id: positiveInteger,
+    owner: playerReference,
+    units: positiveUnitCountsSchema,
+    path: z.array(z.string().min(1)).min(2),
+    pathIndex: nonNegativeInteger,
+    segmentProgress: nonNegativeInteger,
+    segmentDuration: positiveInteger,
+    originId: z.string().min(1),
+    destinationId: z.string().min(1),
+    lane: z.number().int(),
+    issuedTick: nonNegativeInteger,
+  })
+  .strict();
+
+const participantSchema = z
+  .object({
+    playerId: playerReference.nullable(),
+    units: unitCountsSchema,
+    control: z.number().int().min(0).max(10_000),
+    casualtyProgressMilli: casualtyRemainderSchema,
+    entryFrom: z.string().min(1),
+    joinedTick: nonNegativeInteger,
+    lastReinforcementTick: z.number().int().min(-1),
+    reinforcementAmount: nonNegativeInteger,
+  })
+  .strict();
+
+const battleSchema = z
+  .object({
+    id: positiveInteger,
+    tileId: z.string().min(1),
+    incumbentOwner: playerReference.nullable(),
+    participants: z.array(participantSchema).min(1).max(22),
+    ageTicks: nonNegativeInteger,
+    roundAccumulator: combatRoundAccumulatorSchema,
+  })
+  .strict();
+
+const eventTypes = [...v2EventTypes, "typed-support"] as const;
 const eventSchema = z
   .object({
     id: positiveInteger,
@@ -412,7 +651,7 @@ export const gameCommandSchema = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
-      type: z.literal("toggle-barracks"),
+      type: z.literal("toggle-production"),
       playerId: playerReference,
       tileId: z.string().min(1),
       scheduledTick: optionalTick,
@@ -437,28 +676,9 @@ export const gameCommandSchema = z.discriminatedUnion("type", [
     .strict(),
 ]);
 
-const placementSchema = z
-  .object({
-    elapsedTicks: nonNegativeInteger,
-    maxTicks: nonNegativeInteger.nullable(),
-    placements: z.array(
-      z
-        .object({
-          playerId: playerReference,
-          centerId: z.string().min(1).nullable(),
-          locked: z.boolean(),
-          relocationCount: nonNegativeInteger,
-          aiTargetRelocations: nonNegativeInteger,
-          nextAiActionTick: nonNegativeInteger.nullable(),
-        })
-        .strict(),
-    ),
-  })
-  .strict();
-
 const stateSchema = z
   .object({
-    version: z.literal(2),
+    version: z.literal(3),
     config: z
       .object({ ...configFields, startingCenters: z.array(z.string().min(1)).optional() })
       .strict(),
@@ -507,6 +727,15 @@ function compareAxialIds(left: string, right: string): number {
   return a.q - b.q || a.r - b.r;
 }
 
+function structureTiming(type: CurrentStructure["type"]): {
+  buildTicks: number;
+  trainTicks: number;
+} {
+  if (type === "barracks") return BALANCE.barracks;
+  if (type === "archery-range") return BALANCE.archeryRange;
+  return BALANCE.wizardTower;
+}
+
 function validateReferences(snapshot: EngineSnapshot): void {
   const { state } = snapshot;
   const { map, players } = state;
@@ -534,6 +763,28 @@ function validateReferences(snapshot: EngineSnapshot): void {
       fail(`state.map.tiles.${id}.terrain`, "land mismatch");
     const structure = tile.structure;
     if (!structure) continue;
+    const timing = structureTiming(structure.type);
+    if (
+      structure.pendingProgressTicks !== null &&
+      structure.pendingProgressTicks >= timing.buildTicks
+    )
+      fail(
+        `state.map.tiles.${id}.structure.pendingProgressTicks`,
+        "must remain below the build duration",
+      );
+    if (structure.trainingProgressMilli > timing.trainTicks * BALANCE.fullIntegrity)
+      fail(`state.map.tiles.${id}.structure.trainingProgressMilli`, "exceeds one production cycle");
+    const seizedTickLimit =
+      structure.status === "seized"
+        ? BALANCE.seizedTicks
+        : structure.status === "repairing"
+          ? BALANCE.repairTicks
+          : 0;
+    if (
+      (seizedTickLimit === 0 && structure.seizedTicks !== 0) ||
+      (seizedTickLimit > 0 && structure.seizedTicks >= seizedTickLimit)
+    )
+      fail(`state.map.tiles.${id}.structure.seizedTicks`, "does not match the structure phase");
     if (structure.completedCount === 0) {
       if (
         structure.status !== null ||
@@ -554,28 +805,25 @@ function validateReferences(snapshot: EngineSnapshot): void {
     ) {
       fail(`state.map.tiles.${id}.structure`, "exceeds stack cap");
     }
-    if (structure.type === "farm" && tile.terrain !== "meadow")
-      fail(`state.map.tiles.${id}.structure`, "Farm terrain mismatch");
+    if (structure.type === "archery-range" && tile.terrain !== "meadow")
+      fail(`state.map.tiles.${id}.structure`, "Archery Range terrain mismatch");
     if (structure.type === "barracks" && tile.terrain !== "muster")
       fail(`state.map.tiles.${id}.structure`, "Barracks terrain mismatch");
-    if (
-      structure.type !== "barracks" &&
-      (structure.rallyTargetId !== null ||
-        structure.barracksProgressMilli !== 0 ||
-        structure.rallyQueuedTroops !== 0)
-    )
-      fail(`state.map.tiles.${id}.structure`, "non-Barracks has Barracks state");
-    if (structure.rallyQueuedTroops > tile.troops)
-      fail(`state.map.tiles.${id}.structure.rallyQueuedTroops`, "exceeds retained local troops");
-    if (structure.rallyQueuedTroops > 0 && structure.rallyTargetId === null)
-      fail(`state.map.tiles.${id}.structure.rallyQueuedTroops`, "requires a rally target");
-    if (structure.status === "seized" && structure.rallyQueuedTroops !== 0)
+    if (!unitsContainedBy(structure.rallyQueuedUnits, tile.units))
+      fail(`state.map.tiles.${id}.structure.rallyQueuedUnits`, "exceeds retained local units");
+    const producedType = unitTypeForStructure(structure.type);
+    if (structure.rallyQueuedUnits[producedType] !== totalUnits(structure.rallyQueuedUnits))
       fail(
-        `state.map.tiles.${id}.structure.rallyQueuedTroops`,
-        "seized Barracks cannot queue troops",
+        `state.map.tiles.${id}.structure.rallyQueuedUnits`,
+        "contains units from another producer type",
       );
-    if (structure.type !== "turret" && structure.turretShotProgressMilli !== 0)
-      fail(`state.map.tiles.${id}.structure`, "non-Turret has shot state");
+    if (totalUnits(structure.rallyQueuedUnits) > 0 && structure.rallyTargetId === null)
+      fail(`state.map.tiles.${id}.structure.rallyQueuedUnits`, "requires a rally target");
+    if (structure.status === "seized" && totalUnits(structure.rallyQueuedUnits) !== 0)
+      fail(
+        `state.map.tiles.${id}.structure.rallyQueuedUnits`,
+        "seized structure cannot queue units",
+      );
     if (structure.rallyTargetId !== null && !landIds.has(structure.rallyTargetId))
       fail(`state.map.tiles.${id}.structure.rallyTargetId`, "references non-land");
   }
@@ -583,6 +831,20 @@ function validateReferences(snapshot: EngineSnapshot): void {
     if (player.id !== index) fail(`state.players.${index}.id`, "must equal array index");
     if (player.eliminatedBy !== null && !players[player.eliminatedBy])
       fail(`state.players.${index}.eliminatedBy`, "missing player");
+  });
+  const aggregateUnits = players.map(() => 0);
+  for (const id of map.landIds) {
+    const tile = map.tiles[id]!;
+    if (tile.owner !== null) aggregateUnits[tile.owner]! += totalUnits(tile.units);
+  }
+  for (const stack of state.stacks) aggregateUnits[stack.owner]! += totalUnits(stack.units);
+  for (const battle of state.battles)
+    for (const participant of battle.participants)
+      if (participant.playerId !== null)
+        aggregateUnits[participant.playerId]! += totalUnits(participant.units);
+  players.forEach((player, index) => {
+    if (player.troopCount !== aggregateUnits[index])
+      fail(`state.players.${index}.troopCount`, "does not match authoritative unit totals");
   });
   const humanSeats = state.config.multiplayer ? (state.config.humanSeats ?? []) : [0];
   const expectedPlayers = (state.config.multiplayer ? humanSeats.length : 1) + state.config.aiCount;
@@ -804,7 +1066,7 @@ function legacyHash(state: LegacySnapshot["state"]): string {
   return stableHash({ ...state, stateHash: undefined, config: rulesConfig });
 }
 
-function migrateStructure(structure: LegacyStructure | null): StructureState | null {
+function migrateStructure(structure: LegacyStructure | null): V2Structure | null {
   if (!structure) return null;
   if (structure.status === "constructing") {
     return {
@@ -843,9 +1105,9 @@ function migrateStructure(structure: LegacyStructure | null): StructureState | n
   };
 }
 
-function migrateBattle(battle: LegacyBattle, stateTick: number): GameState["battles"][number] {
+function migrateBattle(battle: LegacyBattle, stateTick: number): V2Battle {
   const joinedTick = Math.max(0, stateTick - battle.ageTicks);
-  const candidates: BattleParticipant[] = [
+  const candidates: V2Participant[] = [
     {
       playerId: battle.defender,
       troops: battle.defenderTroops,
@@ -879,7 +1141,7 @@ function migrateBattle(battle: LegacyBattle, stateTick: number): GameState["batt
       reinforcementAmount: 0,
     })),
   ];
-  const grouped = new Map<string, BattleParticipant>();
+  const grouped = new Map<string, V2Participant>();
   for (const participant of candidates) {
     const key = participant.playerId === null ? "neutral" : `p${participant.playerId}`;
     const current = grouped.get(key);
@@ -910,7 +1172,7 @@ function migrateBattle(battle: LegacyBattle, stateTick: number): GameState["batt
   };
 }
 
-function migrateLegacy(snapshot: LegacySnapshot): EngineSnapshot {
+function migrateLegacyToV2(snapshot: LegacySnapshot): V2Snapshot {
   if (legacyHash(snapshot.state) !== snapshot.state.stateHash)
     fail("state.stateHash", "does not match deterministic v1 payload");
   const legacy = snapshot.state;
@@ -944,12 +1206,217 @@ function migrateLegacy(snapshot: LegacySnapshot): EngineSnapshot {
     battles: legacy.battles.map((battle) => migrateBattle(battle, legacy.tick)),
     enclosures: [],
     stateHash: "",
+  } satisfies V2Snapshot["state"];
+  state.stateHash = hashGameState(state as unknown as GameState);
+  const migrated: V2Snapshot = {
+    state,
+    commandHistory: snapshot.commandHistory,
+    pendingCommands: snapshot.pendingCommands,
+  };
+  return migrated;
+}
+
+function balancedUnits(count: number): UnitCounts {
+  const quotient = Math.floor(count / UNIT_TYPES.length);
+  const remainder = count % UNIT_TYPES.length;
+  return {
+    melee: quotient + Number(remainder >= 1),
+    ranged: quotient + Number(remainder >= 2),
+    wizard: quotient,
+  };
+}
+
+function distributeMilli(totalMilli: number, units: UnitCounts): UnitCounts {
+  const unitTotal = totalUnits(units);
+  if (totalMilli === 0 || unitTotal === 0) return { melee: 0, ranged: 0, wizard: 0 };
+  const output: UnitCounts = { melee: 0, ranged: 0, wizard: 0 };
+  let assigned = 0;
+  const remainders = UNIT_TYPES.map((type, order) => {
+    const numerator = totalMilli * units[type];
+    const amount = Math.floor(numerator / unitTotal);
+    output[type] = amount;
+    assigned += amount;
+    return { type, order, remainder: numerator % unitTotal };
+  }).sort((left, right) => right.remainder - left.remainder || left.order - right.order);
+  for (let index = 0; assigned < totalMilli; index += 1, assigned += 1) {
+    output[remainders[index % remainders.length]!.type] += 1;
+  }
+  return output;
+}
+
+function migrateStructureType(type: V2Structure["type"]): CurrentStructure["type"] {
+  if (type === "farm") return "archery-range";
+  if (type === "turret") return "wizard-tower";
+  return "barracks";
+}
+
+function validateV2MigrationInput(snapshot: V2Snapshot): void {
+  const landIds = new Set(snapshot.state.map.landIds);
+  for (const [tileId, tile] of Object.entries(snapshot.state.map.tiles)) {
+    const structure = tile.structure;
+    if (!structure) continue;
+    if (
+      structure.type !== "barracks" &&
+      (structure.rallyTargetId !== null ||
+        structure.barracksProgressMilli !== 0 ||
+        structure.rallyQueuedTroops !== 0)
+    ) {
+      fail(`state.map.tiles.${tileId}.structure`, "non-Barracks has Barracks state");
+    }
+    if (structure.type !== "turret" && structure.turretShotProgressMilli !== 0) {
+      fail(`state.map.tiles.${tileId}.structure`, "non-Turret has shot state");
+    }
+    if (structure.rallyQueuedTroops > tile.troops) {
+      fail(
+        `state.map.tiles.${tileId}.structure.rallyQueuedTroops`,
+        "exceeds retained local troops",
+      );
+    }
+    if (structure.rallyQueuedTroops > 0 && structure.rallyTargetId === null) {
+      fail(`state.map.tiles.${tileId}.structure.rallyQueuedTroops`, "requires a rally target");
+    }
+    if (structure.status === "seized" && structure.rallyQueuedTroops !== 0) {
+      fail(
+        `state.map.tiles.${tileId}.structure.rallyQueuedTroops`,
+        "seized Barracks cannot queue troops",
+      );
+    }
+    if (structure.rallyTargetId !== null && !landIds.has(structure.rallyTargetId)) {
+      fail(`state.map.tiles.${tileId}.structure.rallyTargetId`, "references non-land");
+    }
+    if (structure.barracksProgressMilli > BALANCE.barracks.trainTicks * BALANCE.fullIntegrity) {
+      fail(`state.map.tiles.${tileId}.structure.barracksProgressMilli`, "exceeds one cycle");
+    }
+    if (structure.turretShotProgressMilli >= 30 * BALANCE.fullIntegrity) {
+      fail(`state.map.tiles.${tileId}.structure.turretShotProgressMilli`, "exceeds one cycle");
+    }
+  }
+}
+
+function migrateV2TileUnits(tile: V2Snapshot["state"]["map"]["tiles"][string]): UnitCounts {
+  const queuedMelee = tile.structure?.type === "barracks" ? tile.structure.rallyQueuedTroops : 0;
+  const units = balancedUnits(tile.troops - queuedMelee);
+  units.melee += queuedMelee;
+  return units;
+}
+
+function migrateV2Structure(structure: V2Structure | null): CurrentStructure | null {
+  if (!structure) return null;
+  const type = migrateStructureType(structure.type);
+  const trainTicks =
+    type === "barracks"
+      ? BALANCE.barracks.trainTicks
+      : type === "archery-range"
+        ? BALANCE.archeryRange.trainTicks
+        : BALANCE.wizardTower.trainTicks;
+  const migratedProgress =
+    structure.type === "barracks"
+      ? structure.barracksProgressMilli
+      : structure.type === "turret"
+        ? Math.floor((structure.turretShotProgressMilli * trainTicks) / 30)
+        : 0;
+  const maximumProgress = trainTicks * BALANCE.fullIntegrity;
+  const rallyQueuedUnits =
+    structure.type === "barracks"
+      ? unitsOf("melee", structure.rallyQueuedTroops)
+      : { melee: 0, ranged: 0, wizard: 0 };
+  return {
+    type,
+    completedCount: structure.completedCount,
+    status: structure.status,
+    integrity: structure.integrity,
+    pendingProgressTicks: structure.pendingProgressTicks,
+    seizedTicks: structure.seizedTicks,
+    productionPaused: structure.productionPaused,
+    trainingProgressMilli: Math.min(migratedProgress, Math.max(0, maximumProgress)),
+    rallyTargetId: structure.rallyTargetId,
+    rallyQueuedUnits,
+  };
+}
+
+function migrateV2Command(command: V2Command): GameCommand {
+  if (command.type === "build") {
+    return { ...command, structure: migrateStructureType(command.structure) };
+  }
+  if (command.type === "toggle-barracks") {
+    return {
+      type: "toggle-production",
+      playerId: command.playerId,
+      tileId: command.tileId,
+      scheduledTick: command.scheduledTick,
+    };
+  }
+  return command;
+}
+
+function migrateV2Snapshot(snapshot: V2Snapshot): EngineSnapshot {
+  if (hashGameState(snapshot.state as unknown as GameState) !== snapshot.state.stateHash) {
+    fail("state.stateHash", "does not match deterministic v2 payload");
+  }
+  validateV2MigrationInput(snapshot);
+  const state = {
+    ...snapshot.state,
+    version: 3 as const,
+    map: {
+      ...snapshot.state.map,
+      tiles: Object.fromEntries(
+        Object.entries(snapshot.state.map.tiles).map(([id, tile]) => {
+          const units = migrateV2TileUnits(tile);
+          return [
+            id,
+            {
+              id: tile.id,
+              q: tile.q,
+              r: tile.r,
+              terrain: tile.terrain,
+              owner: tile.owner,
+              units,
+              structure: migrateV2Structure(tile.structure),
+              controlledSinceTick: tile.controlledSinceTick,
+              lastRewardTick: tile.lastRewardTick,
+              decorationSeed: tile.decorationSeed,
+            },
+          ];
+        }),
+      ),
+    },
+    stacks: snapshot.state.stacks.map((stack) => {
+      const { troops, ...fields } = stack;
+      return { ...fields, units: balancedUnits(troops) };
+    }),
+    battles: snapshot.state.battles.map((battle) => ({
+      ...battle,
+      participants: battle.participants.map((participant) => {
+        const { troops, casualtyProgressMilli, ...fields } = participant;
+        const units = balancedUnits(troops);
+        return {
+          ...fields,
+          units,
+          casualtyProgressMilli: distributeMilli(casualtyProgressMilli, units),
+        };
+      }),
+    })),
+    stateHash: "",
   } satisfies GameState;
+  const aggregateUnits = state.players.map(() => 0);
+  for (const tileId of state.map.landIds) {
+    const tile = state.map.tiles[tileId]!;
+    if (tile.owner !== null) aggregateUnits[tile.owner]! += totalUnits(tile.units);
+  }
+  for (const stack of state.stacks) aggregateUnits[stack.owner]! += totalUnits(stack.units);
+  for (const battle of state.battles)
+    for (const participant of battle.participants)
+      if (participant.playerId !== null)
+        aggregateUnits[participant.playerId]! += totalUnits(participant.units);
+  state.players = state.players.map((player, index) => ({
+    ...player,
+    troopCount: aggregateUnits[index]!,
+  }));
   state.stateHash = hashGameState(state);
   const migrated: EngineSnapshot = {
     state,
-    commandHistory: snapshot.commandHistory as GameCommand[],
-    pendingCommands: snapshot.pendingCommands as GameCommand[] | undefined,
+    commandHistory: snapshot.commandHistory.map(migrateV2Command),
+    pendingCommands: snapshot.pendingCommands?.map(migrateV2Command),
   };
   validateReferences(migrated);
   return migrated;
@@ -978,8 +1445,10 @@ export function parseEngineSnapshot(value: unknown): EngineSnapshot {
     "version" in value.state
       ? value.state.version
       : undefined;
-  if (version === 1) return migrateLegacy(parseWithSchema(legacySnapshotSchema, value));
-  if (version !== 2) throw new SnapshotValidationError("Unsupported snapshot version");
+  if (version === 1)
+    return migrateV2Snapshot(migrateLegacyToV2(parseWithSchema(legacySnapshotSchema, value)));
+  if (version === 2) return migrateV2Snapshot(parseWithSchema(v2SnapshotSchema, value));
+  if (version !== 3) throw new SnapshotValidationError("Unsupported snapshot version");
   const parsed = parseWithSchema(snapshotSchema, value) as EngineSnapshot;
   validateReferences(parsed);
   return parsed;

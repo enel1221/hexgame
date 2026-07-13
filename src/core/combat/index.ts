@@ -1,9 +1,27 @@
 import { BALANCE } from "../../shared/balance";
-import type { BattleParticipant, BattleState, GameState, TileState } from "../../shared/types";
-import { isStructureOperational, seizeStructure, structureIntegrityPermille } from "../buildings";
+import type {
+  BattleParticipant,
+  BattleState,
+  GameState,
+  StructureState,
+  TileState,
+  UnitCounts,
+  UnitType,
+} from "../../shared/types";
+import { isStructureOperational, seizeStructure } from "../buildings";
 import { emitEvent } from "../engine/events";
 import { axialKey, neighbors } from "../hex";
 import { checkAndRewardElimination, grantCaptureReward } from "../rewards";
+import {
+  addUnits,
+  emptyUnits,
+  matchupPermille,
+  sumUnits,
+  totalUnits,
+  UNIT_TYPES,
+  unitTypeForStructure,
+  unitsOf,
+} from "../units";
 
 export const BATTLE_CONTROL_MIN = 0;
 export const BATTLE_CONTROL_MAX = 10_000;
@@ -14,12 +32,32 @@ const PRESSURE_SCALE = 1_000;
 
 export interface BattleParticipantPresentation {
   playerId: number | null;
+  units: UnitCounts;
+  /** Derived convenience total; authoritative state stores only the composition. */
   troops: number;
+  basePowerByType: UnitCounts;
+  effectivePowerByType: UnitCounts;
+  localSupportPower: UnitCounts;
+  adjacentSupportPower: UnitCounts;
+  basePower: number;
   effectivePower: number;
+  rpsMultiplierPermille: number;
   sharePermyriad: number;
-  turretSupportCount: number;
   incumbent: boolean;
 }
+
+interface ParticipantPowerSnapshot {
+  participant: BattleParticipant;
+  basePowerByType: UnitCounts;
+  effectivePowerByType: UnitCounts;
+  localSupportPower: UnitCounts;
+  adjacentSupportPower: UnitCounts;
+  basePower: number;
+  effectivePower: number;
+  rpsMultiplierPermille: number;
+}
+
+type BattleSupport = Map<number, Map<number, UnitCounts>>;
 
 function compareNullablePlayerIds(left: number | null, right: number | null): number {
   if (left === right) return 0;
@@ -48,52 +86,69 @@ function terrainDefensePermille(tile: TileState): number {
   return 1000;
 }
 
-export function attackerEffectivePower(troops: number): number {
-  return Math.max(0, troops) * 1000;
+function powerFromUnits(units: UnitCounts): UnitCounts {
+  return {
+    melee: units.melee * 1000,
+    ranged: units.ranged * 1000,
+    wizard: units.wizard * 1000,
+  };
 }
 
-function operationalTurret(tile: TileState): NonNullable<TileState["structure"]> | null {
-  const structure = tile.structure;
-  if (
-    structure?.type !== "turret" ||
-    structure.completedCount <= 0 ||
-    !isStructureOperational(structure)
-  ) {
-    return null;
+function scalePower(power: UnitCounts, permille: number): UnitCounts {
+  return {
+    melee: Math.floor((power.melee * permille) / 1000),
+    ranged: Math.floor((power.ranged * permille) / 1000),
+    wizard: Math.floor((power.wizard * permille) / 1000),
+  };
+}
+
+function adjustPowerForMatchup(base: UnitCounts, opposition: UnitCounts): UnitCounts {
+  const oppositionTotal = totalUnits(opposition);
+  if (oppositionTotal <= 0) return { ...base };
+  const result = emptyUnits();
+  for (const sourceType of UNIT_TYPES) {
+    let weightedMatchup = 0;
+    for (const targetType of UNIT_TYPES) {
+      weightedMatchup += opposition[targetType] * matchupPermille(sourceType, targetType);
+    }
+    result[sourceType] = Math.floor(
+      (base[sourceType] * weightedMatchup) / (oppositionTotal * 1000),
+    );
   }
-  return structure;
+  return result;
 }
 
-/**
- * Home defense keeps virtual defenders outside the percentage multiplier.
- * Ordinary terrain applies afterward to the whole defensive formation.
- */
-export function defenderEffectivePower(tile: TileState, troops: number): number {
-  const organicPower = attackerEffectivePower(troops);
-  if (organicPower <= 0) return 0;
+export function effectivePowerFromBase(
+  basePowerByType: UnitCounts,
+  oppositionPowerByType: UnitCounts,
+): number {
+  return totalUnits(adjustPowerForMatchup(basePowerByType, oppositionPowerByType));
+}
 
-  const turret = operationalTurret(tile);
-  const integrity = structureIntegrityPermille(turret);
-  const completedCount = turret?.completedCount ?? 0;
-  const fullBonus =
-    completedCount <= 0
-      ? 0
-      : Math.min(
-          BALANCE.turret.maxDefensePermille,
-          BALANCE.turret.baseDefensePermille +
-            Math.max(0, completedCount - 1) * BALANCE.turret.additionalDefensePermille,
-        );
-  const integrityScaledBonus = Math.floor((fullBonus * integrity) / BALANCE.fullIntegrity);
-  const boostedOrganic = Math.floor(
-    (organicPower * (BALANCE.fullIntegrity + integrityScaledBonus)) / BALANCE.fullIntegrity,
+export function attackerEffectivePower(units: UnitCounts, opposition = emptyUnits()): number {
+  return effectivePowerFromBase(powerFromUnits(units), powerFromUnits(opposition));
+}
+
+function localSupportPower(structure: StructureState | null): UnitCounts {
+  if (!structure || !isStructureOperational(structure)) return emptyUnits();
+  const fullPower = Math.min(
+    BALANCE.localSupportCapMilli,
+    structure.completedCount * BALANCE.localSupportPerCopyMilli,
   );
-  const virtualPower = Math.floor(
-    (completedCount * BALANCE.turret.virtualDefendersPerCopy * 1000 * integrity) /
-      BALANCE.fullIntegrity,
-  );
-  return Math.floor(
-    ((boostedOrganic + virtualPower) * terrainDefensePermille(tile)) / BALANCE.fullIntegrity,
-  );
+  const power = Math.floor((fullPower * structure.integrity) / BALANCE.fullIntegrity);
+  return unitsOf(unitTypeForStructure(structure.type), power);
+}
+
+/** Local typed support is terrain-scaled with the incumbent's actual formation. */
+export function defenderEffectivePower(
+  tile: TileState,
+  units: UnitCounts,
+  opposition = emptyUnits(),
+): number {
+  if (totalUnits(units) <= 0) return 0;
+  const local = localSupportPower(tile.structure);
+  const base = scalePower(addUnits(powerFromUnits(units), local), terrainDefensePermille(tile));
+  return totalUnits(adjustPowerForMatchup(base, powerFromUnits(opposition)));
 }
 
 export function getBattleParticipant(
@@ -101,18 +156,6 @@ export function getBattleParticipant(
   playerId: number | null,
 ): BattleParticipant | undefined {
   return battle.participants.find((participant) => participant.playerId === playerId);
-}
-
-export function participantEffectivePower(
-  state: GameState,
-  battle: BattleState,
-  participant: BattleParticipant,
-): number {
-  const tile = state.map.tiles[battle.tileId];
-  if (!tile || participant.troops <= 0) return 0;
-  return participant.playerId === battle.incumbentOwner
-    ? defenderEffectivePower(tile, participant.troops)
-    : attackerEffectivePower(participant.troops);
 }
 
 export function battleControlDelta(ownPower: number, opposingPower: number): number {
@@ -138,13 +181,11 @@ function allocateByWeight<K>(
   const result = new Map<K, number>();
   if (total <= 0 || entries.length === 0) return result;
   const positive = entries.filter((entry) => entry.weight > 0);
-  const weighted =
-    positive.length > 0 ? positive : entries.map((entry) => ({ ...entry, weight: 1 }));
-  const weightTotal = weighted.reduce((sum, entry) => sum + entry.weight, 0);
+  if (positive.length === 0) return result;
+  const weightTotal = positive.reduce((sum, entry) => sum + entry.weight, 0);
   let assigned = 0;
   const remainders: Array<{ key: K; remainder: number }> = [];
-
-  for (const entry of weighted) {
+  for (const entry of positive) {
     const numerator = total * entry.weight;
     const allocation = Math.floor(numerator / weightTotal);
     result.set(entry.key, allocation);
@@ -155,78 +196,183 @@ function allocateByWeight<K>(
     (left, right) => right.remainder - left.remainder || compareKeys(left.key, right.key),
   );
   for (let index = 0; assigned < total; index += 1, assigned += 1) {
-    const entry = remainders[index % remainders.length]!;
-    result.set(entry.key, (result.get(entry.key) ?? 0) + 1);
+    const key = remainders[index % remainders.length]!.key;
+    result.set(key, (result.get(key) ?? 0) + 1);
   }
   return result;
 }
 
-function battleSupportsTurretAt(
-  state: GameState,
-  battle: BattleState,
-  sourceTile: TileState,
-  owner: number,
-): boolean {
-  const ownerParticipant = getBattleParticipant(battle, owner);
-  if (!ownerParticipant || ownerParticipant.troops <= 0) return false;
-  if (
-    !battle.participants.some(
-      (participant) => participant.playerId !== owner && participant.troops > 0,
-    )
-  ) {
-    return false;
-  }
-  const ownBattle = state.battles.find((candidate) => candidate.tileId === sourceTile.id);
-  if (ownBattle) return ownBattle.id === battle.id;
-  return neighbors(sourceTile).some((neighbor) => axialKey(neighbor) === battle.tileId);
+function battleHasActiveOwner(battle: BattleState, owner: number): boolean {
+  const participant = getBattleParticipant(battle, owner);
+  return Boolean(participant && totalUnits(participant.units) > 0);
 }
 
-function supportingTurretCounts(state: GameState, battle: BattleState): Map<number, number> {
-  const counts = new Map<number, number>();
-  for (const tileId of state.map.landIds) {
-    const tile = state.map.tiles[tileId]!;
-    const turret = operationalTurret(tile);
-    const owner = tile.owner;
-    if (!turret || owner === null) continue;
-    if (!battleSupportsTurretAt(state, battle, tile, owner)) continue;
-    counts.set(owner, (counts.get(owner) ?? 0) + turret.completedCount);
-  }
-  return counts;
+function battleHasHostileParticipant(battle: BattleState, owner: number): boolean {
+  return battle.participants.some(
+    (participant) => participant.playerId !== owner && totalUnits(participant.units) > 0,
+  );
 }
 
-export function supportingTurretCount(
+function supportEligible(battle: BattleState, sourceTile: TileState, owner: number): boolean {
+  return (
+    battleHasActiveOwner(battle, owner) &&
+    battleHasHostileParticipant(battle, owner) &&
+    neighbors(sourceTile).some((neighbor) => axialKey(neighbor) === battle.tileId)
+  );
+}
+
+function capSupportByType(power: UnitCounts, cap: number): UnitCounts {
+  const total = totalUnits(power);
+  if (total <= cap) return power;
+  const allocations = allocateByWeight(
+    cap,
+    UNIT_TYPES.map((type) => ({ key: type, weight: power[type] })),
+    (left, right) => UNIT_TYPES.indexOf(left) - UNIT_TYPES.indexOf(right),
+  );
+  return {
+    melee: allocations.get("melee") ?? 0,
+    ranged: allocations.get("ranged") ?? 0,
+    wizard: allocations.get("wizard") ?? 0,
+  };
+}
+
+/** One aggregate, own-tile-prioritized support budget per structure stack. */
+function adjacentSupportAssignments(state: GameState): BattleSupport {
+  const output: BattleSupport = new Map();
+  const battles = [...state.battles].sort(
+    (left, right) => compareTileIds(state, left.tileId, right.tileId) || left.id - right.id,
+  );
+  const sourceIds = [...state.map.landIds].sort((left, right) =>
+    compareTileIds(state, left, right),
+  );
+  for (const sourceId of sourceIds) {
+    const source = state.map.tiles[sourceId]!;
+    const structure = source.structure;
+    const owner = source.owner;
+    if (owner === null || !structure || !isStructureOperational(structure)) continue;
+    const ownBattle = battles.find((battle) => battle.tileId === sourceId);
+    if (ownBattle) continue;
+    const eligible = battles.filter((battle) => supportEligible(battle, source, owner));
+    if (eligible.length === 0) continue;
+    const fullBudget = Math.min(
+      BALANCE.adjacentSupportSourceCapMilli,
+      structure.completedCount * BALANCE.adjacentSupportPerCopyMilli,
+    );
+    const budget = Math.floor((fullBudget * structure.integrity) / BALANCE.fullIntegrity);
+    const allocations = allocateByWeight(
+      budget,
+      eligible.map((battle) => ({ key: battle.id, weight: 1 })),
+      (left, right) => {
+        const leftBattle = eligible.find((battle) => battle.id === left)!;
+        const rightBattle = eligible.find((battle) => battle.id === right)!;
+        return (
+          compareTileIds(state, leftBattle.tileId, rightBattle.tileId) ||
+          leftBattle.id - rightBattle.id
+        );
+      },
+    );
+    const type = unitTypeForStructure(structure.type);
+    for (const battle of eligible) {
+      const amount = allocations.get(battle.id) ?? 0;
+      if (amount <= 0) continue;
+      const byPlayer = output.get(battle.id) ?? new Map<number, UnitCounts>();
+      byPlayer.set(owner, addUnits(byPlayer.get(owner) ?? emptyUnits(), unitsOf(type, amount)));
+      output.set(battle.id, byPlayer);
+    }
+  }
+  for (const byPlayer of output.values()) {
+    for (const [playerId, power] of byPlayer) {
+      byPlayer.set(playerId, capSupportByType(power, BALANCE.adjacentSupportBattleCapMilli));
+    }
+  }
+  return output;
+}
+
+function battlePowerSnapshots(
   state: GameState,
   battle: BattleState,
-  playerId: number | null,
+  allSupport = adjacentSupportAssignments(state),
+): ParticipantPowerSnapshot[] {
+  const tile = state.map.tiles[battle.tileId]!;
+  const support = allSupport.get(battle.id);
+  const bases = [...battle.participants].sort(compareBattleParticipants).map((participant) => {
+    const actual = powerFromUnits(participant.units);
+    const local =
+      participant.playerId === battle.incumbentOwner && totalUnits(participant.units) > 0
+        ? localSupportPower(tile.structure)
+        : emptyUnits();
+    const home =
+      participant.playerId === battle.incumbentOwner
+        ? scalePower(addUnits(actual, local), terrainDefensePermille(tile))
+        : actual;
+    const adjacent =
+      participant.playerId === null
+        ? emptyUnits()
+        : (support?.get(participant.playerId) ?? emptyUnits());
+    return { participant, basePowerByType: addUnits(home, adjacent), local, adjacent };
+  });
+  return bases.map(({ participant, basePowerByType, local, adjacent }) => {
+    const opposition = sumUnits(
+      bases
+        .filter((candidate) => candidate.participant.playerId !== participant.playerId)
+        .map((candidate) => candidate.basePowerByType),
+    );
+    const effectivePowerByType = adjustPowerForMatchup(basePowerByType, opposition);
+    const basePower = totalUnits(basePowerByType);
+    const effectivePower = totalUnits(effectivePowerByType);
+    return {
+      participant,
+      basePowerByType,
+      effectivePowerByType,
+      localSupportPower: local,
+      adjacentSupportPower: adjacent,
+      basePower,
+      effectivePower,
+      rpsMultiplierPermille:
+        basePower <= 0 ? 1000 : Math.floor((effectivePower * 1000) / basePower),
+    };
+  });
+}
+
+export function participantEffectivePower(
+  state: GameState,
+  battle: BattleState,
+  participant: BattleParticipant,
 ): number {
-  if (playerId === null) return 0;
-  return supportingTurretCounts(state, battle).get(playerId) ?? 0;
+  return (
+    battlePowerSnapshots(state, battle).find(
+      (snapshot) => snapshot.participant.playerId === participant.playerId,
+    )?.effectivePower ?? 0
+  );
 }
 
-/** Pure authoritative-to-presentation projection shared by AI and the renderer. */
+/** Pure authoritative-to-presentation projection shared by AI and renderer. */
 export function battlePresentation(
   state: GameState,
   battle: BattleState,
 ): BattleParticipantPresentation[] {
-  const participants = [...battle.participants].sort(compareBattleParticipants);
-  const powers = participants.map((participant) => ({
-    participant,
-    power: participantEffectivePower(state, battle, participant),
-  }));
+  const snapshots = battlePowerSnapshots(state, battle);
   const shares = allocateByWeight(
     BATTLE_CONTROL_MAX,
-    powers.map(({ participant, power }) => ({ key: participant.playerId, weight: power })),
+    snapshots.map(({ participant, effectivePower }) => ({
+      key: participant.playerId,
+      weight: effectivePower,
+    })),
     compareNullablePlayerIds,
   );
-  const turretCounts = supportingTurretCounts(state, battle);
-  return powers.map(({ participant, power }) => ({
-    playerId: participant.playerId,
-    troops: participant.troops,
-    effectivePower: power,
-    sharePermyriad: shares.get(participant.playerId) ?? 0,
-    turretSupportCount:
-      participant.playerId === null ? 0 : (turretCounts.get(participant.playerId) ?? 0),
-    incumbent: participant.playerId === battle.incumbentOwner,
+  return snapshots.map((snapshot) => ({
+    playerId: snapshot.participant.playerId,
+    units: { ...snapshot.participant.units },
+    troops: totalUnits(snapshot.participant.units),
+    basePowerByType: snapshot.basePowerByType,
+    effectivePowerByType: snapshot.effectivePowerByType,
+    localSupportPower: snapshot.localSupportPower,
+    adjacentSupportPower: snapshot.adjacentSupportPower,
+    basePower: snapshot.basePower,
+    effectivePower: snapshot.effectivePower,
+    rpsMultiplierPermille: snapshot.rpsMultiplierPermille,
+    sharePermyriad: shares.get(snapshot.participant.playerId) ?? 0,
+    incumbent: snapshot.participant.playerId === battle.incumbentOwner,
   }));
 }
 
@@ -234,21 +380,22 @@ function addReinforcement(
   state: GameState,
   battle: BattleState,
   participant: BattleParticipant,
-  troops: number,
+  units: UnitCounts,
 ): void {
-  participant.troops += troops;
+  const amount = totalUnits(units);
+  participant.units = addUnits(participant.units, units);
   participant.control = Math.min(
     BATTLE_CONTROL_MAX,
-    participant.control + Math.min(800, troops * 20),
+    participant.control + Math.min(800, amount * 20),
   );
   participant.lastReinforcementTick = state.tick;
-  participant.reinforcementAmount = troops;
+  participant.reinforcementAmount = amount;
   emitEvent(state, {
     type: "reinforcement",
     playerId: participant.playerId ?? undefined,
     tileId: battle.tileId,
-    amount: troops,
-    message: `${troops} troops reinforced ${
+    amount,
+    message: `${amount} troops reinforced ${
       participant.playerId === null
         ? "the neutral defenders"
         : (state.players[participant.playerId]?.name ?? "an army")
@@ -260,19 +407,19 @@ export function startBattle(
   state: GameState,
   tile: TileState,
   attacker: number,
-  troops: number,
+  units: UnitCounts,
   entryFrom: string,
 ): BattleState {
   const battle: BattleState = {
-    id: state.nextEntityId,
+    id: state.nextEntityId++,
     tileId: tile.id,
     incumbentOwner: tile.owner,
     participants: [
       {
         playerId: tile.owner,
-        troops: tile.troops,
+        units: { ...tile.units },
         control: BATTLE_CONTROL_START,
-        casualtyProgressMilli: 0,
+        casualtyProgressMilli: emptyUnits(),
         entryFrom: tile.id,
         joinedTick: state.tick,
         lastReinforcementTick: -1,
@@ -280,9 +427,9 @@ export function startBattle(
       },
       {
         playerId: attacker,
-        troops,
+        units: { ...units },
         control: BATTLE_CONTROL_START,
-        casualtyProgressMilli: 0,
+        casualtyProgressMilli: emptyUnits(),
         entryFrom,
         joinedTick: state.tick,
         lastReinforcementTick: -1,
@@ -292,8 +439,7 @@ export function startBattle(
     ageTicks: 0,
     roundAccumulator: 0,
   };
-  state.nextEntityId += 1;
-  tile.troops = 0;
+  tile.units = emptyUnits();
   state.battles.push(battle);
   state.battles.sort(
     (left, right) => compareTileIds(state, left.tileId, right.tileId) || left.id - right.id,
@@ -307,26 +453,27 @@ export function startBattle(
   return battle;
 }
 
-/** Resolves a stack reaching a tile into a merge, reinforcement, or immediate new faction. */
+/** Resolves a stack reaching a tile into a merge, reinforcement, or new faction. */
 export function handleStackArrival(
   state: GameState,
   owner: number,
-  troops: number,
+  units: UnitCounts,
   tileId: string,
   entryFrom: string,
 ): void {
   const tile = state.map.tiles[tileId];
-  if (!tile || troops <= 0) return;
+  const amount = totalUnits(units);
+  if (!tile || amount <= 0) return;
   const battle = state.battles.find((candidate) => candidate.tileId === tileId);
   if (battle) {
     const participant = getBattleParticipant(battle, owner);
-    if (participant) addReinforcement(state, battle, participant, troops);
+    if (participant) addReinforcement(state, battle, participant, units);
     else {
       battle.participants.push({
         playerId: owner,
-        troops,
+        units: { ...units },
         control: BATTLE_CONTROL_START,
-        casualtyProgressMilli: 0,
+        casualtyProgressMilli: emptyUnits(),
         entryFrom,
         joinedTick: state.tick,
         lastReinforcementTick: -1,
@@ -337,173 +484,87 @@ export function handleStackArrival(
         type: "reinforcement",
         playerId: owner,
         tileId,
-        amount: troops,
-        message: `${state.players[owner]?.name ?? "An army"} entered the battle with ${troops}`,
+        amount,
+        message: `${state.players[owner]?.name ?? "An army"} entered the battle with ${amount}`,
       });
     }
     return;
   }
-
   if (tile.owner === owner) {
-    tile.troops += troops;
+    tile.units = addUnits(tile.units, units);
     return;
   }
-  startBattle(state, tile, owner, troops, entryFrom);
+  startBattle(state, tile, owner, units, entryFrom);
 }
 
-interface TurretVolley {
-  sourceTileId: string;
-  targetBattleId: number;
-  owner: number;
-  shots: number;
+interface CasualtyTarget {
+  key: string;
+  playerId: number | null;
+  type: UnitType;
+  count: number;
 }
 
-function applyTurretFire(state: GameState): Map<number, Map<number | null, number>> {
-  const battles = [...state.battles].sort(
-    (left, right) => compareTileIds(state, left.tileId, right.tileId) || left.id - right.id,
+function casualtyKey(playerId: number | null, type: UnitType): string {
+  return `${playerId === null ? "neutral" : playerId}:${type}`;
+}
+
+function compareCasualtyKeys(left: string, right: string): number {
+  const [leftPlayer, leftType] = left.split(":") as [string, UnitType];
+  const [rightPlayer, rightType] = right.split(":") as [string, UnitType];
+  const leftId = leftPlayer === "neutral" ? -1 : Number(leftPlayer);
+  const rightId = rightPlayer === "neutral" ? -1 : Number(rightPlayer);
+  return leftId - rightId || UNIT_TYPES.indexOf(leftType) - UNIT_TYPES.indexOf(rightType);
+}
+
+function tickBattleRound(
+  state: GameState,
+  battle: BattleState,
+  support: BattleSupport,
+): Map<number | null, number> {
+  const snapshots = battlePowerSnapshots(state, battle, support);
+  const powers = new Map(
+    snapshots.map((snapshot) => [snapshot.participant.playerId, snapshot.effectivePower]),
   );
-  const preShotPower = new Map<number, Map<number | null, number>>();
-  const preShotTroops = new Map<number, Map<number | null, number>>();
-  for (const battle of battles) {
-    const troopMap = new Map<number | null, number>();
-    const powerMap = new Map<number | null, number>();
-    for (const participant of [...battle.participants].sort(compareBattleParticipants)) {
-      troopMap.set(participant.playerId, participant.troops);
-      powerMap.set(participant.playerId, participantEffectivePower(state, battle, participant));
-    }
-    preShotTroops.set(battle.id, troopMap);
-    preShotPower.set(battle.id, powerMap);
-  }
-
-  const threshold = BALANCE.turret.shotTicks * BALANCE.fullIntegrity;
-  const volleys: TurretVolley[] = [];
-  const turretTileIds = state.map.landIds
-    .filter((tileId) => operationalTurret(state.map.tiles[tileId]!))
-    .sort((left, right) => compareTileIds(state, left, right));
-  for (const sourceTileId of turretTileIds) {
-    const sourceTile = state.map.tiles[sourceTileId]!;
-    const turret = operationalTurret(sourceTile)!;
-    const owner = sourceTile.owner;
-    if (owner === null || state.players[owner]?.eliminated) continue;
-
-    const ownBattle = battles.find((battle) => battle.tileId === sourceTileId);
-    const eligible = (
-      ownBattle
-        ? battleSupportsTurretAt(state, ownBattle, sourceTile, owner)
-          ? [ownBattle]
-          : []
-        : battles.filter((battle) => battleSupportsTurretAt(state, battle, sourceTile, owner))
-    ).sort((left, right) => compareTileIds(state, left.tileId, right.tileId) || left.id - right.id);
-    if (eligible.length === 0) continue;
-
-    turret.turretShotProgressMilli += turret.completedCount * turret.integrity;
-    const shots = Math.floor(turret.turretShotProgressMilli / threshold);
-    turret.turretShotProgressMilli %= threshold;
-    if (shots <= 0) continue;
-
-    const quotas = allocateByWeight(
-      shots,
-      eligible.map((battle) => ({ key: battle.id, weight: 1 })),
-      (left, right) => {
-        const leftBattle = eligible.find((battle) => battle.id === left)!;
-        const rightBattle = eligible.find((battle) => battle.id === right)!;
-        const rotation =
-          (Math.floor(state.tick / BALANCE.turret.shotTicks) + sourceTile.decorationSeed) %
-          eligible.length;
-        const leftIndex = eligible.indexOf(leftBattle);
-        const rightIndex = eligible.indexOf(rightBattle);
-        const leftRank = (leftIndex - rotation + eligible.length) % eligible.length;
-        const rightRank = (rightIndex - rotation + eligible.length) % eligible.length;
-        return leftRank - rightRank || leftBattle.id - rightBattle.id;
-      },
-    );
-    for (const battle of eligible) {
-      const quota = quotas.get(battle.id) ?? 0;
-      if (quota > 0) volleys.push({ sourceTileId, targetBattleId: battle.id, owner, shots: quota });
-    }
-  }
-
-  const losses = new Map<string, number>();
-  const keyFor = (battleId: number, playerId: number | null): string =>
-    `${battleId}:${playerId === null ? "neutral" : playerId}`;
-  for (const volley of volleys) {
-    const battle = battles.find((candidate) => candidate.id === volley.targetBattleId);
-    const troopMap = preShotTroops.get(volley.targetBattleId);
-    if (!battle || !troopMap) continue;
-    const targets = [...battle.participants]
-      .filter((participant) => participant.playerId !== volley.owner)
-      .sort(compareBattleParticipants)
-      .map((participant) => ({
-        key: participant.playerId,
-        weight: troopMap.get(participant.playerId) ?? 0,
-      }));
-    const allocations = allocateByWeight(volley.shots, targets, compareNullablePlayerIds);
-    for (const [playerId, amount] of allocations) {
-      const key = keyFor(battle.id, playerId);
-      losses.set(key, (losses.get(key) ?? 0) + amount);
-    }
-  }
-
-  for (const battle of battles) {
-    for (const participant of battle.participants) {
-      const intended = losses.get(keyFor(battle.id, participant.playerId)) ?? 0;
-      const actual = Math.min(participant.troops, intended);
-      if (actual <= 0) continue;
-      participant.troops -= actual;
-      recordTroopLoss(state, participant.playerId, actual);
-    }
-  }
-  for (const volley of volleys) {
-    const battle = battles.find((candidate) => candidate.id === volley.targetBattleId);
-    if (!battle) continue;
-    emitEvent(state, {
-      type: "turret-volley",
-      playerId: volley.owner,
-      tileId: battle.tileId,
-      sourceTileId: volley.sourceTileId,
-      amount: volley.shots,
-      message: `${volley.shots} aggregated Turret shot${volley.shots === 1 ? "" : "s"} supported ${battle.tileId}`,
-    });
-  }
-  return preShotPower;
-}
-
-function tickBattleRound(state: GameState, battle: BattleState): Map<number | null, number> {
-  const participants = [...battle.participants].sort(compareBattleParticipants);
-  const powers = new Map<number | null, number>();
-  const troops = new Map<number | null, number>();
-  for (const participant of participants) {
-    powers.set(participant.playerId, participantEffectivePower(state, battle, participant));
-    troops.set(participant.playerId, participant.troops);
-  }
   if (battle.ageTicks <= BATTLE_WARMUP_TICKS) return powers;
-
-  const totalPower = [...powers.values()].reduce((sum, power) => sum + power, 0);
+  const totalPower = snapshots.reduce((sum, snapshot) => sum + snapshot.effectivePower, 0);
   const controlChanges = new Map<number | null, number>();
-  const incomingPressure = new Map<number | null, number>();
-  for (const participant of participants) {
-    const ownPower = powers.get(participant.playerId) ?? 0;
+  const incoming = new Map<string, number>();
+  const targets: CasualtyTarget[] = snapshots.flatMap(({ participant }) =>
+    UNIT_TYPES.filter((type) => participant.units[type] > 0).map((type) => ({
+      key: casualtyKey(participant.playerId, type),
+      playerId: participant.playerId,
+      type,
+      count: participant.units[type],
+    })),
+  );
+
+  for (const snapshot of snapshots) {
+    const ownPower = snapshot.effectivePower;
     const opposingPower = Math.max(0, totalPower - ownPower);
     const delta = battleControlDelta(ownPower, opposingPower);
-    const winsTie = ownPower === opposingPower && participant.playerId === battle.incumbentOwner;
-    controlChanges.set(participant.playerId, ownPower > opposingPower || winsTie ? delta : -delta);
-
-    // Outgoing pressure uses the same snapshotted effective power as control.
-    // Home terrain/Turret defense therefore belongs only to its own faction;
-    // adjacent Turrets remain separately represented by their real shot budget.
-    const pressure = Math.floor(ownPower / BALANCE.combatPressurePowerDivisor);
-    const targets = participants
-      .filter((target) => target.playerId !== participant.playerId)
-      .map((target) => ({ key: target.playerId, weight: troops.get(target.playerId) ?? 0 }));
-    const allocated = allocateByWeight(pressure, targets, compareNullablePlayerIds);
-    for (const [targetId, amount] of allocated) {
-      incomingPressure.set(targetId, (incomingPressure.get(targetId) ?? 0) + amount);
+    const winsTie =
+      ownPower === opposingPower && snapshot.participant.playerId === battle.incumbentOwner;
+    controlChanges.set(
+      snapshot.participant.playerId,
+      ownPower > opposingPower || winsTie ? delta : -delta,
+    );
+    for (const sourceType of UNIT_TYPES) {
+      const pressure = Math.floor(
+        snapshot.effectivePowerByType[sourceType] / BALANCE.combatPressurePowerDivisor,
+      );
+      const hostileTargets = targets
+        .filter((target) => target.playerId !== snapshot.participant.playerId)
+        .map((target) => ({
+          key: target.key,
+          weight: target.count * matchupPermille(sourceType, target.type),
+        }));
+      const allocation = allocateByWeight(pressure, hostileTargets, compareCasualtyKeys);
+      for (const [key, amount] of allocation) incoming.set(key, (incoming.get(key) ?? 0) + amount);
     }
   }
 
-  // Control and casualties are both applied only after every faction used the
-  // same pre-round snapshot.
-  for (const participant of participants) {
+  for (const snapshot of snapshots) {
+    const participant = snapshot.participant;
     participant.control = Math.max(
       BATTLE_CONTROL_MIN,
       Math.min(
@@ -511,13 +572,16 @@ function tickBattleRound(state: GameState, battle: BattleState): Map<number | nu
         participant.control + (controlChanges.get(participant.playerId) ?? 0),
       ),
     );
-    const progress =
-      participant.casualtyProgressMilli + (incomingPressure.get(participant.playerId) ?? 0);
-    const intendedLoss = Math.floor(progress / PRESSURE_SCALE);
-    participant.casualtyProgressMilli = progress % PRESSURE_SCALE;
-    const actualLoss = Math.min(participant.troops, intendedLoss);
-    participant.troops -= actualLoss;
-    recordTroopLoss(state, participant.playerId, actualLoss);
+    for (const type of UNIT_TYPES) {
+      const progress =
+        participant.casualtyProgressMilli[type] +
+        (incoming.get(casualtyKey(participant.playerId, type)) ?? 0);
+      const intendedLoss = Math.floor(progress / PRESSURE_SCALE);
+      participant.casualtyProgressMilli[type] = progress % PRESSURE_SCALE;
+      const actualLoss = Math.min(participant.units[type], intendedLoss);
+      participant.units[type] -= actualLoss;
+      recordTroopLoss(state, participant.playerId, actualLoss);
+    }
   }
   return powers;
 }
@@ -542,14 +606,14 @@ function pruneDefeatedParticipants(
 ): void {
   const ordered = [...battle.participants].sort(compareBattleParticipants);
   let survivors = ordered.filter(
-    (participant) => participant.troops > 0 && participant.control > BATTLE_CONTROL_MIN,
+    (participant) => totalUnits(participant.units) > 0 && participant.control > BATTLE_CONTROL_MIN,
   );
   if (survivors.length === 0 && ordered.length > 0) {
     const chosen = [...ordered].sort((left, right) =>
       survivorOrder(battle, powers, left, right),
     )[0]!;
-    if (chosen.troops <= 0) {
-      chosen.troops = 1;
+    if (totalUnits(chosen.units) <= 0) {
+      chosen.units = unitsOf("melee", 1);
       if (chosen.playerId !== null) {
         const player = state.players[chosen.playerId];
         if (player) player.stats.troopsLost = Math.max(0, player.stats.troopsLost - 1);
@@ -558,13 +622,13 @@ function pruneDefeatedParticipants(
     chosen.control = Math.max(1, chosen.control);
     survivors = [chosen];
   }
-
   const survivorSet = new Set(survivors);
   for (const participant of ordered) {
     if (survivorSet.has(participant)) continue;
-    if (participant.troops > 0) {
-      recordTroopLoss(state, participant.playerId, participant.troops);
-      participant.troops = 0;
+    const remaining = totalUnits(participant.units);
+    if (remaining > 0) {
+      recordTroopLoss(state, participant.playerId, remaining);
+      participant.units = emptyUnits();
     }
   }
   battle.participants = survivors.sort(compareBattleParticipants);
@@ -574,22 +638,20 @@ function resolveBattle(state: GameState, battle: BattleState, winner: BattlePart
   const tile = state.map.tiles[battle.tileId];
   if (!tile) return;
   for (const participant of battle.participants) {
-    if (participant === winner) continue;
-    recordTroopLoss(state, participant.playerId, participant.troops);
+    if (participant !== winner)
+      recordTroopLoss(state, participant.playerId, totalUnits(participant.units));
   }
   state.battles = state.battles.filter((candidate) => candidate.id !== battle.id);
-
   const previousOwner = battle.incumbentOwner;
   if (winner.playerId === previousOwner) {
-    tile.troops = Math.max(1, winner.troops);
+    tile.units = totalUnits(winner.units) > 0 ? { ...winner.units } : unitsOf("melee", 1);
     return;
   }
   if (winner.playerId === null) {
     tile.owner = null;
-    tile.troops = Math.max(1, winner.troops);
+    tile.units = totalUnits(winner.units) > 0 ? { ...winner.units } : unitsOf("melee", 1);
     return;
   }
-
   const capturedStructure =
     tile.structure && tile.structure.completedCount > 0
       ? { type: tile.structure.type, completedCount: tile.structure.completedCount }
@@ -597,7 +659,7 @@ function resolveBattle(state: GameState, battle: BattleState, winner: BattlePart
   seizeStructure(tile);
   grantCaptureReward(state, winner.playerId, tile, previousOwner, capturedStructure);
   tile.owner = winner.playerId;
-  tile.troops = Math.max(1, winner.troops);
+  tile.units = totalUnits(winner.units) > 0 ? { ...winner.units } : unitsOf("melee", 1);
   tile.controlledSinceTick = state.tick;
   const player = state.players[winner.playerId];
   if (player) player.stats.tilesCaptured += 1;
@@ -642,23 +704,21 @@ export function tickCombat(state: GameState): void {
   state.battles.sort(
     (left, right) => compareTileIds(state, left.tileId, right.tileId) || left.id - right.id,
   );
-  const turretPowerSnapshots = applyTurretFire(state);
+  const support = adjacentSupportAssignments(state);
   const activeAtStart = [...state.battles];
   for (const battle of activeAtStart) {
     if (!state.battles.some((candidate) => candidate.id === battle.id)) continue;
     battle.ageTicks += 1;
     battle.roundAccumulator += 1;
-    let powers =
-      turretPowerSnapshots.get(battle.id) ??
-      new Map(
-        battle.participants.map((participant) => [
-          participant.playerId,
-          participantEffectivePower(state, battle, participant),
-        ]),
-      );
+    let powers = new Map(
+      battlePowerSnapshots(state, battle, support).map((snapshot) => [
+        snapshot.participant.playerId,
+        snapshot.effectivePower,
+      ]),
+    );
     while (battle.roundAccumulator >= BALANCE.combatRoundTicks) {
       battle.roundAccumulator -= BALANCE.combatRoundTicks;
-      powers = tickBattleRound(state, battle);
+      powers = tickBattleRound(state, battle, support);
     }
     settleBattle(state, battle, powers);
   }

@@ -2,9 +2,9 @@ import type { Metadata } from "next";
 import { GameApp } from "@/src/client/GameApp";
 
 export const metadata: Metadata = {
-  title: "Hex Dominion — Territory bends to the bold",
+  title: "Hex Dominion — Command the counter",
   description:
-    "A real-time procedural hex strategy game of expansion, local armies, animated battles, and deterministic AI.",
+    "A real-time hex strategy game of compact chokepoint maps, typed armies, animated battles, and deterministic AI.",
 };
 
 export default function Home() {

@@ -17,6 +17,7 @@ import {
   isEligibleSpawnCenter,
 } from "../map";
 import { hashSeed } from "../rng";
+import { emptyUnits, UNIT_TYPES } from "../units";
 import {
   deriveReservedPlacementCenters,
   placementDistanceBalance,
@@ -181,7 +182,7 @@ export function createPlacementState(
       centerId: null,
       locked: false,
       relocationCount: 0,
-      aiTargetRelocations: 2 + (scheduleSeed % 2),
+      aiTargetRelocations: 2,
       nextAiActionTick: 7 + (scheduleSeed % 6),
     };
   });
@@ -194,9 +195,16 @@ export function createPlacementState(
 
 /** Populate the first visible AI claims in stable player order. */
 export function initializeAiPlacements(state: GameState): void {
-  for (const placement of state.placement.placements) {
-    if (state.players[placement.playerId]?.isHuman || placement.centerId !== null) continue;
-    const selected = fallbackCenter(state, placement.playerId, 0);
+  const aiPlacements = state.placement.placements.filter(
+    (placement) => !state.players[placement.playerId]?.isHuman,
+  );
+  const reservations = reservedAiPlacements(state);
+  const reservedCenters = reservations.map((reservation) => reservation.centerId);
+  const initialShift = aiPlacements.length > 2 ? 1 : 0;
+  for (let index = 0; index < aiPlacements.length; index += 1) {
+    const placement = aiPlacements[index]!;
+    if (placement.centerId !== null) continue;
+    const selected = reservedCenters[(index + initialShift) % reservedCenters.length];
     if (!selected)
       throw new Error(`No eligible initial spawn remains for AI ${placement.playerId}`);
     placement.centerId = selected;
@@ -315,40 +323,49 @@ export function applyPlacementCommand(
 
 function relocateAndLockAi(state: GameState): void {
   const seed = placementSeed(state);
-  for (const placement of state.placement.placements) {
-    if (state.players[placement.playerId]?.isHuman || placement.locked) continue;
-    if (
-      placement.nextAiActionTick === null ||
-      placement.nextAiActionTick > state.placement.elapsedTicks
-    ) {
-      continue;
-    }
-    if (placement.relocationCount < placement.aiTargetRelocations) {
-      const nextRelocationCount = placement.relocationCount + 1;
-      // Reserve the final visible relocation for the canonical fair vector.
-      // Earlier markers remain deterministic, eligible, and noncolliding.
-      if (nextRelocationCount < placement.aiTargetRelocations) {
-        const selected = fallbackCenter(
-          state,
-          placement.playerId,
-          nextRelocationCount,
-          placement.centerId,
-        );
-        if (selected) placement.centerId = selected;
-      }
-      placement.relocationCount += 1;
-      const gap =
-        6 +
-        (hashSeed(`${seed}:placement-gap:${placement.playerId}:${placement.relocationCount}`) % 5);
-      placement.nextAiActionTick += gap;
-    }
-  }
-
   const aiPlacements = state.placement.placements.filter(
     (placement) => !state.players[placement.playerId]?.isHuman && !placement.locked,
   );
+  if (aiPlacements.length === 0) return;
   if (
-    aiPlacements.length === 0 ||
+    !aiPlacements.every(
+      (placement) =>
+        placement.nextAiActionTick !== null &&
+        placement.nextAiActionTick <= state.placement.elapsedTicks,
+    )
+  ) {
+    return;
+  }
+
+  if (aiPlacements.some((placement) => placement.relocationCount < placement.aiTargetRelocations)) {
+    const nextRelocationCount = Math.min(...aiPlacements.map((entry) => entry.relocationCount)) + 1;
+    const reservations = reservedAiPlacements(state).map((reservation) => reservation.centerId);
+    if (aiPlacements.length === 1) {
+      const placement = aiPlacements[0]!;
+      const selected =
+        nextRelocationCount < placement.aiTargetRelocations
+          ? fallbackCenter(state, placement.playerId, nextRelocationCount, placement.centerId)
+          : reservations[0];
+      if (selected) placement.centerId = selected;
+    } else {
+      const initialShift = aiPlacements.length > 2 ? 1 : 0;
+      const shift =
+        nextRelocationCount < aiPlacements[0]!.aiTargetRelocations ? initialShift + 1 : 0;
+      for (let index = 0; index < aiPlacements.length; index += 1) {
+        aiPlacements[index]!.centerId = reservations[(index + shift) % reservations.length]!;
+      }
+    }
+    for (const placement of aiPlacements) {
+      placement.relocationCount = nextRelocationCount;
+      const gap =
+        6 +
+        (hashSeed(`${seed}:placement-gap:${placement.playerId}:${placement.relocationCount}`) % 5);
+      placement.nextAiActionTick = state.placement.elapsedTicks + gap;
+    }
+    return;
+  }
+
+  if (
     !aiPlacements.every(
       (placement) =>
         placement.relocationCount >= placement.aiTargetRelocations &&
@@ -406,6 +423,14 @@ export function finalizePlacements(state: GameState): void {
     throw new Error(fairness.reason ?? "Final centers violate map fairness");
   }
   applySpawnAllocations(state.map, finalCenters, placementSeed(state));
+  for (let playerId = 0; playerId < state.map.spawnClusters.length; playerId += 1) {
+    const cluster = state.map.spawnClusters[playerId]!;
+    for (const tileId of cluster) state.map.tiles[tileId]!.units = emptyUnits();
+    for (let index = 0; index < BALANCE.startingTroops; index += 1) {
+      const tile = state.map.tiles[cluster[index % cluster.length]!]!;
+      tile.units[UNIT_TYPES[index % UNIT_TYPES.length]!] += 1;
+    }
+  }
   state.config.startingCenters = [...finalCenters];
   state.placement = {
     elapsedTicks: 0,

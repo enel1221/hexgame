@@ -6,15 +6,19 @@ import type {
   SendPercent,
   StructureType,
   TileState,
+  UnitCounts,
 } from "../../shared/types";
 import { axialKey, compareAxialKeys, distance, neighbors } from "../hex";
 import { findPath } from "../hex/pathfinding";
 import { SeededRng } from "../rng";
 import { validateCommand } from "../commands";
+import { unitsForPercent } from "../movement";
+import { addUnits, sumUnits, totalUnits } from "../units";
 import {
   attackerEffectivePower,
   battlePresentation,
   defenderEffectivePower,
+  effectivePowerFromBase,
   getBattleParticipant,
 } from "../combat";
 
@@ -74,6 +78,10 @@ function ownedTiles(state: GameState, playerId: number): TileState[] {
     .filter((tile) => tile.owner === playerId);
 }
 
+function tileTroops(tile: TileState): number {
+  return totalUnits(tile.units);
+}
+
 function movingTroopsForPercent(troops: number, percent: SendPercent): number {
   return Math.min(troops - 1, Math.floor((troops * percent) / 100));
 }
@@ -95,6 +103,7 @@ function decisionProfile(state: GameState, playerId: number, tuning: AiTuning): 
     (player.tileCount * 1000) / Math.max(1, state.map.landCount),
   );
   const mustContestLeader = state.victory.leaderId !== null && state.victory.leaderId !== playerId;
+  const activePlayers = state.players.filter((candidate) => !candidate.eliminated).length;
 
   let pressureLevel: 0 | 1 | 2 = state.config.difficulty === "hard" ? 2 : 0;
   if (state.config.difficulty === "easy") {
@@ -106,7 +115,7 @@ function decisionProfile(state: GameState, playerId: number, tuning: AiTuning): 
   }
   if (mustContestLeader || ownControlPermille >= 650) pressureLevel = 2;
   const attackBatchSize: 1 | 2 | 3 | 4 | 5 =
-    ownControlPermille >= 450
+    activePlayers <= 2 || ownControlPermille >= 450
       ? 5
       : state.config.difficulty === "hard"
         ? 3
@@ -117,6 +126,16 @@ function decisionProfile(state: GameState, playerId: number, tuning: AiTuning): 
             : neutralPermille <= 100 || state.tick >= 9_000
               ? 3
               : 2;
+
+  if (activePlayers <= 2) {
+    return {
+      ...tuning,
+      pressureLevel: 2,
+      attackBatchSize: 5,
+      attackRatioPermille: 900,
+      sendPercent: 100,
+    };
+  }
 
   if (state.config.difficulty === "easy") {
     if (pressureLevel === 1) {
@@ -153,7 +172,7 @@ function decisionProfile(state: GameState, playerId: number, tuning: AiTuning): 
         ...tuning,
         pressureLevel,
         attackBatchSize,
-        attackRatioPermille: mustContestLeader ? 1_000 : 1_025,
+        attackRatioPermille: activePlayers <= 2 ? 900 : mustContestLeader ? 1_000 : 1_025,
         sendPercent: 100,
       };
     }
@@ -175,9 +194,44 @@ function strategicBattlePower(
     (participant) => participant.playerId === playerId,
   );
   if (!presentation) return 0;
-  // Adjacent support causes real casualties instead of virtual soldiers. This
-  // small heuristic premium lets AI account for it without altering rules.
-  return presentation.effectivePower + presentation.turretSupportCount * 500;
+  return presentation.effectivePower;
+}
+
+function projectedAttackPowers(
+  presentation: ReturnType<typeof battlePresentation>,
+  playerId: number,
+  units: UnitCounts,
+): { attackerPower: number; defenderPower: number } {
+  // Existing base power already includes terrain and assigned support. Ignore
+  // prospective support for the entrant so the threshold stays conservative,
+  // then recompute every faction's RPS multiplier against the added formation.
+  const entrantBase: UnitCounts = {
+    melee: units.melee * 1_000,
+    ranged: units.ranged * 1_000,
+    wizard: units.wizard * 1_000,
+  };
+  const opposition = sumUnits(presentation.map((participant) => participant.basePowerByType));
+  return {
+    attackerPower: effectivePowerFromBase(entrantBase, opposition),
+    defenderPower: Math.max(
+      0,
+      ...presentation
+        .filter((participant) => participant.playerId !== playerId)
+        .map((participant) =>
+          effectivePowerFromBase(
+            participant.basePowerByType,
+            addUnits(
+              entrantBase,
+              sumUnits(
+                presentation
+                  .filter((opponent) => opponent.playerId !== participant.playerId)
+                  .map((opponent) => opponent.basePowerByType),
+              ),
+            ),
+          ),
+        ),
+    ),
+  };
 }
 
 function chooseReinforcement(
@@ -216,8 +270,10 @@ function chooseReinforcement(
   if (battles.length === 0) return null;
 
   const sources = ownedTiles(state, playerId)
-    .filter((tile) => tile.troops > tuning.reserveTroops + 1)
-    .sort((left, right) => right.troops - left.troops || compareAxialKeys(left.id, right.id))
+    .filter((tile) => tileTroops(tile) > tuning.reserveTroops + 1)
+    .sort(
+      (left, right) => tileTroops(right) - tileTroops(left) || compareAxialKeys(left.id, right.id),
+    )
     .slice(0, tuning.candidateLimit);
 
   for (const battle of battles) {
@@ -226,17 +282,20 @@ function chooseReinforcement(
       if (source.id === target.id) continue;
       const path = findPath(state.map, source.id, target.id, playerId, true);
       if (!path) continue;
-      const percent: SendPercent = source.troops >= 12 ? 50 : 75;
-      const sent = movingTroopsForPercent(source.troops, percent);
+      const percent: SendPercent = tileTroops(source) >= 12 ? 50 : 75;
+      const sentUnits = unitsForPercent(source.units, percent);
       const participant = getBattleParticipant(battle, playerId)!;
+      const opposition = sumUnits(
+        battle.participants
+          .filter((candidate) => candidate.playerId !== playerId)
+          .map((candidate) => candidate.units),
+      );
+      const projectedUnits = addUnits(participant.units, sentUnits);
       const projectedOrganicPower =
         participant.playerId === battle.incumbentOwner
-          ? defenderEffectivePower(target, participant.troops + sent)
-          : attackerEffectivePower(participant.troops + sent);
-      const ownSupport =
-        battlePresentation(state, battle).find((entry) => entry.playerId === playerId)
-          ?.turretSupportCount ?? 0;
-      const projectedPower = projectedOrganicPower + ownSupport * 500;
+          ? defenderEffectivePower(target, projectedUnits, opposition)
+          : attackerEffectivePower(projectedUnits, opposition);
+      const projectedPower = projectedOrganicPower;
       const enemyPower = Math.max(
         0,
         ...battle.participants
@@ -272,19 +331,21 @@ function chooseDevelopedTileDefense(
       tile,
       threat: adjacentTiles(state, tile)
         .filter((neighbor) => neighbor.owner !== null && neighbor.owner !== playerId)
-        .reduce((largest, neighbor) => Math.max(largest, neighbor.troops), 0),
+        .reduce((largest, neighbor) => Math.max(largest, tileTroops(neighbor)), 0),
     }))
-    .filter(({ tile, threat }) => threat > tile.troops)
+    .filter(({ tile, threat }) => threat > tileTroops(tile))
     .sort(
       (left, right) =>
-        right.threat - right.tile.troops - (left.threat - left.tile.troops) ||
+        right.threat - tileTroops(right.tile) - (left.threat - tileTroops(left.tile)) ||
         compareAxialKeys(left.tile.id, right.tile.id),
     );
   if (threatened.length === 0) return null;
 
   const sources = ownedTiles(state, playerId)
-    .filter((tile) => tile.troops > tuning.reserveTroops + 2)
-    .sort((left, right) => right.troops - left.troops || compareAxialKeys(left.id, right.id))
+    .filter((tile) => tileTroops(tile) > tuning.reserveTroops + 2)
+    .sort(
+      (left, right) => tileTroops(right) - tileTroops(left) || compareAxialKeys(left.id, right.id),
+    )
     .slice(0, tuning.candidateLimit);
   for (const target of threatened) {
     for (const source of sources) {
@@ -325,13 +386,19 @@ function chooseEnclosureResponse(
   for (const enclosure of trapped) {
     const pocket = new Set(enclosure.tileIds);
     const sources = ownedTiles(state, playerId)
-      .filter((tile) => pocket.has(tile.id) && tile.troops > tuning.reserveTroops + 1)
-      .sort((left, right) => right.troops - left.troops || compareAxialKeys(left.id, right.id))
+      .filter((tile) => pocket.has(tile.id) && tileTroops(tile) > tuning.reserveTroops + 1)
+      .sort(
+        (left, right) =>
+          tileTroops(right) - tileTroops(left) || compareAxialKeys(left.id, right.id),
+      )
       .slice(0, tuning.candidateLimit);
     const targets = enclosure.boundaryIds
       .map((tileId) => state.map.tiles[tileId])
       .filter((tile): tile is TileState => Boolean(tile))
-      .sort((left, right) => left.troops - right.troops || compareAxialKeys(left.id, right.id));
+      .sort(
+        (left, right) =>
+          tileTroops(left) - tileTroops(right) || compareAxialKeys(left.id, right.id),
+      );
     for (const source of sources) {
       for (const target of targets) {
         const command: GameCommand = {
@@ -362,14 +429,20 @@ function chooseEnclosureResponse(
           tile!.owner === playerId &&
           !state.battles.some((battle) => battle.tileId === tile!.id),
       )
-      .sort((left, right) => left.troops - right.troops || compareAxialKeys(left.id, right.id));
+      .sort(
+        (left, right) =>
+          tileTroops(left) - tileTroops(right) || compareAxialKeys(left.id, right.id),
+      );
     const sources = ownedTiles(state, playerId)
-      .filter((tile) => tile.troops > tuning.reserveTroops + 3)
-      .sort((left, right) => right.troops - left.troops || compareAxialKeys(left.id, right.id))
+      .filter((tile) => tileTroops(tile) > tuning.reserveTroops + 3)
+      .sort(
+        (left, right) =>
+          tileTroops(right) - tileTroops(left) || compareAxialKeys(left.id, right.id),
+      )
       .slice(0, tuning.candidateLimit);
     for (const target of boundary.slice(0, 6)) {
       for (const source of sources) {
-        if (source.id === target.id || source.troops <= target.troops + 2) continue;
+        if (source.id === target.id || tileTroops(source) <= tileTroops(target) + 2) continue;
         const command: GameCommand = {
           type: "move",
           playerId,
@@ -401,9 +474,12 @@ function targetValue(
   if (target.terrain === "meadow") score += 140;
   else if (target.terrain === "muster") score += 175;
   else if (target.terrain === "hills") score += 35;
-  if (target.structure?.type === "farm") score += 180 * target.structure.completedCount;
-  else if (target.structure?.type === "barracks") score += 280 * target.structure.completedCount;
-  else if (target.structure?.type === "turret") score += 120 * target.structure.completedCount;
+  if (target.structure?.type === "barracks") score += 240 * target.structure.completedCount;
+  else if (target.structure?.type === "archery-range") {
+    score += 250 * target.structure.completedCount;
+  } else if (target.structure?.type === "wizard-tower") {
+    score += 280 * target.structure.completedCount;
+  }
   if (target.owner !== null) {
     const opponent = state.players[target.owner];
     if (opponent?.tileCount === 1) score += 800;
@@ -419,7 +495,7 @@ function targetValue(
       if (state.players[playerId]!.tileCount >= opponent.tileCount * 2) score += 260;
     }
   }
-  score -= target.troops * 45;
+  score -= tileTroops(target) * 45;
   // Prefer coherent fronts rather than long tendrils.
   score += adjacentTiles(state, target).filter((tile) => tile.owner === playerId).length * 35;
   return score;
@@ -475,17 +551,21 @@ function chooseAttackOrExpansion(
   const sources = ownedTiles(state, playerId)
     .filter(
       (tile) =>
-        tile.troops > tuning.reserveTroops &&
+        tileTroops(tile) > tuning.reserveTroops &&
         !excludedSources.has(tile.id) &&
         isFrontier(state, tile, playerId),
     )
-    .sort((left, right) => right.troops - left.troops || compareAxialKeys(left.id, right.id))
+    .sort(
+      (left, right) => tileTroops(right) - tileTroops(left) || compareAxialKeys(left.id, right.id),
+    )
     .slice(0, tuning.candidateLimit);
   const focusOpponentId = chooseFocusOpponent(state, playerId, sources);
   const choices: AttackChoice[] = [];
+  const battlePresentations = new Map<number, ReturnType<typeof battlePresentation>>();
 
   for (const source of sources) {
-    const sent = movingTroopsForPercent(source.troops, tuning.sendPercent);
+    const sent = movingTroopsForPercent(tileTroops(source), tuning.sendPercent);
+    const sentUnits = unitsForPercent(source.units, tuning.sendPercent);
     if (sent <= 0) continue;
     for (const target of adjacentTiles(state, source)) {
       if (target.owner === playerId) continue;
@@ -493,23 +573,31 @@ function chooseAttackOrExpansion(
       // Existing participants are owned by reinforcement policy. A new faction
       // may deliberately enter a favorable free-for-all immediately.
       if (battle && getBattleParticipant(battle, playerId)) continue;
-      const defenderPower = battle
-        ? Math.max(
-            0,
-            ...battle.participants.map((participant) =>
-              strategicBattlePower(state, battle, participant.playerId),
-            ),
+      const projected = battle
+        ? projectedAttackPowers(
+            battlePresentations.get(battle.id) ??
+              (() => {
+                const value = battlePresentation(state, battle);
+                battlePresentations.set(battle.id, value);
+                return value;
+              })(),
+            playerId,
+            sentUnits,
           )
-        : defenderEffectivePower(target, target.troops);
+        : null;
+      const attackerPower =
+        projected?.attackerPower ?? attackerEffectivePower(sentUnits, target.units);
+      const defenderPower =
+        projected?.defenderPower ?? defenderEffectivePower(target, target.units, sentUnits);
       const requiredPower = Math.floor((defenderPower * tuning.attackRatioPermille) / 1000);
-      if (sent * 1000 < requiredPower) continue;
+      if (attackerPower < requiredPower) continue;
       choices.push({
         source,
         target,
         score:
           targetValue(state, playerId, target, tuning.pressureLevel, focusOpponentId) +
           (battle ? 220 + battle.participants.length * 45 : 0) +
-          Math.min(180, (sent - target.troops) * 20) +
+          Math.min(180, (sent - tileTroops(target)) * 20) +
           rng.int(tuning.jitter + 1),
       });
     }
@@ -548,9 +636,12 @@ function chooseMobilization(
   const sources = owned
     .filter(
       (tile) =>
-        !isFrontier(state, tile, playerId) && tile.troops > Math.max(5, tuning.reserveTroops + 2),
+        !isFrontier(state, tile, playerId) &&
+        tileTroops(tile) > Math.max(5, tuning.reserveTroops + 2),
     )
-    .sort((left, right) => right.troops - left.troops || compareAxialKeys(left.id, right.id))
+    .sort(
+      (left, right) => tileTroops(right) - tileTroops(left) || compareAxialKeys(left.id, right.id),
+    )
     .slice(0, tuning.candidateLimit);
 
   for (const source of sources) {
@@ -592,19 +683,14 @@ function canDevelopAs(tile: TileState, type: StructureType): boolean {
 function chooseBuild(state: GameState, playerId: number): GameCommand | null {
   const player = state.players[playerId]!;
   const owned = ownedTiles(state, playerId);
-  const farms = countStructures(state, playerId, "farm");
   const barracks = countStructures(state, playerId, "barracks");
-  const turrets = countStructures(state, playerId, "turret");
-  const desiredFarms = Math.max(1, Math.ceil(owned.length / 10));
+  const ranges = countStructures(state, playerId, "archery-range");
+  const towers = countStructures(state, playerId, "wizard-tower");
   const desiredBarracks = Math.max(1, Math.ceil(owned.length / 22));
-  const desiredTurrets = Math.floor(owned.length / 18);
+  const desiredRanges = Math.max(1, Math.ceil(owned.length / 18));
+  const desiredTowers = Math.max(1, Math.floor(owned.length / 20));
 
   const options: Array<{ type: StructureType; tiles: TileState[]; desired: boolean }> = [
-    {
-      type: "farm",
-      desired: farms < desiredFarms && player.supplyMilli >= BALANCE.farm.costMilli + 10_000,
-      tiles: owned.filter((tile) => tile.terrain === "meadow" && canDevelopAs(tile, "farm")),
-    },
     {
       type: "barracks",
       desired:
@@ -612,14 +698,18 @@ function chooseBuild(state: GameState, playerId: number): GameCommand | null {
       tiles: owned.filter((tile) => tile.terrain === "muster" && canDevelopAs(tile, "barracks")),
     },
     {
-      type: "turret",
-      desired: turrets < desiredTurrets && player.supplyMilli >= BALANCE.turret.costMilli + 20_000,
+      type: "archery-range",
+      desired:
+        ranges < desiredRanges && player.supplyMilli >= BALANCE.archeryRange.costMilli + 15_000,
       tiles: owned.filter(
-        (tile) =>
-          canDevelopAs(tile, "turret") &&
-          isFrontier(state, tile, playerId) &&
-          tile.terrain !== "meadow",
+        (tile) => tile.terrain === "meadow" && canDevelopAs(tile, "archery-range"),
       ),
+    },
+    {
+      type: "wizard-tower",
+      desired:
+        towers < desiredTowers && player.supplyMilli >= BALANCE.wizardTower.costMilli + 20_000,
+      tiles: owned.filter((tile) => canDevelopAs(tile, "wizard-tower")),
     },
   ];
 

@@ -16,7 +16,7 @@ export async function generateMetadata(): Promise<Metadata> {
       template: "%s · Hex Dominion",
     },
     description:
-      "Command a living procedural realm in a tactical territory RTS built for the browser.",
+      "Command Melee, Ranged, and Wizard armies across compact procedural chokepoints.",
     applicationName: "Hex Dominion",
     keywords: ["strategy game", "hex game", "browser RTS", "procedural map", "multiplayer"],
     icons: {
@@ -28,7 +28,7 @@ export async function generateMetadata(): Promise<Metadata> {
       url: origin,
       title: "Hex Dominion",
       description:
-        "Territory bends to the bold. Expand, fortify, and conquer a living procedural hex realm.",
+        "Wizard beats Melee, Ranged beats Wizard, and Melee beats Ranged across a compact procedural realm.",
       images: [
         {
           url: `${origin}/og.png`,
@@ -41,7 +41,7 @@ export async function generateMetadata(): Promise<Metadata> {
     twitter: {
       card: "summary_large_image",
       title: "Hex Dominion",
-      description: "Territory bends to the bold.",
+      description: "Command the counter. Break the chokepoint.",
       images: [`${origin}/og.png`],
     },
   };

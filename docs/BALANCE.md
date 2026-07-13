@@ -7,32 +7,32 @@
 | Parameter               |              Value | Notes                                                     |
 | ----------------------- | -----------------: | --------------------------------------------------------- |
 | Starting Supply         |                100 | Per ruler                                                 |
-| Starting troops         |                 24 | Deterministically distributed over the starting cluster   |
+| Starting troops         |         24 (8/8/8) | Equal Melee/Ranged/Wizard composition over the cluster    |
 | Starting owned tiles    |                  7 | Connected center plus its six neighbors                   |
 | Free starting structure |         1 Barracks | Active, on the center Muster Ground                       |
 | Placement padding       |           radius 2 | Footprint/local expansion cannot touch water or an edge   |
 | Minimum center distance |            6 hexes | Applies to provisional and locked centers                 |
 | Multiplayer placement   |   300 ticks / 30 s | Missing starts are assigned deterministically             |
 | AI placement lock       | <=42 ticks / 4.2 s | Relay start floor is 5 s so locked bot centers never move |
-| Target land per ruler   |                 95 | Before clamping                                           |
-| Minimum playable land   |                380 | Four-player floor                                         |
-| Maximum playable land   |              2,100 | Safety cap; 21 players currently target 1,995             |
+| Target land per ruler   |                 52 | Before clamping                                           |
+| Minimum playable land   |                180 | Two/three-player floor                                    |
+| Maximum playable land   |              1,092 | Safety cap and current 21-player target                   |
 | Supported AI opponents  |               3–20 | 4–21 total rulers in single-player                        |
 | Recent event retention  |                 24 | UI/state event ring length                                |
 | Autosave interval       |   150 ticks / 15 s | Single-player local snapshot cadence                      |
 
 Generated cell count is chosen so playable land remains 72–82% of all cells. The terrain shares below are per mille of playable land; Plains receive the remainder after the four allocated biomes.
 
-| Terrain        | Configured share |             Defense |                                                   Movement | Build rules        |
-| -------------- | ---------------: | ------------------: | ---------------------------------------------------------: | ------------------ |
-| Fertile Meadow |       18.0–23.0% |              normal |                            9 ticks / 0.9 s per entered hex | Farm or Turret     |
-| Muster Ground  |        8.0–12.0% |              normal |                                            9 ticks / 0.9 s | Barracks or Turret |
-| Plains         |        remainder |              normal |                                            9 ticks / 0.9 s | Turret             |
-| Forest         |       10.5–14.5% | +12% defender power |                                            9 ticks / 0.9 s | Turret             |
-| Hills          |        9.5–15.5% | +25% defender power | 115% movement-cost multiplier, rounded to 11 ticks / 1.1 s | Turret             |
-| Water          |         excluded |                 n/a |                                                 impassable | none               |
+| Terrain        | Configured share |             Defense |                                                   Movement | Build rules                   |
+| -------------- | ---------------: | ------------------: | ---------------------------------------------------------: | ----------------------------- |
+| Fertile Meadow |       18.0–23.0% |              normal |                            9 ticks / 0.9 s per entered hex | Archery Range or Wizard Tower |
+| Muster Ground  |        8.0–12.0% |              normal |                                            9 ticks / 0.9 s | Barracks or Wizard Tower      |
+| Plains         |        remainder |              normal |                                            9 ticks / 0.9 s | Wizard Tower                  |
+| Forest         |       10.5–14.5% | +12% defender power |                                            9 ticks / 0.9 s | Wizard Tower                  |
+| Hills          |        9.5–15.5% | +25% defender power | 115% movement-cost multiplier, rounded to 11 ticks / 1.1 s | Wizard Tower                  |
+| Water          |         excluded |                 n/a |                                                 impassable | none                          |
 
-Fairness generation also requires connected land, no one-tile articulation bridge, seven connected owned spawn tiles, 24 starting troops, two Meadows within radius two, one Muster Ground within radius two, at least two open expansion tiles, spawn-center distance of at least six, and bounded local-area/neutral-defense variance. A final vector is distance-balanced only when its largest nearest-opponent distance is at most twice its smallest. Human choices are accepted only when the pure deterministic completion can preserve that rule and the complete map-fairness report.
+Every archetype carves a deterministic impassable-water seam while preserving the exact land target and one connected traversable landmass. River Gates and Highland Passes use controlled two-tile gates; Shattered Crown uses controlled one-tile gates. A qualifying gate must separate substantial regions, uncontrolled articulation bridges are rejected, and spawn centers remain at least three hexes from a gate. Fairness also requires seven connected owned spawn tiles, the 8/8/8 opening army, two Meadows and one Muster Ground within radius two, at least two open expansion tiles, center distance of at least six, and bounded local-area/neutral-defense variance. A final vector is distance-balanced only when its largest nearest-opponent distance is at most twice its smallest.
 
 ## Economy and structures
 
@@ -40,46 +40,34 @@ Fairness generation also requires connected land, no one-tile articulation bridg
 | --------------------------------------- | ---------------------------------------: |
 | Copies of one type per tile             |                                     1–99 |
 | Simultaneous pending additions          |                               1 per tile |
-| Base income per owned land tile         |                           0.035 Supply/s |
-| Farm cost per copy                      |                                45 Supply |
-| Farm construction per copy              |                           60 ticks / 6 s |
-| Active Farm income per copy             |           1.1 Supply/s at full integrity |
-| Barracks cost per copy                  |                                70 Supply |
-| Barracks construction per copy          |                           80 ticks / 8 s |
-| Barracks aggregate training interval    |       25 ticks / 2.5 s at full integrity |
-| Barracks output per cycle               | up to completed count in one batch/stack |
-| Barracks troop cost                     |                           1 Supply/troop |
-| Barracks no-rally local target          |                    40 troops on its tile |
-| Turret cost per copy                    |                                90 Supply |
-| Turret construction per copy            |                         100 ticks / 10 s |
-| Turret virtual defenders per copy       |           3 at full integrity, home only |
-| Turret organic-garrison bonus           |      +18% +2%/extra copy, capped at +50% |
-| Turret casualty shot                    |     30 full-integrity turret-ticks / 3 s |
+| Passive income per ruler                |                             1.0 Supply/s |
+| Income per owned land tile              |                            0.05 Supply/s |
+| Barracks (Melee) cost / build           |                     70 Supply / 80 ticks |
+| Archery Range (Ranged) cost / build     |                     75 Supply / 90 ticks |
+| Wizard Tower (Wizard) cost / build      |                    90 Supply / 100 ticks |
+| Aggregate training interval             |       25 ticks / 2.5 s at full integrity |
+| Output per cycle                        | up to completed count in one typed batch |
+| Unit training cost                      |                            1 Supply/unit |
+| No-rally local target                   |                     40 units on its tile |
+| Local typed support                     |     2/copy, capped at 12 per source tile |
+| Adjacent typed support                  |      1/copy, capped at 6 per source tile |
+| Adjacent support cap                    |         12 per faction in any one battle |
 | Construction cancellation refund        |                     65% of one copy cost |
 | Captured structure integrity            |                                      40% |
 | Captured structure seized/disabled time |                           60 ticks / 6 s |
 | Automatic repair time                   |        120 ticks / 12 s from 40% to 100% |
 
-Only active or repairing completed copies are operational. A contested tile pauses pending construction and ordinary Farm/Barracks output. Existing completed copies continue operating while the next copy constructs. Farm output, Barracks throughput, Turret virtual defenders, and the organic-garrison bonus scale with shared integrity while repairing. Capture destroys the one pending copy, seizes every completed copy together at 40% integrity, and clears a Barracks rally.
+Only active or repairing completed copies are operational. A contested tile pauses pending construction and production. Existing copies continue operating while the next copy constructs. Throughput and support scale with integrity while repairing. Capture destroys the pending copy, seizes every completed copy together at 40% integrity, and clears its rally.
 
-Farm income is `completedCount × 1,100 × integrity / 1,000` milli-Supply per second. Barracks accumulate one shared integrity-scaled production cycle and train `min(completedCount, affordableTroops)` as one batch. A valid rally dispatches only that new batch; a blocked route retains it locally up to the 40-troop cap and automatically retries later.
+Every producer accumulates one shared integrity-scaled cycle and trains its own type: Barracks train Melee, Archery Ranges train Ranged, and Wizard Towers train Wizards. A valid rally dispatches only the new typed batch; a blocked route retains it locally up to the 40-unit cap and retries later. Same-type copies stack to x99, while structure types never mix on one tile.
 
-Turret home power keeps the virtual force outside the percentage multiplier:
+Local support adds the building's typed virtual power to its home battle. Otherwise, adjacent support is divided deterministically among eligible neighboring battles and capped per source and faction. Support never creates a participant or captures territory by itself; its owner must have at least one real unit in the battle.
 
-```text
-integrity factor = integrity / 1,000
-virtual = completedCount × 3 × integrity factor
-organic bonus = min(50%, 18% + 2% × (completedCount - 1)) × integrity factor
-home power = terrain multiplier × (organic troops × (1 + organic bonus) + virtual)
-```
-
-Thus one Plains defender with x3 full-integrity Turrets begins at about `1 × 1.22 + 9 = 10.22` troop-equivalents. The one stack accumulator gains `completedCount × integrity` only while it has an eligible own/adjacent battle; each 30,000 accumulated units produces one simultaneous real casualty. An idle stack cannot bank a future volley.
-
-Economy settles once each simulation second. This keeps rates exact without adding fractional carry fields to state. Barracks stop training at the local target, when paused, when contested, or when the owner cannot pay the troop cost.
+Economy settles once each simulation second. A fresh seven-tile ruler earns `1.0 + 7 × 0.05 = 1.35 Supply/s`, replacing the previous Farm-dependent opening economy.
 
 ## Movement and dispatch
 
-Dispatch choices are 25%, 50%, 75%, and 100%. Each source contributes `min(troops - 1, floor(troops * percent / 100))`, so every issued source retains at least one troop. Hills use the entered tile's 1.15 movement multiplier. Friendly routes can cross owned land and take one final hostile step; they cannot path through hostile territory.
+Dispatch choices are 25%, 50%, 75%, and 100%. Each source contributes `min(total units - 1, floor(total units × percent / 100))`, so every issued source retains at least one real unit. Melee/Ranged/Wizard counts are split with deterministic largest remainders and conserved independently through movement, interruption, arrival, and Multi allocation. Hills use the entered tile's 1.15 movement multiplier. Friendly routes can cross owned land and take one final hostile step; they cannot path through hostile territory or water.
 
 An atomic Multi command accepts at most 64 sources and 16 destinations. It pools every still-eligible source contribution, assigns equal destination quotas (integer remainders in canonical axial order), and solves one deterministic minimum-cost reachable allocation from the pre-mutation state. An infeasible allocation rejects without deductions or stack creation. A due multiplayer command may omit stale sources and replan, but it still executes completely or not at all.
 
@@ -99,9 +87,11 @@ An atomic Multi command accepts at most 64 sources and 16 destinations. It pools
 | Outgoing pressure per round    | `floor(effective power / 200)` milli-casualties |
 | One accumulated casualty       |                          1,000 milli-casualties |
 
-Every faction arriving at an active battle immediately joins or reinforces its canonical participant. A round snapshots every participant's troops, incumbent/terrain benefit, and supporting Turrets. Each faction's outgoing pressure comes only from its own effective power and is divided among every other participant in proportion to those opponents' pre-round troop counts. Casualties and independent participant-control changes apply simultaneously, so participant-array or battle-array order cannot change the result. The battle bar separately normalizes current effective-power shares to exactly 10,000 with stable remainder assignment.
+The counter cycle is Wizard > Melee, Ranged > Wizard, and Melee > Ranged. A unit receives 1,500-per-mille power against the type it counters and 1,000 otherwise. Against a mixed or N-faction battle, each type's modifier is weighted against the aggregate hostile composition. Thus equal pure counter armies begin at 60/40 effective power, while identical mixed formations remain equal.
 
-Two-party fights retain the 8-tick warmup, 2-tick round, and 35-tick minimum. A total-elimination tie chooses the survivor by pre-round effective power, then incumbent ownership, then stable player ID. Turret shots use the same pre-round proportional hostile targeting and can fire only when their owner already has troops in that battle.
+Every faction arriving at an active battle immediately joins or reinforces its canonical participant. A round snapshots exact typed units, incumbent terrain, local building power, and adjacent typed support. Outgoing pressure derives from that faction's RPS-adjusted power and is allocated across hostile faction/type targets with canonical remainder rules. Typed casualties and independent participant-control changes apply simultaneously, so participant or battle array order cannot change the result. The battle bar normalizes effective-power shares to exactly 10,000 and separately exposes actual composition, typed support, and the RPS bonus.
+
+Two-party fights retain the 8-tick warmup, 2-tick round, and 35-tick minimum. A total-elimination tie chooses the survivor by pre-round effective power, then incumbent ownership, then stable player ID.
 
 ## Encirclement
 
@@ -114,20 +104,21 @@ A pocket is one connected component of non-captor playable land whose complete l
 
 ## Capture and elimination rewards
 
-| Reward/guard                     |                 Value |
-| -------------------------------- | --------------------: |
-| Hostile tile base reward         |              3 Supply |
-| Captured Farm bonus              |   +6 Supply (9 total) |
-| Captured Barracks bonus          | +10 Supply (13 total) |
-| Captured Turret bonus            |  +8 Supply (11 total) |
-| Required prior hostile ownership |      200 ticks / 20 s |
-| Per-tile reward cooldown         |      450 ticks / 45 s |
-| Elimination base bounty          |             50 Supply |
-| Defeated Supply transfer         |                   25% |
-| Transfer cap                     |             50 Supply |
-| Maximum elimination payout       |            100 Supply |
+| Reward/guard                     |            Value |
+| -------------------------------- | ---------------: |
+| Neutral tile reward              |         2 Supply |
+| Hostile tile base reward         |         5 Supply |
+| Captured Barracks bonus / copy   |        +8 Supply |
+| Captured Archery Range / copy    |        +8 Supply |
+| Captured Wizard Tower / copy     |       +10 Supply |
+| Required prior hostile ownership | 200 ticks / 20 s |
+| Per-tile reward cooldown         | 450 ticks / 45 s |
+| Elimination base bounty          |        50 Supply |
+| Defeated Supply transfer         |              25% |
+| Transfer cap                     |        50 Supply |
+| Maximum elimination payout       |       100 Supply |
 
-Neutral captures do not pay the hostile-capture reward. The prior-ownership guard and tile cooldown limit deliberate ping-pong farming. A captured stack pays its structure bonus once per completed copy without an aggregate cap. Elimination is credited when the defeated ruler owns no land; their remaining stacks and battle participant are removed, and the eliminator receives the bounty plus the bounded stored-Supply transfer.
+Neutral land pays once when first claimed. Hostile rewards retain the prior-ownership guard and tile cooldown to limit deliberate ping-pong farming. A captured structure stack pays its bonus once per completed copy without an aggregate cap. Elimination is credited when the defeated ruler owns no land; their remaining stacks and battle participant are removed, and the eliminator receives the bounty plus the bounded stored-Supply transfer.
 
 ## Victory
 
@@ -151,11 +142,12 @@ Difficulty changes search behavior only; it grants no Supply, troops, combat, co
 
 ## Tuning rationale
 
-- Seven starting tiles and 24 local troops make an opening order meaningful without allowing immediate player elimination.
-- Very small per-tile income rewards expansion while Farms remain the primary economic choice.
-- Farms pay back their 45-Supply cost in roughly 41 active seconds before base tile income, making developed territory worth fighting for without instant snowballing.
-- Barracks are local logistics: their 40-troop cap and per-troop Supply cost force armies to be moved rather than globally materialized.
-- Turrets add three virtual home defenders per copy and a capped organic-garrison bonus. The x3 fixture is about 10.22 initial Plains equivalents and roughly three real shots over three seconds, keeping 10 attackers insufficient while 13–14 remains the intended near-minimum range.
+- Seven starting tiles and an exact 8/8/8 army make every counter choice available without allowing immediate elimination.
+- Compact maps and water gates make each tile strategically important while keeping all land connected and every route deterministic.
+- Passive plus per-tile income funds all three military producers; neutral and hostile capture rewards keep expansion economically meaningful without a dedicated Farm.
+- Typed producers are local logistics: the 40-unit cap, per-unit Supply cost, and rally path force armies to move rather than materialize globally.
+- A 50% counter bonus is large enough to swing the battle bar visibly, but identical or balanced compositions retain neutral power.
+- Building support is typed and capped, so a defended gate matters without allowing an x99 stack to contribute unbounded virtual force.
 - The 3.5-second resolution floor guarantees visible combat; power-weighted control movement lets mismatches resolve sooner than near-even fights.
 - Capture bonuses make developed enemy tiles attractive, while the 20-second ownership requirement and 45-second cooldown damp repeated trades.
 - The 80%/15-second victory condition gives every surviving ruler a clear interruption window and avoids wins from a momentary border swing.

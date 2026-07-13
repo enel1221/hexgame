@@ -36,7 +36,7 @@ function pathMap(
       r: cell.r,
       terrain: cell.terrain ?? "plains",
       owner: cell.owner === undefined ? 0 : cell.owner,
-      troops: 1,
+      units: { melee: 1, ranged: 0, wizard: 0 },
       structure: null,
       controlledSinceTick: 0,
       lastRewardTick: 0,
@@ -158,6 +158,18 @@ describe("deterministic terrain-aware A*", () => {
     expect(findPath(map, "0,0", "3,0", 0)).toBeNull();
     expect(isLegalPath(map, ["0,0", "1,0", "2,0"], 0, true)).toBe(true);
     expect(isLegalPath(map, ["0,0", "1,0", "2,0", "3,0"], 0, true)).toBe(false);
+  });
+
+  it("never starts on, ends on, or crosses impassable water", () => {
+    const map = pathMap([
+      { q: 0, r: 0 },
+      { q: 1, r: 0, terrain: "water" },
+      { q: 2, r: 0 },
+    ]);
+    expect(findPath(map, "0,0", "2,0", 0)).toBeNull();
+    expect(findPath(map, "0,0", "1,0", 0)).toBeNull();
+    expect(findPath(map, "1,0", "2,0", 0)).toBeNull();
+    expect(isLegalPath(map, ["0,0", "1,0", "2,0"], 0)).toBe(false);
   });
 
   it("breaks equal-cost ties deterministically", () => {

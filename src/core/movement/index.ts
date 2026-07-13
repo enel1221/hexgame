@@ -1,9 +1,22 @@
 import { BALANCE } from "../../shared/balance";
-import type { GameState, MovingStack, SendPercent, TileState } from "../../shared/types";
+import type {
+  GameState,
+  MovingStack,
+  SendPercent,
+  TileState,
+  UnitCounts,
+} from "../../shared/types";
 import { parseAxialKey } from "../hex";
 import { findPath, pathMovementCost } from "../hex/pathfinding";
 import { handleStackArrival } from "../combat";
 import { emitEvent } from "../engine/events";
+import {
+  addUnits,
+  allocateUnitsAcrossTotals,
+  subtractUnits,
+  takeUnitsProportionally,
+  totalUnits,
+} from "../units";
 
 export interface MoveResult {
   ok: boolean;
@@ -15,6 +28,7 @@ export interface MultiMoveDispatch {
   sourceId: string;
   destinationId: string;
   troops: number;
+  units: UnitCounts;
   path: string[];
 }
 
@@ -22,7 +36,7 @@ export interface MultiMovePlan {
   ok: boolean;
   reason?: string;
   pooledTroops: number;
-  sourceContributions: Array<{ sourceId: string; troops: number }>;
+  sourceContributions: Array<{ sourceId: string; troops: number; units: UnitCounts }>;
   destinationQuotas: Array<{ destinationId: string; troops: number }>;
   dispatches: MultiMoveDispatch[];
 }
@@ -39,6 +53,10 @@ export function troopsForPercent(troops: number, percent: SendPercent): number {
   return Math.min(troops - 1, Math.floor((troops * percent) / 100));
 }
 
+export function unitsForPercent(units: UnitCounts, percent: SendPercent): UnitCounts {
+  return takeUnitsProportionally(units, troopsForPercent(totalUnits(units), percent));
+}
+
 export function issueMoveOrder(
   state: GameState,
   playerId: number,
@@ -49,11 +67,11 @@ export function issueMoveOrder(
   const validation = validateMoveOrder(state, playerId, sourceId, destinationId, percent);
   if (!validation.ok) return validation;
   const source = state.map.tiles[sourceId]!;
-  const troops = troopsForPercent(source.troops, percent);
+  const units = unitsForPercent(source.units, percent);
   const path = findPath(state.map, sourceId, destinationId, playerId, true)!;
 
-  source.troops -= troops;
-  const stack = dispatchExactMovingStack(state, playerId, sourceId, destinationId, troops, path);
+  source.units = subtractUnits(source.units, units);
+  const stack = dispatchExactMovingStack(state, playerId, sourceId, destinationId, units, path);
   return { ok: true, stack };
 }
 
@@ -62,19 +80,22 @@ export function dispatchExactMovingStack(
   playerId: number,
   sourceId: string,
   destinationId: string,
-  troops: number,
+  units: UnitCounts,
   suppliedPath?: readonly string[],
   emitOrder = true,
 ): MovingStack {
   const path = suppliedPath
     ? [...suppliedPath]
     : findPath(state.map, sourceId, destinationId, playerId, true);
-  if (!path || path.length < 2 || troops <= 0) throw new Error("Invalid exact stack dispatch");
+  const troopCount = totalUnits(units);
+  if (!path || path.length < 2 || troopCount <= 0) {
+    throw new Error("Invalid exact stack dispatch");
+  }
   const id = state.nextEntityId++;
   const stack: MovingStack = {
     id,
     owner: playerId,
-    troops,
+    units: { ...units },
     path,
     pathIndex: 0,
     segmentProgress: 0,
@@ -90,8 +111,8 @@ export function dispatchExactMovingStack(
       type: "order",
       playerId,
       tileId: destinationId,
-      amount: troops,
-      message: `${troops} troops ordered to ${destinationId}`,
+      amount: troopCount,
+      message: `${troopCount} troops ordered to ${destinationId}`,
     });
   }
   return stack;
@@ -141,7 +162,7 @@ function addFlowEdge(
 }
 
 function minimumCostAllocation(
-  contributions: readonly { sourceId: string; troops: number }[],
+  contributions: readonly { sourceId: string; troops: number; units: UnitCounts }[],
   quotas: readonly { destinationId: string; troops: number }[],
   routes: ReadonlyMap<string, { path: string[]; cost: number }>,
 ): MultiMoveDispatch[] | null {
@@ -250,6 +271,7 @@ function minimumCostAllocation(
           sourceId: source.sourceId,
           destinationId: destination.destinationId,
           troops,
+          units: { melee: 0, ranged: 0, wizard: 0 },
           path: route.path,
         });
       }
@@ -309,8 +331,11 @@ export function planMultiMove(
       tile: state.map.tiles[sourceId]!,
     }))
     // Scheduled orders deterministically omit sources lost before execution.
-    .filter(({ tile }) => tile.owner === playerId && tile.troops > 1)
-    .map(({ sourceId, tile }) => ({ sourceId, troops: troopsForPercent(tile.troops, percent) }))
+    .filter(({ tile }) => tile.owner === playerId && totalUnits(tile.units) > 1)
+    .map(({ sourceId, tile }) => {
+      const units = unitsForPercent(tile.units, percent);
+      return { sourceId, troops: totalUnits(units), units };
+    })
     .filter(({ troops }) => troops > 0);
   if (contributions.length === 0) return rejected("No eligible sources remain");
   const pooledTroops = contributions.reduce((sum, source) => sum + source.troops, 0);
@@ -336,6 +361,18 @@ export function planMultiMove(
   }
   const dispatches = minimumCostAllocation(contributions, quotas, routes);
   if (!dispatches) return rejected("Equal destination allocation is infeasible");
+  for (const contribution of contributions) {
+    const sourceDispatches = dispatches.filter(
+      (dispatch) => dispatch.sourceId === contribution.sourceId,
+    );
+    const unitAllocations = allocateUnitsAcrossTotals(
+      contribution.units,
+      sourceDispatches.map((dispatch) => dispatch.troops),
+    );
+    sourceDispatches.forEach((dispatch, index) => {
+      dispatch.units = unitAllocations[index]!;
+    });
+  }
   return {
     ok: true,
     pooledTroops,
@@ -355,7 +392,8 @@ export function executeMultiMove(
   const plan = planMultiMove(state, playerId, sourceIds, destinationIds, percent);
   if (!plan.ok) return { ok: false, reason: plan.reason };
   for (const contribution of plan.sourceContributions) {
-    state.map.tiles[contribution.sourceId]!.troops -= contribution.troops;
+    const tile = state.map.tiles[contribution.sourceId]!;
+    tile.units = subtractUnits(tile.units, contribution.units);
   }
   let last: MovingStack | undefined;
   for (const dispatch of plan.dispatches) {
@@ -364,7 +402,7 @@ export function executeMultiMove(
       playerId,
       dispatch.sourceId,
       dispatch.destinationId,
-      dispatch.troops,
+      dispatch.units,
       dispatch.path,
       false,
     );
@@ -397,7 +435,7 @@ export function validateMoveOrder(
     return { ok: false, reason: "Destination is not playable land" };
   }
   if (sourceId === destinationId) return { ok: false, reason: "Source and destination are equal" };
-  const troops = troopsForPercent(source.troops, percent);
+  const troops = troopsForPercent(totalUnits(source.units), percent);
   if (troops <= 0) return { ok: false, reason: "At least one troop must remain behind" };
 
   const path = findPath(state.map, sourceId, destinationId, playerId, true);
@@ -443,7 +481,10 @@ export function rerouteInterruptedStack(state: GameState, stack: MovingStack): b
   }
 
   const stopId = lastOwnedPosition(state, stack);
-  if (stopId) state.map.tiles[stopId]!.troops += stack.troops;
+  if (stopId) {
+    const tile = state.map.tiles[stopId]!;
+    tile.units = addUnits(tile.units, stack.units);
+  }
   emitEvent(state, {
     type: "route-interrupted",
     playerId: stack.owner,
@@ -473,7 +514,7 @@ export function tickMovement(state: GameState): void {
     if (stack.pathIndex >= stack.path.length - 1) {
       state.stacks = state.stacks.filter((candidate) => candidate.id !== stack.id);
       const entryFrom = stack.path[Math.max(0, stack.pathIndex - 1)] ?? stack.originId;
-      handleStackArrival(state, stack.owner, stack.troops, reachedId, entryFrom);
+      handleStackArrival(state, stack.owner, stack.units, reachedId, entryFrom);
       continue;
     }
 

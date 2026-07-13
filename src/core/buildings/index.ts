@@ -3,21 +3,44 @@ import type { GameState, StructureState, StructureType, TileState } from "../../
 import { emitEvent } from "../engine/events";
 import { findPath } from "../hex/pathfinding";
 import { dispatchExactMovingStack } from "../movement";
+import {
+  addUnits,
+  emptyUnits,
+  subtractUnits,
+  totalUnits,
+  unitTypeForStructure,
+  unitsOf,
+} from "../units";
 
 export interface BuildingRule {
   costMilli: number;
   buildTicks: number;
+  trainTicks: number;
+  troopCostMilli: number;
+  localTarget: number;
 }
 
 export const BUILDING_RULES: Record<StructureType, BuildingRule> = {
-  farm: { costMilli: BALANCE.farm.costMilli, buildTicks: BALANCE.farm.buildTicks },
   barracks: {
     costMilli: BALANCE.barracks.costMilli,
     buildTicks: BALANCE.barracks.buildTicks,
+    trainTicks: BALANCE.barracks.trainTicks,
+    troopCostMilli: BALANCE.barracks.troopCostMilli,
+    localTarget: BALANCE.barracks.localTarget,
   },
-  turret: {
-    costMilli: BALANCE.turret.costMilli,
-    buildTicks: BALANCE.turret.buildTicks,
+  "archery-range": {
+    costMilli: BALANCE.archeryRange.costMilli,
+    buildTicks: BALANCE.archeryRange.buildTicks,
+    trainTicks: BALANCE.archeryRange.trainTicks,
+    troopCostMilli: BALANCE.archeryRange.troopCostMilli,
+    localTarget: BALANCE.archeryRange.localTarget,
+  },
+  "wizard-tower": {
+    costMilli: BALANCE.wizardTower.costMilli,
+    buildTicks: BALANCE.wizardTower.buildTicks,
+    trainTicks: BALANCE.wizardTower.trainTicks,
+    troopCostMilli: BALANCE.wizardTower.troopCostMilli,
+    localTarget: BALANCE.wizardTower.localTarget,
   },
 };
 
@@ -40,10 +63,9 @@ export function createEmptyStructureStack(type: StructureType): StructureState {
     pendingProgressTicks: 0,
     seizedTicks: 0,
     productionPaused: false,
-    barracksProgressMilli: 0,
+    trainingProgressMilli: 0,
     rallyTargetId: null,
-    rallyQueuedTroops: 0,
-    turretShotProgressMilli: 0,
+    rallyQueuedUnits: emptyUnits(),
   };
 }
 
@@ -76,8 +98,8 @@ export function canPlaceStructure(
       return { ok: false, reason: "Seized structures must reactivate before expanding" };
     }
   }
-  if (type === "farm" && tile.terrain !== "meadow") {
-    return { ok: false, reason: "Farms require Fertile Meadow" };
+  if (type === "archery-range" && tile.terrain !== "meadow") {
+    return { ok: false, reason: "Archery Ranges require Fertile Meadow" };
   }
   if (type === "barracks" && tile.terrain !== "muster") {
     return { ok: false, reason: "Barracks require Muster Ground" };
@@ -134,7 +156,7 @@ export function cancelConstruction(
   return { ok: true };
 }
 
-export function toggleBarracksProduction(
+export function toggleProduction(
   state: GameState,
   playerId: number,
   tileId: string,
@@ -142,17 +164,15 @@ export function toggleBarracksProduction(
   if (state.phase !== "running") return { ok: false, reason: "Match is not running" };
   const tile = state.map.tiles[tileId];
   if (!tile || tile.owner !== playerId) return { ok: false, reason: "Tile is not owned by player" };
-  if (!tile.structure || tile.structure.type !== "barracks") {
-    return { ok: false, reason: "Tile has no Barracks" };
-  }
+  if (!tile.structure) return { ok: false, reason: "Tile has no production structure" };
   if (!isStructureOperational(tile.structure)) {
-    return { ok: false, reason: "Barracks is not operational" };
+    return { ok: false, reason: "Production structure is not operational" };
   }
   tile.structure.productionPaused = !tile.structure.productionPaused;
   return { ok: true };
 }
 
-export function canSetBarracksRally(
+export function canSetRally(
   state: GameState,
   playerId: number,
   tileId: string,
@@ -162,12 +182,8 @@ export function canSetBarracksRally(
   const tile = state.map.tiles[tileId];
   const destination = state.map.tiles[destinationId];
   if (!tile || tile.owner !== playerId) return { ok: false, reason: "Tile is not owned by player" };
-  if (
-    !tile.structure ||
-    tile.structure.type !== "barracks" ||
-    !isStructureOperational(tile.structure)
-  ) {
-    return { ok: false, reason: "Tile has no operational Barracks" };
+  if (!tile.structure || !isStructureOperational(tile.structure)) {
+    return { ok: false, reason: "Tile has no operational production structure" };
   }
   if (!destination || destination.terrain === "water" || destinationId === tileId) {
     return { ok: false, reason: "Rally destination is not playable land" };
@@ -178,13 +194,13 @@ export function canSetBarracksRally(
   return { ok: true };
 }
 
-export function setBarracksRally(
+export function setRally(
   state: GameState,
   playerId: number,
   tileId: string,
   destinationId: string,
 ): PlacementResult {
-  const validation = canSetBarracksRally(state, playerId, tileId, destinationId);
+  const validation = canSetRally(state, playerId, tileId, destinationId);
   if (!validation.ok) return validation;
   const tile = state.map.tiles[tileId]!;
   tile.structure!.rallyTargetId = destinationId;
@@ -192,29 +208,23 @@ export function setBarracksRally(
     type: "rally-set",
     playerId,
     tileId,
-    message: `Barracks rally set to ${destinationId}`,
+    message: `Production rally set to ${destinationId}`,
   });
   return { ok: true };
 }
 
-export function clearBarracksRally(
-  state: GameState,
-  playerId: number,
-  tileId: string,
-): PlacementResult {
+export function clearRally(state: GameState, playerId: number, tileId: string): PlacementResult {
   if (state.phase !== "running") return { ok: false, reason: "Match is not running" };
   const tile = state.map.tiles[tileId];
   if (!tile || tile.owner !== playerId) return { ok: false, reason: "Tile is not owned by player" };
-  if (!tile.structure || tile.structure.type !== "barracks") {
-    return { ok: false, reason: "Tile has no Barracks" };
-  }
+  if (!tile.structure) return { ok: false, reason: "Tile has no production structure" };
   tile.structure.rallyTargetId = null;
-  tile.structure.rallyQueuedTroops = 0;
+  tile.structure.rallyQueuedUnits = emptyUnits();
   emitEvent(state, {
     type: "rally-cleared",
     playerId,
     tileId,
-    message: "Barracks rally cleared",
+    message: "Production rally cleared",
   });
   return { ok: true };
 }
@@ -246,10 +256,9 @@ export function seizeStructure(tile: TileState): CapturedStructure | null {
   structure.integrity = BALANCE.seizedIntegrity;
   structure.seizedTicks = 0;
   structure.productionPaused = false;
-  structure.barracksProgressMilli = 0;
+  structure.trainingProgressMilli = 0;
   structure.rallyTargetId = null;
-  structure.rallyQueuedTroops = 0;
-  structure.turretShotProgressMilli = 0;
+  structure.rallyQueuedUnits = emptyUnits();
   return captured;
 }
 
@@ -297,7 +306,7 @@ function tickRepair(structure: StructureState): void {
   structure.seizedTicks = 0;
 }
 
-export function barracksRallyPath(
+export function rallyPath(
   state: GameState,
   tile: TileState,
   structure: StructureState,
@@ -306,72 +315,71 @@ export function barracksRallyPath(
   return findPath(state.map, tile.id, structure.rallyTargetId, tile.owner, true);
 }
 
-export function isBarracksRallyBlocked(
+export function isRallyBlocked(
   state: GameState,
   tile: TileState,
   structure: StructureState,
 ): boolean {
-  return structure.rallyTargetId !== null && barracksRallyPath(state, tile, structure) === null;
+  return structure.rallyTargetId !== null && rallyPath(state, tile, structure) === null;
 }
 
-function tickBarracks(state: GameState, tile: TileState, structure: StructureState): void {
+function tickProduction(state: GameState, tile: TileState, structure: StructureState): void {
   if (tile.owner === null) return;
-  structure.rallyQueuedTroops = Math.min(structure.rallyQueuedTroops, tile.troops);
+  const unitType = unitTypeForStructure(structure.type);
+  structure.rallyQueuedUnits = unitsOf(
+    unitType,
+    Math.min(structure.rallyQueuedUnits[unitType], tile.units[unitType]),
+  );
   if (state.battles.some((battle) => battle.tileId === tile.id)) return;
   const player = state.players[tile.owner];
   if (!player) return;
-  const rallyPath = barracksRallyPath(state, tile, structure);
+  const route = rallyPath(state, tile, structure);
   const hasRally = structure.rallyTargetId !== null;
-  if (rallyPath && structure.rallyTargetId && structure.rallyQueuedTroops > 0) {
-    const queued = structure.rallyQueuedTroops;
-    tile.troops -= queued;
-    structure.rallyQueuedTroops = 0;
-    dispatchExactMovingStack(
-      state,
-      tile.owner,
-      tile.id,
-      structure.rallyTargetId,
-      queued,
-      rallyPath,
-    );
+  if (route && structure.rallyTargetId && totalUnits(structure.rallyQueuedUnits) > 0) {
+    const queued = structure.rallyQueuedUnits;
+    tile.units = subtractUnits(tile.units, queued);
+    structure.rallyQueuedUnits = emptyUnits();
+    dispatchExactMovingStack(state, tile.owner, tile.id, structure.rallyTargetId, queued, route);
     return;
   }
+  const rules = BUILDING_RULES[structure.type];
   if (structure.productionPaused) return;
-  if (!hasRally && tile.troops >= BALANCE.barracks.localTarget) {
-    structure.barracksProgressMilli = 0;
+  if (!hasRally && totalUnits(tile.units) >= rules.localTarget) {
+    structure.trainingProgressMilli = 0;
     return;
   }
 
-  structure.barracksProgressMilli += structure.integrity;
-  const cycle = BALANCE.barracks.trainTicks * BALANCE.fullIntegrity;
-  if (structure.barracksProgressMilli < cycle) return;
+  structure.trainingProgressMilli += structure.integrity;
+  const cycle = rules.trainTicks * BALANCE.fullIntegrity;
+  if (structure.trainingProgressMilli < cycle) return;
 
-  const affordable = Math.floor(player.supplyMilli / BALANCE.barracks.troopCostMilli);
-  const localSpace = Math.max(0, BALANCE.barracks.localTarget - tile.troops);
-  const capacity = rallyPath
+  const affordable = Math.floor(player.supplyMilli / rules.troopCostMilli);
+  const localSpace = Math.max(0, rules.localTarget - totalUnits(tile.units));
+  const capacity = route
     ? structure.completedCount
     : Math.min(structure.completedCount, localSpace);
   const trained = Math.min(capacity, affordable);
   if (trained <= 0) {
-    structure.barracksProgressMilli = cycle;
+    structure.trainingProgressMilli = cycle;
     return;
   }
 
-  structure.barracksProgressMilli -= cycle;
-  player.supplyMilli -= trained * BALANCE.barracks.troopCostMilli;
+  structure.trainingProgressMilli -= cycle;
+  player.supplyMilli -= trained * rules.troopCostMilli;
   player.stats.troopsTrained += trained;
-  if (rallyPath && structure.rallyTargetId) {
+  const trainedUnits = unitsOf(unitType, trained);
+  if (route && structure.rallyTargetId) {
     dispatchExactMovingStack(
       state,
       tile.owner,
       tile.id,
       structure.rallyTargetId,
-      trained,
-      rallyPath,
+      trainedUnits,
+      route,
     );
   } else {
-    tile.troops += trained;
-    if (hasRally) structure.rallyQueuedTroops += trained;
+    tile.units = addUnits(tile.units, trainedUnits);
+    if (hasRally) structure.rallyQueuedUnits = addUnits(structure.rallyQueuedUnits, trainedUnits);
   }
 }
 
@@ -387,8 +395,14 @@ export function tickStructures(state: GameState): void {
       continue;
     }
     if (structure.status === "repairing") tickRepair(structure);
-    if (structure.type === "barracks" && isStructureOperational(structure)) {
-      tickBarracks(state, tile, structure);
-    }
+    if (isStructureOperational(structure)) tickProduction(state, tile, structure);
   }
 }
+
+// Source-compatible aliases for non-authoritative callers during the UI migration.
+export const toggleBarracksProduction = toggleProduction;
+export const canSetBarracksRally = canSetRally;
+export const setBarracksRally = setRally;
+export const clearBarracksRally = clearRally;
+export const barracksRallyPath = rallyPath;
+export const isBarracksRallyBlocked = isRallyBlocked;

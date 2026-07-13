@@ -1,4 +1,4 @@
-import { BALANCE } from "../../shared/balance";
+import { BALANCE, targetLandCount } from "../../shared/balance";
 import type {
   Axial,
   GeneratedMap,
@@ -9,7 +9,14 @@ import type {
 } from "../../shared/types";
 import { hashSeed, SeededRng } from "../rng";
 import { axialKey, distance, neighbors, parseAxialKey, ring, spiral } from "../hex/coordinates";
-import { analyzeMapFairness, type MapFairnessReport } from "./fairness";
+import { projectSpacedPlacementCenters } from "../placement/projection";
+import { emptyUnits, UNIT_TYPES, unitsOf } from "../units";
+import {
+  analyzeMapFairness,
+  findControlledChokepoints,
+  minimumChokepointRegionSize,
+  type MapFairnessReport,
+} from "./fairness";
 
 export const MAP_ARCHETYPES = [
   "heartland",
@@ -69,15 +76,8 @@ function compareIds(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.max(minimum, Math.min(maximum, value));
-}
-
 export function targetLandForPlayers(totalPlayers: number): number {
-  if (!Number.isInteger(totalPlayers) || totalPlayers <= 0) {
-    throw new Error("totalPlayers must be a positive integer");
-  }
-  return clamp(totalPlayers * BALANCE.landPerPlayer, BALANCE.minLand, BALANCE.maxLand);
+  return targetLandCount(totalPlayers);
 }
 
 export const getTargetLandCount = targetLandForPlayers;
@@ -337,6 +337,144 @@ function connectedLandSelection(cells: GenerationCell[], targetLand: number): Se
   return land;
 }
 
+const ARCHETYPE_GATE_WIDTH = {
+  heartland: 2,
+  "broken-crown": 1,
+  "highland-basin": 2,
+} as const;
+
+function growLandToTarget(
+  cells: readonly GenerationCell[],
+  initialLand: ReadonlySet<string>,
+  forcedWater: ReadonlySet<string>,
+  targetLand: number,
+): Set<string> {
+  const cellById = new Map(cells.map((cell) => [cell.id, cell]));
+  const land = new Set(initialLand);
+  const frontier = new Set<string>();
+
+  const pushFrontier = (id: string): void => {
+    const cell = cellById.get(id)!;
+    for (const adjacent of neighbors(cell)) {
+      const adjacentId = axialKey(adjacent);
+      if (cellById.has(adjacentId) && !land.has(adjacentId) && !forcedWater.has(adjacentId)) {
+        frontier.add(adjacentId);
+      }
+    }
+  };
+  for (const id of land) pushFrontier(id);
+
+  while (land.size < targetLand) {
+    let selectedId: string | null = null;
+    let selectedScore = Number.NEGATIVE_INFINITY;
+    for (const id of frontier) {
+      const cell = cellById.get(id)!;
+      const adjacentLand = neighbors(cell).reduce(
+        (count, adjacent) => count + Number(land.has(axialKey(adjacent))),
+        0,
+      );
+      const compactScore = cell.score + adjacentLand * 0.025;
+      if (
+        compactScore > selectedScore ||
+        (compactScore === selectedScore && (selectedId === null || compareIds(id, selectedId) < 0))
+      ) {
+        selectedId = id;
+        selectedScore = compactScore;
+      }
+    }
+    if (selectedId === null) throw new Error("Water seam exhausted connected land growth");
+    frontier.delete(selectedId);
+    land.add(selectedId);
+    pushFrontier(selectedId);
+  }
+  return land;
+}
+
+function applyDeterministicWaterSeam(
+  cells: readonly GenerationCell[],
+  baseLand: ReadonlySet<string>,
+  width: number,
+  height: number,
+  archetype: MapArchetype,
+  seed: string,
+  targetLand: number,
+): Set<string> {
+  // A complete offset-column is an uncrossable hex barrier. Preserve only the
+  // seeded gate cells, then refill on either side without ever filling the seam.
+  const cellByOffset = new Map(cells.map((cell) => [`${cell.column},${cell.row}`, cell]));
+  const cellById = new Map(cells.map((cell) => [cell.id, cell]));
+  const gateWidth = ARCHETYPE_GATE_WIDTH[archetype];
+  const minimumRegion = minimumChokepointRegionSize(targetLand);
+  const minimumColumn = Math.max(2, Math.floor(width * 0.34));
+  const maximumColumn = Math.min(width - 3, Math.ceil(width * 0.66));
+  const columns = Array.from(
+    { length: maximumColumn - minimumColumn + 1 },
+    (_, index) => minimumColumn + index,
+  ).sort(
+    (left, right) =>
+      hashSeed(`${seed}:seam-column:${right}`) - hashSeed(`${seed}:seam-column:${left}`) ||
+      left - right,
+  );
+
+  for (const column of columns) {
+    const validRows: number[] = [];
+    for (let row = 2; row < height - 2; row += 1) {
+      const gate = cellByOffset.get(`${column},${row}`);
+      const left = cellByOffset.get(`${column - 1},${row}`);
+      const right = cellByOffset.get(`${column + 1},${row}`);
+      if (
+        gate &&
+        left &&
+        right &&
+        baseLand.has(gate.id) &&
+        baseLand.has(left.id) &&
+        baseLand.has(right.id)
+      ) {
+        validRows.push(row);
+      }
+    }
+    const gateStarts = validRows
+      .filter(
+        (row) =>
+          gateWidth === 1 ||
+          (validRows.includes(row + 1) &&
+            distance(
+              cellByOffset.get(`${column},${row}`)!,
+              cellByOffset.get(`${column},${row + 1}`)!,
+            ) === 1),
+      )
+      .sort(
+        (left, right) =>
+          hashSeed(`${seed}:seam-gate:${column}:${right}`) -
+            hashSeed(`${seed}:seam-gate:${column}:${left}`) || left - right,
+      );
+
+    for (const gateStart of gateStarts) {
+      const gateIds = new Set(
+        Array.from(
+          { length: gateWidth },
+          (_, index) => cellByOffset.get(`${column},${gateStart + index}`)!.id,
+        ),
+      );
+      const forcedWater = new Set(
+        cells
+          .filter((cell) => cell.column === column && !gateIds.has(cell.id))
+          .map((cell) => cell.id),
+      );
+      const carved = new Set([...baseLand].filter((id) => !forcedWater.has(id)));
+      if (componentsOf(carved, cellById).length !== 1) continue;
+      const land = growLandToTarget(cells, carved, forcedWater, targetLand);
+      const withoutGate = new Set([...land].filter((id) => !gateIds.has(id)));
+      const regions = componentsOf(withoutGate, cellById).sort(
+        (left, right) => right.length - left.length || compareIds(left[0]!, right[0]!),
+      );
+      if (regions.length !== 2 || regions[1]!.length < minimumRegion) continue;
+      return land;
+    }
+  }
+  throw new Error(`Unable to create a controlled ${gateWidth}-tile ${archetype} water gate`);
+}
+
 function terrainCounts(
   archetype: MapArchetype,
   landCount: number,
@@ -387,10 +525,14 @@ export function isEligibleSpawnCenter(map: GeneratedMap, centerId: string): bool
   const center = map.tiles[centerId];
   if (!center || center.terrain === "water") return false;
   const required = spiral(center, BALANCE.spawnPaddingRadius).map(axialKey);
-  return required.every((id) => {
+  const hasPadding = required.every((id) => {
     const tile = map.tiles[id];
     return tile !== undefined && tile.terrain !== "water";
   });
+  if (!hasPadding) return false;
+  return findControlledChokepoints(map).every((chokepoint) =>
+    chokepoint.tileIds.every((id) => distance(center, parseAxialKey(id)) >= 3),
+  );
 }
 
 export function eligibleSpawnCenters(map: GeneratedMap): string[] {
@@ -560,21 +702,26 @@ export function applySpawnAllocations(
     }
   }
 
-  // Give every neutral tile the same small garrison; terrain supplies the variation.
-  for (const id of map.landIds) map.tiles[id]!.troops = 1;
+  // Give every neutral tile one deterministic unit without favoring one type globally.
+  for (const id of map.landIds) {
+    const type = UNIT_TYPES[hashSeed(`${seed}:neutral-unit:${id}`) % UNIT_TYPES.length]!;
+    const tile = Object.hasOwn(map.tiles, id) ? map.tiles[id] : undefined;
+    if (!tile) throw new Error(`Generated land tile ${id} is missing`);
+    tile.units = unitsOf(type, 1);
+  }
 
   for (let playerId = 0; playerId < totalPlayers; playerId += 1) {
     const cluster = clusters[playerId]!;
-    const shuffledRing = new SeededRng(`${seed}:troops:${playerId}`).shuffle(cluster.slice(1));
-    const troopOrder = [cluster[0]!, ...shuffledRing];
+    const unitOrder = new SeededRng(`${seed}:units:${playerId}`).shuffle([...cluster]);
     for (const id of cluster) {
       const tile = map.tiles[id]!;
       tile.owner = playerId;
-      tile.troops = 3;
+      tile.units = emptyUnits();
       tile.controlledSinceTick = 0;
     }
-    for (let bonus = 0; bonus < 3; bonus += 1) {
-      map.tiles[troopOrder[bonus]!]!.troops += 1;
+    for (let index = 0; index < BALANCE.startingTroops; index += 1) {
+      const tile = map.tiles[unitOrder[index % unitOrder.length]!]!;
+      tile.units[UNIT_TYPES[index % UNIT_TYPES.length]!] += 1;
     }
     map.tiles[cluster[0]!]!.structure = {
       type: "barracks",
@@ -584,10 +731,9 @@ export function applySpawnAllocations(
       pendingProgressTicks: null,
       seizedTicks: 0,
       productionPaused: false,
-      barracksProgressMilli: 0,
+      trainingProgressMilli: 0,
       rallyTargetId: null,
-      rallyQueuedTroops: 0,
-      turretShotProgressMilli: 0,
+      rallyQueuedUnits: emptyUnits(),
     };
   }
 
@@ -601,7 +747,16 @@ function buildAttempt(options: NormalizedOptions, attempt: number): GeneratedMap
   const { width, height } = dimensionsForLand(targetLand, options.archetype);
   const cells = makeCells(width, height);
   scoreLandCells(cells, width, height, options.archetype, generationSeed);
-  const land = connectedLandSelection(cells, targetLand);
+  const baseLand = connectedLandSelection(cells, targetLand);
+  const land = applyDeterministicWaterSeam(
+    cells,
+    baseLand,
+    width,
+    height,
+    options.archetype,
+    generationSeed,
+    targetLand,
+  );
   const tileIds = cells.map((cell) => cell.id);
   const landIds = tileIds.filter((id) => land.has(id));
   const tiles: Record<string, TileState> = {};
@@ -613,7 +768,12 @@ function buildAttempt(options: NormalizedOptions, attempt: number): GeneratedMap
       r: cell.r,
       terrain: land.has(cell.id) ? "plains" : "water",
       owner: null,
-      troops: land.has(cell.id) ? 1 : 0,
+      units: land.has(cell.id)
+        ? unitsOf(
+            UNIT_TYPES[hashSeed(`${generationSeed}:neutral-unit:${cell.id}`) % UNIT_TYPES.length]!,
+            1,
+          )
+        : emptyUnits(),
       structure: null,
       controlledSinceTick: 0,
       lastRewardTick: 0,
@@ -660,7 +820,13 @@ export function generateNeutralMap(input: MatchMapConfig | MapGenerationOptions)
     try {
       const map = buildAttempt(options, attempt);
       const generationSeed = deriveGenerationSeed(options.seed, attempt);
-      const centers = chooseDefaultSpawnCenters(map, options.totalPlayers, generationSeed);
+      const centers = projectSpacedPlacementCenters({
+        seed: generationSeed,
+        totalParticipants: options.totalPlayers,
+        candidates: eligibleSpawnCenters(map),
+        fixedCenters: [],
+        minimumDistance: BALANCE.minimumSpawnDistance,
+      });
       const allocated = JSON.parse(JSON.stringify(map)) as GeneratedMap;
       applySpawnAllocations(allocated, centers, generationSeed);
       const report = analyzeMapFairness(allocated, options.totalPlayers);
@@ -685,7 +851,13 @@ export function generateMap(input: MatchMapConfig | MapGenerationOptions): Gener
   const options = normalizeOptions(input);
   const map = generateNeutralMap(input);
   const generationSeed = deriveGenerationSeed(map.seed, map.generationAttempt);
-  const centers = chooseDefaultSpawnCenters(map, options.totalPlayers, generationSeed);
+  const centers = projectSpacedPlacementCenters({
+    seed: generationSeed,
+    totalParticipants: options.totalPlayers,
+    candidates: eligibleSpawnCenters(map),
+    fixedCenters: [],
+    minimumDistance: BALANCE.minimumSpawnDistance,
+  });
   applySpawnAllocations(map, centers, generationSeed);
   return map;
 }

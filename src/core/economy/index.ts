@@ -1,32 +1,15 @@
 import { BALANCE, TICKS_PER_SECOND } from "../../shared/balance";
-import type { GameState, StructureState } from "../../shared/types";
-import { isStructureOperational } from "../buildings";
-
-export function calculateFarmIncomeMilliPerSecond(structure: StructureState | null): number {
-  if (
-    structure?.type !== "farm" ||
-    !isStructureOperational(structure) ||
-    structure.productionPaused
-  ) {
-    return 0;
-  }
-  return Math.floor(
-    (BALANCE.farm.incomeMilliPerSecond * structure.completedCount * structure.integrity) /
-      BALANCE.fullIntegrity,
-  );
-}
+import type { GameState } from "../../shared/types";
 
 export function calculateIncomeMilliPerSecond(state: GameState, playerId: number): number {
-  let income = 0;
+  const player = state.players[playerId];
+  if (!player || player.eliminated) return 0;
+
+  let income = BALANCE.passiveIncomeMilliPerSecond;
   for (const tileId of state.map.landIds) {
     const tile = state.map.tiles[tileId]!;
     if (tile.owner !== playerId) continue;
     income += BALANCE.tileIncomeMilliPerSecond;
-
-    const structure = tile.structure;
-    if (!state.battles.some((battle) => battle.tileId === tile.id)) {
-      income += calculateFarmIncomeMilliPerSecond(structure);
-    }
   }
   return income;
 }

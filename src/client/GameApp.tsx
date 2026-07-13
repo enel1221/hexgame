@@ -5,7 +5,7 @@ import { axialKey, findPath, neighbors } from "@/src/core/hex";
 import { parseEngineSnapshot } from "@/src/core/engine";
 import { stableHash } from "@/src/core/hash";
 import { eligibleSpawnCenters } from "@/src/core/map";
-import { planMultiMove, troopsForPercent, type MultiMovePlan } from "@/src/core/movement";
+import { planMultiMove, unitsForPercent, type MultiMovePlan } from "@/src/core/movement";
 import {
   computeFinalSpawnVector,
   validateSpawnChoice,
@@ -14,7 +14,8 @@ import {
 import { calculateIncomeMilliPerSecond } from "@/src/core/economy";
 import { canPlaceStructure, isBarracksRallyBlocked } from "@/src/core/buildings";
 import { battlePresentation } from "@/src/core/combat";
-import { BALANCE, SUPPLY_SCALE, TICKS_PER_SECOND } from "@/src/shared/balance";
+import { formatUnits, totalUnits, unitTypeForStructure } from "@/src/core/units";
+import { BALANCE, SUPPLY_SCALE, targetLandCount, TICKS_PER_SECOND } from "@/src/shared/balance";
 import { COMMIT_SHA, VERSION_LABEL } from "@/src/shared/version";
 import type {
   EngineSnapshot,
@@ -27,6 +28,8 @@ import type {
   SendPercent,
   StructureType,
   TileState,
+  UnitCounts,
+  UnitType,
   WorkerRequest,
   WorkerResponse,
 } from "@/src/shared/types";
@@ -70,23 +73,89 @@ type MultiPhase = "idle" | "sources" | "targets";
 const MAPS: Array<{ id: MapArchetype; name: string; subtitle: string; description: string }> = [
   {
     id: "heartland",
-    name: "Heartland",
-    subtitle: "Open fronts",
-    description: "A broad central realm with clear routes and fluid expansion.",
+    name: "River Gates",
+    subtitle: "Canals & crossings",
+    description: "Broad riverworks compress the front into guarded crossings and contested gates.",
   },
   {
     id: "broken-crown",
-    name: "Broken Crown",
-    subtitle: "Bays & bridges",
-    description: "Peninsulas and wide land bridges create dramatic pressure points.",
+    name: "Shattered Crown",
+    subtitle: "Island necks",
+    description: "Fractured island realms meet at narrow necks where every reinforcement matters.",
   },
   {
     id: "highland-basin",
-    name: "Highland Basin",
-    subtitle: "Defensive terrain",
-    description: "Forests, ridges, lakes, and winding valleys reward careful positioning.",
+    name: "Highland Passes",
+    subtitle: "Ridges & passes",
+    description:
+      "Mountain ridges divide the realm into defensible passes and hard-fought corridors.",
   },
 ];
+
+const STRUCTURES: Record<
+  StructureType,
+  {
+    name: string;
+    unit: UnitType;
+    shortcut: string;
+    terrain: string;
+    costMilli: number;
+    buildTicks: number;
+  }
+> = {
+  barracks: {
+    name: "Barracks",
+    unit: "melee",
+    shortcut: "B",
+    terrain: "Muster Ground",
+    costMilli: BALANCE.barracks.costMilli,
+    buildTicks: BALANCE.barracks.buildTicks,
+  },
+  "archery-range": {
+    name: "Archery Range",
+    unit: "ranged",
+    shortcut: "R",
+    terrain: "Fertile Meadow",
+    costMilli: BALANCE.archeryRange.costMilli,
+    buildTicks: BALANCE.archeryRange.buildTicks,
+  },
+  "wizard-tower": {
+    name: "Wizard Tower",
+    unit: "wizard",
+    shortcut: "T",
+    terrain: "owned land tile",
+    costMilli: BALANCE.wizardTower.costMilli,
+    buildTicks: BALANCE.wizardTower.buildTicks,
+  },
+};
+
+const UNIT_LABELS: Record<UnitType, string> = {
+  melee: "Melee",
+  ranged: "Ranged",
+  wizard: "Wizard",
+};
+
+function formatPower(power: UnitCounts): string {
+  const total = totalUnits(power);
+  const equivalents = total / 1000;
+  return `${equivalents.toFixed(Number.isInteger(equivalents) ? 0 : 1)} power`;
+}
+
+function formatPowerByType(power: UnitCounts): string {
+  return (["melee", "ranged", "wizard"] as const)
+    .filter((type) => power[type] > 0)
+    .map(
+      (type) => `${UNIT_LABELS[type]} ${(power[type] / 1000).toFixed(power[type] % 1000 ? 1 : 0)}`,
+    )
+    .join(", ");
+}
+
+function supportPower(participant: {
+  localSupportPower: UnitCounts;
+  adjacentSupportPower: UnitCounts;
+}): number {
+  return totalUnits(participant.localSupportPower) + totalUnits(participant.adjacentSupportPower);
+}
 
 const DEBUG_SCENARIOS: Array<{ id: DebugScenario; label: string }> = [
   { id: "structures", label: "Structures" },
@@ -207,6 +276,31 @@ function StructureGlyph({ type }: { type: StructureType }) {
   return (
     <span className={`structure-glyph structure-glyph--${type}`} aria-hidden="true">
       <i />
+    </span>
+  );
+}
+
+function UnitGlyph({ type }: { type: UnitType }) {
+  return (
+    <span className={`unit-glyph unit-glyph--${type}`} aria-hidden="true">
+      <i />
+    </span>
+  );
+}
+
+function UnitComposition({ units, compact = false }: { units: UnitCounts; compact?: boolean }) {
+  return (
+    <span
+      className={`unit-composition ${compact ? "unit-composition--compact" : ""}`}
+      aria-label={formatUnits(units)}
+    >
+      {(["melee", "ranged", "wizard"] as const).map((type) => (
+        <span key={type} data-unit-type={type}>
+          <UnitGlyph type={type} />
+          <b>{units[type]}</b>
+          {!compact && <small>{UNIT_LABELS[type]}</small>}
+        </span>
+      ))}
     </span>
   );
 }
@@ -408,7 +502,8 @@ export function GameApp() {
               q: tile.q,
               r: tile.r,
               owner: tile.owner,
-              troops: tile.troops,
+              units: tile.units,
+              troops: totalUnits(tile.units),
               terrain: tile.terrain,
               structure: tile.structure,
             };
@@ -422,6 +517,8 @@ export function GameApp() {
           eliminated: player.eliminated,
           eliminatedBy: player.eliminatedBy,
           supplyMilli: player.supplyMilli,
+          supplyEarnedMilli: player.stats.supplyEarnedMilli,
+          troopsTrained: player.stats.troopsTrained,
           enemiesEliminated: player.stats.enemiesEliminated,
         })),
         events: state.events.map(({ id, type, playerId, tileId, amount, message }) => ({
@@ -436,7 +533,8 @@ export function GameApp() {
         selectedTile: selectedId,
         stacks: state.stacks.map((stack) => ({
           id: stack.id,
-          troops: stack.troops,
+          units: stack.units,
+          troops: totalUnits(stack.units),
           owner: stack.owner,
           path: stack.path,
           pathIndex: stack.pathIndex,
@@ -447,18 +545,31 @@ export function GameApp() {
           id: battle.id,
           tileId: battle.tileId,
           incumbentOwner: battle.incumbentOwner,
-          participants: battle.participants.map((participant) => ({ ...participant })),
+          participants: battle.participants.map((participant) => ({
+            ...participant,
+            troops: totalUnits(participant.units),
+          })),
           actualControl: battle.participants.find(
             (participant) => participant.playerId !== battle.incumbentOwner,
           )?.control,
-          attacker:
-            battle.participants.find(
-              (participant) => participant.playerId !== battle.incumbentOwner,
-            )?.troops ?? 0,
-          defender:
-            battle.participants.find(
-              (participant) => participant.playerId === battle.incumbentOwner,
-            )?.troops ?? 0,
+          attacker: battle.participants.find(
+            (participant) => participant.playerId !== battle.incumbentOwner,
+          )?.units
+            ? totalUnits(
+                battle.participants.find(
+                  (participant) => participant.playerId !== battle.incumbentOwner,
+                )!.units,
+              )
+            : 0,
+          defender: battle.participants.find(
+            (participant) => participant.playerId === battle.incumbentOwner,
+          )?.units
+            ? totalUnits(
+                battle.participants.find(
+                  (participant) => participant.playerId === battle.incumbentOwner,
+                )!.units,
+              )
+            : 0,
         })),
         enclosures: state.enclosures,
         multi: {
@@ -671,7 +782,7 @@ export function GameApp() {
       !selectedId ||
       !hoveredId ||
       selected?.owner !== (state.config.localPlayerId ?? 0) ||
-      selected.troops <= 1
+      totalUnits(selected.units) <= 1
     ) {
       rendererRef.current?.setRoutePreview(null);
       return;
@@ -1314,7 +1425,7 @@ export function GameApp() {
         return;
       }
       if (multiPhase === "sources") {
-        if (tile.owner !== localPlayerId || tile.troops <= 1) return;
+        if (tile.owner !== localPlayerId || totalUnits(tile.units) <= 1) return;
         setMultiSources((sources) =>
           sources.includes(tileId)
             ? sources.filter((sourceId) => sourceId !== tileId)
@@ -1358,7 +1469,7 @@ export function GameApp() {
           return;
         }
         const selectedSource = current.map.tiles[selectedId];
-        if (selectedSource?.owner !== localPlayerId || selectedSource.troops <= 1) {
+        if (selectedSource?.owner !== localPlayerId || totalUnits(selectedSource.units) <= 1) {
           setSelectedId(tileId);
           return;
         }
@@ -1383,7 +1494,8 @@ export function GameApp() {
         return;
       }
       setSelectedId(tileId);
-      if (tile.owner === localPlayerId && tile.troops > 1) audioRef.current?.playSelection();
+      if (tile.owner === localPlayerId && totalUnits(tile.units) > 1)
+        audioRef.current?.playSelection();
     },
     [
       buildMode,
@@ -1472,16 +1584,16 @@ export function GameApp() {
       } else if (event.key === " " && !config.multiplayer) {
         event.preventDefault();
         togglePause();
-      } else if (["f", "b", "t"].includes(event.key.toLowerCase())) {
+      } else if (["b", "r", "t"].includes(event.key.toLowerCase())) {
         cancelMulti();
         setSelectedId(null);
         setRallySourceId(null);
         const type =
-          event.key.toLowerCase() === "f"
-            ? "farm"
-            : event.key.toLowerCase() === "b"
-              ? "barracks"
-              : "turret";
+          event.key.toLowerCase() === "b"
+            ? "barracks"
+            : event.key.toLowerCase() === "r"
+              ? "archery-range"
+              : "wizard-tower";
         setBuildMode((mode) => (mode === type ? null : type));
       } else if (event.key.toLowerCase() === "g" && config.debug) {
         setScoreOpen((open) => !open);
@@ -1580,12 +1692,7 @@ export function GameApp() {
     const structure = selectedTile?.structure;
     if (!structure) return 0;
     if (structure.pendingProgressTicks !== null) {
-      const required =
-        structure.type === "farm"
-          ? BALANCE.farm.buildTicks
-          : structure.type === "barracks"
-            ? BALANCE.barracks.buildTicks
-            : BALANCE.turret.buildTicks;
+      const required = STRUCTURES[structure.type].buildTicks;
       return Math.min(100, Math.round((structure.pendingProgressTicks / required) * 100));
     }
     if (structure.status === "seized")
@@ -1599,24 +1706,18 @@ export function GameApp() {
             100,
         ),
       );
-    if (structure.type === "barracks")
-      return Math.min(
-        100,
-        Math.round(
-          (structure.barracksProgressMilli /
-            (BALANCE.barracks.trainTicks * BALANCE.fullIntegrity)) *
-            100,
-        ),
-      );
-    if (structure.type === "turret")
-      return Math.min(
-        100,
-        Math.round(
-          (structure.turretShotProgressMilli / (BALANCE.turret.shotTicks * BALANCE.fullIntegrity)) *
-            100,
-        ),
-      );
-    return 100;
+    const tuning =
+      structure.type === "barracks"
+        ? BALANCE.barracks
+        : structure.type === "archery-range"
+          ? BALANCE.archeryRange
+          : BALANCE.wizardTower;
+    return Math.min(
+      100,
+      Math.round(
+        (structure.trainingProgressMilli / (tuning.trainTicks * BALANCE.fullIntegrity)) * 100,
+      ),
+    );
   }, [selectedTile]);
   const selectedStructureProgressLabel = useMemo(() => {
     const structure = selectedTile?.structure;
@@ -1630,13 +1731,7 @@ export function GameApp() {
     if (structure.status === "repairing") {
       return `Integrity repair ${selectedStructureProgress}%`;
     }
-    if (structure.type === "barracks") {
-      return `Barracks production cycle ${selectedStructureProgress}%`;
-    }
-    if (structure.type === "turret") {
-      return `Turret volley accumulator ${selectedStructureProgress}%`;
-    }
-    return `Structure operational ${selectedStructureProgress}%`;
+    return `${STRUCTURES[structure.type].name} ${UNIT_LABELS[unitTypeForStructure(structure.type)]} training cycle ${selectedStructureProgress}%`;
   }, [selectedStructureProgress, selectedTile]);
   const selectedBattle =
     selectedTile && state
@@ -1650,23 +1745,23 @@ export function GameApp() {
     selectedTile && state
       ? state.enclosures.find((enclosure) => enclosure.tileIds.includes(selectedTile.id))
       : undefined;
-  const selectedTurretSupportStatus = useMemo(() => {
+  const selectedTypedSupportStatus = useMemo(() => {
     const structure = selectedTile?.structure;
-    if (!state || !selectedTile || structure?.type !== "turret") return null;
+    if (!state || !selectedTile || !structure) return null;
     if (
       selectedTile.owner === null ||
       structure.completedCount === 0 ||
       (structure.status !== "active" && structure.status !== "repairing")
     ) {
-      return "Turret support inactive";
+      return `${STRUCTURES[structure.type].name} support inactive`;
     }
     const owner = selectedTile.owner;
     const eligible = (battle: GameState["battles"][number]): boolean =>
       battle.participants.some(
-        (participant) => participant.playerId === owner && participant.troops > 0,
+        (participant) => participant.playerId === owner && totalUnits(participant.units) > 0,
       ) &&
       battle.participants.some(
-        (participant) => participant.playerId !== owner && participant.troops > 0,
+        (participant) => participant.playerId !== owner && totalUnits(participant.units) > 0,
       );
     const home = state.battles.find(
       (battle) => battle.tileId === selectedTile.id && eligible(battle),
@@ -1678,15 +1773,15 @@ export function GameApp() {
           .filter((battle) => adjacentIds.has(battle.tileId) && eligible(battle))
           .sort((left, right) => left.tileId.localeCompare(right.tileId));
     if (targets.length === 0) {
-      return `Turret x${structure.completedCount} ready; no eligible nearby battle`;
+      return `${STRUCTURES[structure.type].name} x${structure.completedCount} ready; no eligible nearby battle`;
     }
-    return `Turret x${structure.completedCount} supporting ${targets.length} ${
+    return `${STRUCTURES[structure.type].name} x${structure.completedCount} supporting ${targets.length} ${
       targets.length === 1 ? "battle" : "battles"
     }: ${targets.map((battle) => battle.tileId).join(", ")}${home ? " (home priority)" : ""}`;
   }, [selectedTile, state]);
   const selectedRallyBlocked = Boolean(
     state &&
-    selectedTile?.structure?.type === "barracks" &&
+    selectedTile?.structure &&
     selectedTile.structure.rallyTargetId &&
     isBarracksRallyBlocked(state, selectedTile, selectedTile.structure),
   );
@@ -1713,7 +1808,7 @@ export function GameApp() {
       return (
         sum +
         (tile && tile.owner === localPlayerId && !destinationSet.has(tileId)
-          ? troopsForPercent(tile.troops, sendPercent)
+          ? totalUnits(unitsForPercent(tile.units, sendPercent))
           : 0)
       );
     }, 0);
@@ -1724,7 +1819,7 @@ export function GameApp() {
     let hostile: DebugRoute | null = null;
     for (const tileId of state.map.landIds) {
       const tile = state.map.tiles[tileId]!;
-      if (tile.owner !== localPlayerId || tile.troops <= 1) continue;
+      if (tile.owner !== localPlayerId || totalUnits(tile.units) <= 1) continue;
       for (const coordinate of neighbors(tile)) {
         const adjacent = state.map.tiles[axialKey(coordinate)];
         if (!adjacent || adjacent.terrain === "water") continue;
@@ -1816,7 +1911,10 @@ export function GameApp() {
                   <span>02</span>
                   <div>
                     <h2>Set the challengers</h2>
-                    <p>Map scale grows automatically from 380 to 2,100 land hexes.</p>
+                    <p>
+                      Map scale grows automatically from {BALANCE.minLand.toLocaleString()} to{" "}
+                      {BALANCE.maxLand.toLocaleString()} land hexes.
+                    </p>
                   </div>
                 </div>
                 <div className="opponent-row">
@@ -1974,7 +2072,7 @@ export function GameApp() {
                       <b>{config.aiCount + 1}</b> rulers
                     </span>
                     <span>
-                      <b>~{Math.min(2100, Math.max(380, (config.aiCount + 1) * 95))}</b> land hexes
+                      <b>{targetLandCount(config.aiCount + 1).toLocaleString()}</b> land hexes
                     </span>
                     <span>
                       <b>80%</b> to conquer
@@ -2010,7 +2108,7 @@ export function GameApp() {
                   <span>Field controls</span>
                   <p>
                     <kbd>Click</kbd> select & issue orders · <kbd>1–4</kbd> send strength ·{" "}
-                    <kbd>F B T</kbd> build · <kbd>Space</kbd> pause
+                    <kbd>B R T</kbd> build trainers · <kbd>Space</kbd> pause
                   </p>
                 </div>
               </aside>
@@ -2514,7 +2612,7 @@ export function GameApp() {
           <div className="tile-stats">
             <span>
               <small>Garrison</small>
-              <strong>{selectedTile.troops}</strong>
+              <strong>{totalUnits(selectedTile.units)}</strong>
             </span>
             <span>
               <small>Defense</small>
@@ -2528,8 +2626,14 @@ export function GameApp() {
             </span>
             <span>
               <small>Structure</small>
-              <strong>{selectedTile.structure ? selectedTile.structure.type : "None"}</strong>
+              <strong>
+                {selectedTile.structure ? STRUCTURES[selectedTile.structure.type].name : "None"}
+              </strong>
             </span>
+          </div>
+          <div className="tile-unit-roster" data-testid="tile-unit-roster">
+            <strong>Unit composition</strong>
+            <UnitComposition units={selectedTile.units} />
           </div>
           {selectedBattle && (
             <div
@@ -2552,12 +2656,40 @@ export function GameApp() {
                       data-testid={`battle-participant-${participant.playerId ?? "neutral"}`}
                       role="listitem"
                     >
-                      {name} · {participant.troops} troops ·
-                      {` ${(participant.sharePermyriad / 100).toFixed(2)}% effective share`}
-                      {participant.incumbent ? " · incumbent" : ""}
-                      {participant.turretSupportCount > 0
-                        ? ` · supported by Turret x${participant.turretSupportCount}`
-                        : ""}
+                      <b>{name}</b>
+                      <UnitComposition units={participant.units} compact />
+                      <span>
+                        {participant.troops} units · {(participant.sharePermyriad / 100).toFixed(2)}
+                        % effective share · {formatPower(participant.effectivePowerByType)}
+                        {participant.incumbent ? " · incumbent" : ""}
+                      </span>
+                      <span
+                        className={`battle-advantage battle-advantage--${participant.rpsMultiplierPermille > 1000 ? "up" : participant.rpsMultiplierPermille < 1000 ? "down" : "even"}`}
+                      >
+                        {participant.rpsMultiplierPermille > 1000
+                          ? `▲ Type advantage +${(
+                              (participant.rpsMultiplierPermille - 1000) /
+                              10
+                            ).toFixed(0)}%`
+                          : participant.rpsMultiplierPermille < 1000
+                            ? `▼ Type disadvantage −${(
+                                (1000 - participant.rpsMultiplierPermille) /
+                                10
+                              ).toFixed(0)}%`
+                            : "◆ Type matchup even"}
+                      </span>
+                      {supportPower(participant) > 0 && (
+                        <span>
+                          Typed support · local {formatPower(participant.localSupportPower)}
+                          {formatPowerByType(participant.localSupportPower)
+                            ? ` (${formatPowerByType(participant.localSupportPower)})`
+                            : ""}
+                          {` · adjacent ${formatPower(participant.adjacentSupportPower)}`}
+                          {formatPowerByType(participant.adjacentSupportPower)
+                            ? ` (${formatPowerByType(participant.adjacentSupportPower)})`
+                            : ""}
+                        </span>
+                      )}
                     </small>
                   );
                 })}
@@ -2589,7 +2721,8 @@ export function GameApp() {
               <StructureGlyph type={selectedTile.structure.type} />
               <span>
                 <strong>
-                  {selectedTile.structure.type} x{selectedTile.structure.completedCount}
+                  {STRUCTURES[selectedTile.structure.type].name} x
+                  {selectedTile.structure.completedCount}
                   {selectedTile.structure.pendingProgressTicks !== null ? " +1" : ""}
                 </strong>
                 <small>
@@ -2598,20 +2731,17 @@ export function GameApp() {
                     : (selectedTile.structure.status ?? "foundation")}
                   {" · "}
                   {Math.round(selectedTile.structure.integrity / 10)}% integrity
-                  {selectedTile.structure.type === "barracks" &&
-                    ` · ${selectedTile.structure.productionPaused ? "production paused" : "producing"}`}
-                  {selectedTile.structure.type === "barracks" &&
-                    selectedTile.structure.rallyTargetId &&
+                  {` · ${selectedTile.structure.productionPaused ? "production paused" : `training ${UNIT_LABELS[unitTypeForStructure(selectedTile.structure.type)]}`}`}
+                  {selectedTile.structure.rallyTargetId &&
                     ` · rally ${selectedRallyBlocked ? "blocked" : "active"} to ${selectedTile.structure.rallyTargetId}`}
                 </small>
-                {selectedTile.structure.type === "barracks" &&
-                  selectedTile.structure.rallyQueuedTroops > 0 && (
-                    <small data-testid="rally-queued-status">
-                      {selectedTile.structure.rallyQueuedTroops} trained troops queued
-                    </small>
-                  )}
-                {selectedTurretSupportStatus && (
-                  <small data-testid="turret-support-status">{selectedTurretSupportStatus}</small>
+                {totalUnits(selectedTile.structure.rallyQueuedUnits) > 0 && (
+                  <small data-testid="rally-queued-status">
+                    {formatUnits(selectedTile.structure.rallyQueuedUnits)} queued
+                  </small>
+                )}
+                {selectedTypedSupportStatus && (
+                  <small data-testid="typed-support-status">{selectedTypedSupportStatus}</small>
                 )}
                 <small data-testid="structure-progress-text">
                   {selectedStructureProgressLabel}
@@ -2641,12 +2771,11 @@ export function GameApp() {
                     Cancel
                   </button>
                 ) : (
-                  selectedTile.structure.type === "barracks" &&
                   selectedTile.structure.completedCount > 0 && (
                     <button
                       onClick={() =>
                         dispatchCommand({
-                          type: "toggle-barracks",
+                          type: "toggle-production",
                           playerId: localPlayerId,
                           tileId: selectedTile.id,
                         })
@@ -2656,8 +2785,7 @@ export function GameApp() {
                     </button>
                   )
                 ))}
-              {selectedTile.structure.type === "barracks" &&
-                selectedTile.structure.completedCount > 0 &&
+              {selectedTile.structure.completedCount > 0 &&
                 selectedTile.owner === localPlayerId && (
                   <div className="rally-actions">
                     <button
@@ -2709,7 +2837,7 @@ export function GameApp() {
             ))}
             <em>
               {selectedTile
-                ? `Send ${Math.max(0, Math.min(selectedTile.troops - 1, Math.floor((selectedTile.troops * sendPercent) / 100)))} troops`
+                ? `Send ${totalUnits(unitsForPercent(selectedTile.units, sendPercent))} units`
                 : "Select a garrison"}
             </em>
             <button
@@ -2730,14 +2858,9 @@ export function GameApp() {
           </div>
           <div className="dock-divider" />
           <div className="build-control">
-            <span>Raise structure</span>
-            {(["farm", "barracks", "turret"] as const).map((type) => {
-              const cost =
-                type === "farm"
-                  ? BALANCE.farm.costMilli
-                  : type === "barracks"
-                    ? BALANCE.barracks.costMilli
-                    : BALANCE.turret.costMilli;
+            <span>Train & support</span>
+            {(["barracks", "archery-range", "wizard-tower"] as const).map((type) => {
+              const details = STRUCTURES[type];
               return (
                 <button
                   key={type}
@@ -2753,9 +2876,10 @@ export function GameApp() {
                 >
                   <StructureGlyph type={type} />
                   <span>
-                    <b>{type}</b>
+                    <b>{details.name}</b>
                     <small>
-                      {formatSupply(cost)} supply · {type[0]!.toUpperCase()}
+                      {formatSupply(details.costMilli)} supply · trains {UNIT_LABELS[details.unit]}{" "}
+                      · {details.shortcut}
                     </small>
                   </span>
                 </button>
@@ -2819,10 +2943,10 @@ export function GameApp() {
         <div className={`build-tooltip ${buildReason ? "is-invalid" : ""}`}>
           <StructureGlyph type={buildMode} />
           <span>
-            <strong>Placing {buildMode}</strong>
+            <strong>Placing {STRUCTURES[buildMode].name}</strong>
             <small>
               {buildReason ??
-                `Choose a glowing ${buildMode === "farm" ? "Fertile Meadow" : buildMode === "barracks" ? "Muster Ground" : "owned land tile"}.`}
+                `Choose a glowing ${STRUCTURES[buildMode].terrain}. This trains ${UNIT_LABELS[STRUCTURES[buildMode].unit]}.`}
             </small>
           </span>
           <kbd>Esc</kbd>
@@ -2831,7 +2955,7 @@ export function GameApp() {
 
       {rallySourceId && (
         <div className="build-tooltip rally-tooltip" role="status">
-          <StructureGlyph type="barracks" />
+          <StructureGlyph type={state?.map.tiles[rallySourceId]?.structure?.type ?? "barracks"} />
           <span>
             <strong>Choose rally destination</strong>
             <small>Friendly, neutral, or one reachable hostile final step.</small>

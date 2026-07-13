@@ -5,6 +5,7 @@ import { emitEvent } from "../engine/events";
 import { axialKey, neighbors } from "../hex";
 import { rerouteInterruptedStack } from "../movement";
 import { checkAndRewardElimination, grantCaptureReward } from "../rewards";
+import { addUnits, emptyUnits, totalUnits } from "../units";
 
 interface DetectedPocket {
   captorId: number;
@@ -211,7 +212,7 @@ function completeEnclosure(state: GameState, enclosure: EnclosureState): void {
   if (!captor || captor.eliminated) return;
   const pocket = new Set(enclosure.tileIds);
   const eliminatedCandidates = new Set<number>();
-  const captorBattleTroops = new Map<string, number>();
+  const captorBattleUnits = new Map<string, ReturnType<typeof emptyUnits>>();
 
   // A stack's authoritative rule position is path[pathIndex]. Presentation
   // interpolation never decides whether it was trapped.
@@ -219,7 +220,7 @@ function completeEnclosure(state: GameState, enclosure: EnclosureState): void {
   for (const stack of [...state.stacks].sort((left, right) => left.id - right.id)) {
     const currentId = stackCurrentTileId(stack);
     if (stack.owner !== enclosure.captorId && currentId && pocket.has(currentId)) {
-      recordTroopLoss(state, stack.owner, stack.troops);
+      recordTroopLoss(state, stack.owner, totalUnits(stack.units));
       continue;
     }
     survivingStacks.push(stack);
@@ -234,12 +235,12 @@ function completeEnclosure(state: GameState, enclosure: EnclosureState): void {
     }
     for (const participant of battle.participants) {
       if (participant.playerId === enclosure.captorId) {
-        captorBattleTroops.set(
+        captorBattleUnits.set(
           battle.tileId,
-          (captorBattleTroops.get(battle.tileId) ?? 0) + participant.troops,
+          addUnits(captorBattleUnits.get(battle.tileId) ?? emptyUnits(), participant.units),
         );
       } else {
-        recordTroopLoss(state, participant.playerId, participant.troops);
+        recordTroopLoss(state, participant.playerId, totalUnits(participant.units));
       }
     }
   }
@@ -250,7 +251,7 @@ function completeEnclosure(state: GameState, enclosure: EnclosureState): void {
     const previousOwner = tile.owner;
     if (previousOwner !== null && previousOwner !== enclosure.captorId) {
       eliminatedCandidates.add(previousOwner);
-      recordTroopLoss(state, previousOwner, tile.troops);
+      recordTroopLoss(state, previousOwner, totalUnits(tile.units));
     }
     const capturedStructure =
       tile.structure && tile.structure.completedCount > 0
@@ -259,7 +260,7 @@ function completeEnclosure(state: GameState, enclosure: EnclosureState): void {
     seizeStructure(tile);
     grantCaptureReward(state, enclosure.captorId, tile, previousOwner, capturedStructure);
     tile.owner = enclosure.captorId;
-    tile.troops = captorBattleTroops.get(tileId) ?? 0;
+    tile.units = captorBattleUnits.get(tileId) ?? emptyUnits();
     tile.controlledSinceTick = state.tick;
     captor.stats.tilesCaptured += 1;
     emitEvent(state, {

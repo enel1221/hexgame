@@ -3,7 +3,13 @@ export type TerrainType = "meadow" | "muster" | "plains" | "forest" | "hills" | 
 export type MapArchetype = "heartland" | "broken-crown" | "highland-basin";
 export type Difficulty = "easy" | "normal" | "hard";
 export type GraphicsQuality = "low" | "medium" | "high";
-export type StructureType = "farm" | "barracks" | "turret";
+export type UnitType = "melee" | "ranged" | "wizard";
+export interface UnitCounts {
+  melee: number;
+  ranged: number;
+  wizard: number;
+}
+export type StructureType = "barracks" | "archery-range" | "wizard-tower";
 export type StructureStatus = "active" | "seized" | "repairing";
 export type GamePhase = "placement" | "opening" | "running" | "complete";
 
@@ -22,20 +28,18 @@ export interface StructureState {
   pendingProgressTicks: number | null;
   seizedTicks: number;
   productionPaused: boolean;
-  /** Fixed-point integrity-ticks toward the next aggregate Barracks cycle. */
-  barracksProgressMilli: number;
+  /** Fixed-point integrity-ticks toward the next aggregate training cycle. */
+  trainingProgressMilli: number;
   rallyTargetId: string | null;
-  /** Newly trained troops retained locally while the rally route is blocked. */
-  rallyQueuedTroops: number;
-  /** Fixed-point integrity-ticks toward the next aggregate Turret volley. */
-  turretShotProgressMilli: number;
+  /** Newly trained units retained locally while the rally route is blocked. */
+  rallyQueuedUnits: UnitCounts;
 }
 
 export interface TileState extends Axial {
   id: string;
   terrain: TerrainType;
   owner: number | null;
-  troops: number;
+  units: UnitCounts;
   structure: StructureState | null;
   controlledSinceTick: number;
   lastRewardTick: number;
@@ -100,7 +104,7 @@ export interface PlayerStats {
 export interface MovingStack {
   id: number;
   owner: number;
-  troops: number;
+  units: UnitCounts;
   path: string[];
   pathIndex: number;
   segmentProgress: number;
@@ -114,9 +118,9 @@ export interface MovingStack {
 export interface BattleParticipant {
   /** Null is reserved for the neutral incumbent. */
   playerId: number | null;
-  troops: number;
+  units: UnitCounts;
   control: number;
-  casualtyProgressMilli: number;
+  casualtyProgressMilli: UnitCounts;
   entryFrom: string;
   joinedTick: number;
   lastReinforcementTick: number;
@@ -162,7 +166,9 @@ export type GameEventType =
   | "placement-complete"
   | "rally-set"
   | "rally-cleared"
+  /** Retained so migrated recent-event rings remain readable. */
   | "turret-volley"
+  | "typed-support"
   | "encirclement-started"
   | "encirclement-complete"
   | "elimination"
@@ -201,7 +207,7 @@ export interface MatchConfig {
 }
 
 export interface GameState {
-  version: 2;
+  version: 3;
   config: MatchConfig;
   phase: GamePhase;
   placement: PlacementState;
@@ -262,7 +268,7 @@ export type GameCommand =
       scheduledTick?: number;
     }
   | {
-      type: "toggle-barracks";
+      type: "toggle-production";
       playerId: number;
       tileId: string;
       scheduledTick?: number;

@@ -392,7 +392,7 @@ describe("local Wrangler multiplayer relay", () => {
         type: "build",
         playerId: 1,
         tileId: "2,0",
-        structure: "turret",
+        structure: "wizard-tower",
       },
     });
     expect(
@@ -409,7 +409,7 @@ describe("local Wrangler multiplayer relay", () => {
         type: "build",
         playerId: 1,
         tileId: "2,0",
-        structure: "turret",
+        structure: "wizard-tower",
       },
     });
     const guestAck = await guestSocket.take(

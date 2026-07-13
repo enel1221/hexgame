@@ -1,5 +1,6 @@
 import { BALANCE, SUPPLY_SCALE } from "../../shared/balance";
 import type { GameState, StructureType, TileState } from "../../shared/types";
+import { totalUnits } from "../units";
 import { emitEvent } from "../engine/events";
 
 export interface CapturedStructureValue {
@@ -15,9 +16,9 @@ function normalizeCapturedStructure(value: CaptureRewardStructure): CapturedStru
 }
 
 function structureRewardMilli(type: StructureType | null): number {
-  if (type === "farm") return BALANCE.farmCaptureRewardMilli;
   if (type === "barracks") return BALANCE.barracksCaptureRewardMilli;
-  if (type === "turret") return BALANCE.turretCaptureRewardMilli;
+  if (type === "archery-range") return BALANCE.archeryRangeCaptureRewardMilli;
+  if (type === "wizard-tower") return BALANCE.wizardTowerCaptureRewardMilli;
   return 0;
 }
 
@@ -36,24 +37,26 @@ export function grantCaptureReward(
   previousOwner: number | null,
   capturedStructure: CaptureRewardStructure,
 ): number {
-  if (previousOwner === null || previousOwner === captorId) return 0;
-  if (!captureRewardEligibility(state, tile)) return 0;
+  if (previousOwner === captorId) return 0;
+  if (previousOwner !== null && !captureRewardEligibility(state, tile)) return 0;
 
   const captured = normalizeCapturedStructure(capturedStructure);
   const amount =
-    BALANCE.captureRewardMilli +
-    structureRewardMilli(captured?.type ?? null) * (captured?.completedCount ?? 0);
+    previousOwner === null
+      ? BALANCE.neutralCaptureRewardMilli
+      : BALANCE.captureRewardMilli +
+        structureRewardMilli(captured?.type ?? null) * (captured?.completedCount ?? 0);
   const captor = state.players[captorId];
   if (!captor) return 0;
   captor.supplyMilli += amount;
   captor.stats.supplyEarnedMilli += amount;
-  tile.lastRewardTick = state.tick;
+  if (previousOwner !== null) tile.lastRewardTick = state.tick;
   emitEvent(state, {
     type: "reward",
     playerId: captorId,
     tileId: tile.id,
     amount,
-    message: `+${amount / SUPPLY_SCALE} Supply for hostile capture`,
+    message: `+${amount / SUPPLY_SCALE} Supply for ${previousOwner === null ? "neutral" : "hostile"} capture`,
   });
   return amount;
 }
@@ -62,7 +65,7 @@ function removeEliminatedForces(state: GameState, playerId: number): void {
   const eliminated = state.players[playerId];
   if (eliminated) {
     for (const stack of state.stacks) {
-      if (stack.owner === playerId) eliminated.stats.troopsLost += stack.troops;
+      if (stack.owner === playerId) eliminated.stats.troopsLost += totalUnits(stack.units);
     }
   }
   state.stacks = state.stacks.filter((stack) => stack.owner !== playerId);
@@ -70,7 +73,7 @@ function removeEliminatedForces(state: GameState, playerId: number): void {
   const retainedBattles = [];
   for (const battle of state.battles) {
     const removed = battle.participants.find((participant) => participant.playerId === playerId);
-    if (removed && eliminated) eliminated.stats.troopsLost += removed.troops;
+    if (removed && eliminated) eliminated.stats.troopsLost += totalUnits(removed.units);
     battle.participants = battle.participants.filter(
       (participant) => participant.playerId !== playerId,
     );
@@ -78,7 +81,7 @@ function removeEliminatedForces(state: GameState, playerId: number): void {
       const survivor = battle.participants[0]!;
       const tile = state.map.tiles[battle.tileId];
       if (tile && survivor.playerId === battle.incumbentOwner) {
-        tile.troops = Math.max(tile.troops, survivor.troops);
+        tile.units = { ...survivor.units };
         continue;
       }
     }

@@ -5,6 +5,7 @@ import type {
   GameState,
   StructureState,
   StructureType,
+  UnitType,
 } from "../shared/types";
 import { handleStackArrival } from "./combat";
 import { createInitialState, refreshPlayerAggregates } from "./engine";
@@ -13,6 +14,7 @@ import { cloneDeterministic, hashGameState } from "./hash";
 import { axialKey, compareAxialKeys, distance, neighbors, parseAxialKey } from "./hex";
 import { beginMatch, computeFinalSpawnVector, finalizePlacementVector } from "./placement";
 import { checkAndRewardElimination } from "./rewards";
+import { emptyUnits, totalUnits, unitsOf } from "./units";
 
 export const DEBUG_SCENARIOS = [
   "structures",
@@ -113,10 +115,9 @@ function activeStructure(
     pendingProgressTicks: null,
     seizedTicks: 0,
     productionPaused: false,
-    barracksProgressMilli: 0,
+    trainingProgressMilli: 0,
     rallyTargetId: null,
-    rallyQueuedTroops: 0,
-    turretShotProgressMilli: 0,
+    rallyQueuedUnits: emptyUnits(),
     ...overrides,
   };
 }
@@ -137,15 +138,17 @@ function installBattle(
     control: number;
     ageTicks: number;
     roundAccumulator?: number;
+    attackerType?: UnitType;
+    defenderType?: UnitType;
   },
 ): BattleState {
   const target = state.map.tiles[location.targetId]!;
   const entry = state.map.tiles[location.entryFrom]!;
   target.owner = defender;
-  target.troops = 0;
+  target.units = emptyUnits();
   target.structure = null;
   entry.owner = attacker;
-  entry.troops = Math.max(entry.troops, 72);
+  if (totalUnits(entry.units) < 72) entry.units = unitsOf("melee", 72);
 
   const retainedId = existingBattleId(previous, location.targetId);
   const id = retainedId ?? state.nextEntityId++;
@@ -157,9 +160,9 @@ function installBattle(
     participants: [
       {
         playerId: defender,
-        troops: options.defenderTroops,
+        units: unitsOf(options.defenderType ?? "ranged", options.defenderTroops),
         control: 10_000 - options.control,
-        casualtyProgressMilli: 0,
+        casualtyProgressMilli: emptyUnits(),
         entryFrom: target.id,
         joinedTick: state.tick,
         lastReinforcementTick: -1,
@@ -167,9 +170,9 @@ function installBattle(
       },
       {
         playerId: attacker,
-        troops: options.attackerTroops,
+        units: unitsOf(options.attackerType ?? "melee", options.attackerTroops),
         control: options.control,
-        casualtyProgressMilli: 0,
+        casualtyProgressMilli: emptyUnits(),
         entryFrom: entry.id,
         joinedTick: state.tick,
         lastReinforcementTick: -1,
@@ -188,8 +191,8 @@ function addStructures(state: GameState, playerId: number): void {
   if (!cluster || cluster.length < 3) throw new Error("Structure scenario needs a spawn cluster");
   const musterId = cluster.find((id) => state.map.tiles[id]!.terrain === "muster");
   const meadowId = cluster.find((id) => state.map.tiles[id]!.terrain === "meadow");
-  const turretId = cluster.find((id) => id !== musterId && id !== meadowId);
-  if (!musterId || !meadowId || !turretId) {
+  const towerId = cluster.find((id) => id !== musterId && id !== meadowId);
+  if (!musterId || !meadowId || !towerId) {
     throw new Error("Structure scenario needs nearby Muster and Meadow terrain");
   }
 
@@ -197,20 +200,18 @@ function addStructures(state: GameState, playerId: number): void {
     const tile = state.map.tiles[id]!;
     tile.owner = playerId;
     tile.structure = null;
-    tile.troops = Math.max(tile.troops, 18);
+    if (totalUnits(tile.units) < 18) tile.units = unitsOf("melee", 18);
   }
-  const rallyTargetId = cluster.find((id) => id !== musterId && id !== meadowId && id !== turretId);
+  const rallyTargetId = cluster.find((id) => id !== musterId && id !== meadowId && id !== towerId);
   state.map.tiles[musterId]!.structure = activeStructure("barracks", 3, {
-    barracksProgressMilli: Math.floor((BALANCE.barracks.trainTicks * BALANCE.fullIntegrity) / 2),
+    trainingProgressMilli: Math.floor((BALANCE.barracks.trainTicks * BALANCE.fullIntegrity) / 2),
     rallyTargetId: rallyTargetId ?? null,
-    rallyQueuedTroops: rallyTargetId ? 4 : 0,
+    rallyQueuedUnits: unitsOf("melee", rallyTargetId ? 4 : 0),
   });
-  state.map.tiles[meadowId]!.structure = activeStructure("farm", 2, {
-    pendingProgressTicks: Math.floor(BALANCE.farm.buildTicks / 2),
+  state.map.tiles[meadowId]!.structure = activeStructure("archery-range", 2, {
+    pendingProgressTicks: Math.floor(BALANCE.archeryRange.buildTicks / 2),
   });
-  state.map.tiles[turretId]!.structure = activeStructure("turret", 99, {
-    turretShotProgressMilli: Math.floor(BALANCE.turret.shotTicks / 2) * BALANCE.fullIntegrity,
-  });
+  state.map.tiles[towerId]!.structure = activeStructure("wizard-tower", 99);
   const player = state.players[playerId]!;
   player.supplyMilli = Math.max(player.supplyMilli, 500 * 1000);
   player.stats.structuresBuilt = Math.max(player.stats.structuresBuilt, 104);
@@ -234,7 +235,7 @@ function addBattle(
   });
 
   if (reinforced) {
-    handleStackArrival(state, localId, 40, battle.tileId, location.entryFrom);
+    handleStackArrival(state, localId, unitsOf("melee", 40), battle.tileId, location.entryFrom);
   } else {
     emitEvent(state, {
       type: "battle-started",
@@ -256,7 +257,7 @@ function addMinimumDurationBattle(state: GameState, previous: GameState): void {
     for (const tileId of state.map.landIds) {
       const tile = state.map.tiles[tileId]!;
       if (tile.owner !== player.id) continue;
-      tile.troops = 1;
+      tile.units = unitsOf("melee", 1);
       tile.structure = null;
     }
   }
@@ -269,10 +270,7 @@ function addMinimumDurationBattle(state: GameState, previous: GameState): void {
     roundAccumulator: BALANCE.combatRoundTicks - 1,
   });
   const target = state.map.tiles[battle.tileId]!;
-  target.structure = activeStructure("turret", 3, {
-    turretShotProgressMilli:
-      BALANCE.turret.shotTicks * BALANCE.fullIntegrity - 3 * BALANCE.fullIntegrity,
-  });
+  target.structure = activeStructure("wizard-tower", 3);
   emitEvent(state, {
     type: "battle-started",
     playerId: localId,
@@ -300,7 +298,7 @@ function addDevelopedCapture(state: GameState, previous: GameState): void {
   });
   const target = state.map.tiles[battle.tileId]!;
   target.terrain = "meadow";
-  target.structure = activeStructure("farm");
+  target.structure = activeStructure("archery-range");
   target.controlledSinceTick = 0;
   target.lastRewardTick = 0;
   emitEvent(state, {
@@ -318,7 +316,7 @@ function addElimination(state: GameState, previous: GameState): void {
     const tile = state.map.tiles[tileId]!;
     if (tile.owner === enemyId) {
       tile.owner = null;
-      tile.troops = 1;
+      tile.units = unitsOf("melee", 1);
       tile.structure = null;
     }
   }
@@ -337,9 +335,9 @@ function addElimination(state: GameState, previous: GameState): void {
     state.map.tiles[battle.tileId]!.terrain = "plains";
     battle.participants.push({
       playerId: activeOpponents[1]!.id,
-      troops: 20,
+      units: unitsOf("wizard", 20),
       control: 5_000,
-      casualtyProgressMilli: 0,
+      casualtyProgressMilli: emptyUnits(),
       entryFrom: location.entryFrom,
       joinedTick: state.tick,
       lastReinforcementTick: -1,
@@ -374,15 +372,15 @@ function addEnclosureFixture(state: GameState, playerId: number): void {
     .map(axialKey)
     .sort((left, right) => compareTileIds(state, left, right));
   target.owner = opponentId(state, playerId);
-  target.troops = 6;
+  target.units = unitsOf("wizard", 6);
   target.terrain = "meadow";
-  target.structure = activeStructure("farm", 2, {
-    pendingProgressTicks: Math.floor(BALANCE.farm.buildTicks / 2),
+  target.structure = activeStructure("archery-range", 2, {
+    pendingProgressTicks: Math.floor(BALANCE.archeryRange.buildTicks / 2),
   });
   for (const boundaryId of boundaryIds) {
     const boundary = state.map.tiles[boundaryId]!;
     boundary.owner = playerId;
-    boundary.troops = Math.max(boundary.troops, 8);
+    if (totalUnits(boundary.units) < 8) boundary.units = unitsOf("melee", 8);
   }
   state.enclosures = [
     {
@@ -404,7 +402,7 @@ function addInteriorBuildTile(state: GameState, playerId: number): void {
   for (const id of cluster) {
     const tile = state.map.tiles[id]!;
     tile.owner = playerId;
-    tile.troops = Math.max(tile.troops, 18);
+    if (totalUnits(tile.units) < 18) tile.units = unitsOf("melee", 18);
   }
   const enclosed = neighbors(center).every((adjacent) => clusterSet.has(axialKey(adjacent)));
   if (!enclosed) throw new Error("Spawn center is not enclosed by owned land");
@@ -418,7 +416,7 @@ function addCapturedTile(state: GameState): void {
   const { targetId } = findScenarioLocation(state, localId);
   const tile = state.map.tiles[targetId]!;
   tile.owner = localId;
-  tile.troops = 72;
+  tile.units = unitsOf("melee", 72);
   tile.structure = null;
   tile.controlledSinceTick = state.tick;
   tile.lastRewardTick = state.tick;
@@ -448,7 +446,7 @@ function addCompletedMatch(state: GameState, winnerId: number): void {
     const tile = state.map.tiles[tileId]!;
     if (tile.owner !== winnerId) {
       tile.owner = null;
-      tile.troops = 1;
+      tile.units = unitsOf("melee", 1);
       tile.structure = null;
     }
   }

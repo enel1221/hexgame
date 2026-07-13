@@ -122,11 +122,8 @@ describe("deterministic command relay helpers", () => {
       colorPatterns: true,
       debug: false,
     });
-    const selections = [
-      { seat: 0, centerId: "8,13" },
-      { seat: 1, centerId: "18,7" },
-      { seat: 2, centerId: "16,3" },
-    ] as const;
+    const canonical = computeFinalSpawnVector(engine.state);
+    const selections = canonical.slice(0, 3).map((centerId, seat) => ({ seat, centerId }));
     for (const selection of selections) {
       expect(
         applyCommand(engine.state, {
@@ -140,7 +137,7 @@ describe("deterministic command relay helpers", () => {
     const coreVector = computeFinalSpawnVector(engine.state);
     const candidates = eligibleSpawnCenters(engine.state.map);
     const relayVector = finalizePlacementCenters({
-      seed: "fair-choice-audit",
+      seed: deriveGenerationSeed("fair-choice-audit", engine.state.map.generationAttempt),
       totalParticipants: 4,
       candidates: [...candidates].reverse(),
       selections,

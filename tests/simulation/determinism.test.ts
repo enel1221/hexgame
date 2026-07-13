@@ -6,6 +6,7 @@ import {
   neighbors,
   replayCommands,
   stableStringify,
+  totalUnits,
 } from "../../src/core";
 import { createRunningGame } from "../unit/fixtures";
 
@@ -27,7 +28,7 @@ function queueOpeningMove(engine: ReturnType<typeof createRunningGame>): void {
     .map((hex) => engine.state.map.tiles[axialKey(hex)])
     .find((tile) => tile && tile.owner === null);
   const friendly = engine.state.map.spawnClusters[0]!.map((id) => engine.state.map.tiles[id]!).find(
-    (tile) => tile.id !== source.id && tile.troops > 1,
+    (tile) => tile.id !== source.id && totalUnits(tile.units) > 1,
   )!;
   engine.submitCommand({
     type: "move",

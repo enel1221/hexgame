@@ -1,6 +1,11 @@
 import { expect, type Page } from "@playwright/test";
 
 export type MapArchetype = "heartland" | "broken-crown" | "highland-basin";
+export interface TestUnitCounts {
+  melee: number;
+  ranged: number;
+  wizard: number;
+}
 export type DebugScenario =
   | "structures"
   | "battle"
@@ -19,21 +24,23 @@ export interface TestTile {
   q: number;
   r: number;
   owner: number | null;
+  units: TestUnitCounts;
   troops: number;
   terrain: "meadow" | "muster" | "plains" | "forest" | "hills" | "water";
   structure: {
-    type: "farm" | "barracks" | "turret";
+    type: "barracks" | "archery-range" | "wizard-tower";
     completedCount: number;
     status: "active" | "seized" | "repairing" | null;
     integrity: number;
     pendingProgressTicks: number | null;
     rallyTargetId: string | null;
-    rallyQueuedTroops: number;
+    rallyQueuedUnits: TestUnitCounts;
   } | null;
 }
 
 export interface TestStack {
   id: number;
+  units: TestUnitCounts;
   troops: number;
   owner: number;
   path: string[];
@@ -48,6 +55,7 @@ export interface TestBattle {
   incumbentOwner: number | null;
   participants: Array<{
     playerId: number | null;
+    units: TestUnitCounts;
     troops: number;
     control: number;
     lastReinforcementTick: number;
@@ -100,6 +108,8 @@ export interface HexDominionTestApi {
     eliminated: boolean;
     eliminatedBy: number | null;
     supplyMilli: number;
+    supplyEarnedMilli: number;
+    troopsTrained: number;
     enemiesEliminated: number;
   }>;
   events: Array<{
@@ -141,7 +151,14 @@ export interface HexDominionTestApi {
 }
 
 export interface TestPresentation {
-  stacks: Array<{ id: number; x: number; y: number; targetX: number; targetY: number }>;
+  stacks: Array<{
+    id: number;
+    x: number;
+    y: number;
+    targetX: number;
+    targetY: number;
+    units: TestUnitCounts;
+  }>;
   battles: Array<{
     id: number;
     actual: number;
@@ -153,7 +170,9 @@ export interface TestPresentation {
       actual: number;
       displayed: number;
       troops: number;
-      turretSupportCount: number;
+      units: TestUnitCounts;
+      rpsMultiplierPermille: number;
+      supportPower: number;
     }>;
   }>;
   captures: Array<{ tileId: string; age: number }>;

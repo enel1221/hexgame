@@ -52,7 +52,7 @@ A `GameEngine` schedules submitted commands no earlier than the next tick. Multi
 
 Movement paths may cross owned land and make at most one final hostile step. A route cut during travel is recalculated from the current owned tile; if no legal route remains, the stack returns to its last owned position. Multi-move validation uses the same pure planner as the UI preview: it canonicalizes at most 64 sources and 16 destinations, computes all contributions, equal destination quotas, paths, and a bounded minimum-cost allocation from one pre-mutation state, and mutates nothing unless the complete plan is feasible. One multi-move remains one scheduled command and one history entry even when its plan creates several aggregate moving stacks.
 
-Every producer uses the ordinary movement reachability rule for rally validation. One structure stack has one retained destination. A completed cycle produces one affordable aggregate batch of its own unit type, dispatches only newly trained units, and marks a retained rally blocked when no current legal route exists.
+Every producer uses the ordinary movement reachability rule for rally validation. One structure stack has one retained destination. A completed cycle produces one affordable aggregate batch of its own unit type without a troop-storage cap, dispatches only newly trained units, and retains blocked-rally output locally until a legal route returns.
 
 ## Determinism
 
@@ -93,11 +93,11 @@ The Worker sends authoritative state at tick boundaries. Rendering fills the 100
 - the visible stack container eases toward each new target position;
 - soldier limbs use frame-time animation only for presentation;
 - battle state exposes one canonical participant per active faction, exact typed counts, and integer control shares totaling 10,000;
-- the battle bar eases one color/pattern segment per participant and keeps late entrants/reinforcements visually readable without inventing a coalition;
+- the battle bar eases one color/pattern effective-share segment per participant, places an `x1.xx` type multiplier inside every segment wide enough to label, and keeps late entrants/reinforcements readable without inventing a coalition;
 - battle presentation adds paired fighters, strike animation, particles, and a brief bright impact segment without changing combat state;
 - ownership changes create a directional edge-wipe before the displayed border/tint commits;
 - capture and reward events create short world-space labels over the affected tile.
-- placement footprints, locks, rally paths, Multi rings/numbered targets/route fans, typed building support, RPS cues, and enclosure perimeters are presentation layers over authoritative state;
+- placement footprints, locks, rally paths, Multi rings/numbered targets/route fans, battle type multipliers, detailed typed building support, and enclosure perimeters are presentation layers over authoritative state;
 - x2–x99 structure badges and support effects never create one retained object or projectile per copy.
 
 Static terrain geometry is drawn when a map first arrives. Ownership is retained and redrawn only when a capture wipe completes instead of on every state tick. Labels, structures, stacks, and battles are updated in retained PixiJS layers. HUD panels remain semantic HTML/CSS for accessibility and responsive layout.

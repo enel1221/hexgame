@@ -11,12 +11,12 @@
 | Starting owned tiles    |                  7 | Connected center plus its six neighbors                   |
 | Free starting structure |         1 Barracks | Active, on the center Muster Ground                       |
 | Placement padding       |           radius 2 | Footprint/local expansion cannot touch water or an edge   |
-| Minimum center distance |            6 hexes | Applies to provisional and locked centers                 |
+| Minimum center distance |            4 hexes | Applies to provisional and locked centers                 |
 | Multiplayer placement   |   300 ticks / 30 s | Missing starts are assigned deterministically             |
 | AI placement lock       | <=42 ticks / 4.2 s | Relay start floor is 5 s so locked bot centers never move |
-| Target land per ruler   |                 52 | Before clamping                                           |
-| Minimum playable land   |                180 | Two/three-player floor                                    |
-| Maximum playable land   |              1,092 | Safety cap and current 21-player target                   |
+| Target land per ruler   |                 30 | Before clamping                                           |
+| Minimum playable land   |                128 | Two/three-player floor                                    |
+| Maximum playable land   |                630 | Safety cap and current 21-player target                   |
 | Supported AI opponents  |               3–20 | 4–21 total rulers in single-player                        |
 | Recent event retention  |                 24 | UI/state event ring length                                |
 | Autosave interval       |   150 ticks / 15 s | Single-player local snapshot cadence                      |
@@ -32,7 +32,7 @@ Generated cell count is chosen so playable land remains 72–82% of all cells. T
 | Hills          |        9.5–15.5% | +25% defender power | 115% movement-cost multiplier, rounded to 11 ticks / 1.1 s | Wizard Tower                  |
 | Water          |         excluded |                 n/a |                                                 impassable | none                          |
 
-Every archetype carves a deterministic impassable-water seam while preserving the exact land target and one connected traversable landmass. River Gates and Highland Passes use controlled two-tile gates; Shattered Crown uses controlled one-tile gates. A qualifying gate must separate substantial regions, uncontrolled articulation bridges are rejected, and spawn centers remain at least three hexes from a gate. Fairness also requires seven connected owned spawn tiles, the 8/8/8 opening army, two Meadows and one Muster Ground within radius two, at least two open expansion tiles, center distance of at least six, and bounded local-area/neutral-defense variance. A final vector is distance-balanced only when its largest nearest-opponent distance is at most twice its smallest.
+Every archetype carves a deterministic impassable-water seam while preserving the exact land target and one connected traversable landmass. River Gates and Highland Passes use controlled two-tile gates; Shattered Crown uses controlled one-tile gates. A qualifying gate must separate substantial regions, uncontrolled articulation bridges are rejected, and spawn centers remain at least three hexes from a gate. Fairness also requires seven connected owned spawn tiles, the 8/8/8 opening army, two Meadows and one Muster Ground within radius two, at least two open expansion tiles, center distance of at least four, and bounded local-area/neutral-defense variance. A final vector is distance-balanced only when its largest nearest-opponent distance is at most twice its smallest.
 
 ## Economy and structures
 
@@ -48,7 +48,7 @@ Every archetype carves a deterministic impassable-water seam while preserving th
 | Aggregate training interval             |       25 ticks / 2.5 s at full integrity |
 | Output per cycle                        | up to completed count in one typed batch |
 | Unit training cost                      |                            1 Supply/unit |
-| No-rally local target                   |                     40 units on its tile |
+| Local and blocked-rally troop storage   |                                 Uncapped |
 | Local typed support                     |     2/copy, capped at 12 per source tile |
 | Adjacent typed support                  |      1/copy, capped at 6 per source tile |
 | Adjacent support cap                    |         12 per faction in any one battle |
@@ -59,7 +59,7 @@ Every archetype carves a deterministic impassable-water seam while preserving th
 
 Only active or repairing completed copies are operational. A contested tile pauses pending construction and production. Existing copies continue operating while the next copy constructs. Throughput and support scale with integrity while repairing. Capture destroys the pending copy, seizes every completed copy together at 40% integrity, and clears its rally.
 
-Every producer accumulates one shared integrity-scaled cycle and trains its own type: Barracks train Melee, Archery Ranges train Ranged, and Wizard Towers train Wizards. A valid rally dispatches only the new typed batch; a blocked route retains it locally up to the 40-unit cap and retries later. Same-type copies stack to x99, while structure types never mix on one tile.
+Every producer accumulates one shared integrity-scaled cycle and trains its own type: Barracks train Melee, Archery Ranges train Ranged, and Wizard Towers train Wizards. A valid rally dispatches only the new typed batch; without a valid route, production keeps accumulating locally without a troop cap and a blocked rally retries later. Same-type copies stack to x99, while structure types never mix on one tile.
 
 Local support adds the building's typed virtual power to its home battle. Otherwise, adjacent support is divided deterministically among eligible neighboring battles and capped per source and faction. Support never creates a participant or captures territory by itself; its owner must have at least one real unit in the battle.
 
@@ -89,7 +89,7 @@ An atomic Multi command accepts at most 64 sources and 16 destinations. It pools
 
 The counter cycle is Wizard > Melee, Ranged > Wizard, and Melee > Ranged. A unit receives 1,500-per-mille power against the type it counters and 1,000 otherwise. Against a mixed or N-faction battle, each type's modifier is weighted against the aggregate hostile composition. Thus equal pure counter armies begin at 60/40 effective power, while identical mixed formations remain equal.
 
-Every faction arriving at an active battle immediately joins or reinforces its canonical participant. A round snapshots exact typed units, incumbent terrain, local building power, and adjacent typed support. Outgoing pressure derives from that faction's RPS-adjusted power and is allocated across hostile faction/type targets with canonical remainder rules. Typed casualties and independent participant-control changes apply simultaneously, so participant or battle array order cannot change the result. The battle bar normalizes effective-power shares to exactly 10,000 and separately exposes actual composition, typed support, and the RPS bonus.
+Every faction arriving at an active battle immediately joins or reinforces its canonical participant. A round snapshots exact typed units, incumbent terrain, local building power, and adjacent typed support. Outgoing pressure derives from that faction's RPS-adjusted power and is allocated across hostile faction/type targets with canonical remainder rules. Typed casualties and independent participant-control changes apply simultaneously, so participant or battle array order cannot change the result. The single battle bar normalizes effective-power shares to exactly 10,000 and labels wide-enough faction segments with their weighted `x1.xx` type multiplier; the inspector separately exposes exact composition and typed support.
 
 Two-party fights retain the 8-tick warmup, 2-tick round, and 35-tick minimum. A total-elimination tie chooses the survivor by pre-round effective power, then incumbent ownership, then stable player ID.
 
@@ -145,7 +145,7 @@ Difficulty changes search behavior only; it grants no Supply, troops, combat, co
 - Seven starting tiles and an exact 8/8/8 army make every counter choice available without allowing immediate elimination.
 - Compact maps and water gates make each tile strategically important while keeping all land connected and every route deterministic.
 - Passive plus per-tile income funds all three military producers; neutral and hostile capture rewards keep expansion economically meaningful without a dedicated Farm.
-- Typed producers are local logistics: the 40-unit cap, per-unit Supply cost, and rally path force armies to move rather than materialize globally.
+- Typed producers are local logistics: continuous local production is limited economically by per-unit Supply cost, while rally paths move new batches toward the front instead of materializing them globally.
 - A 50% counter bonus is large enough to swing the battle bar visibly, but identical or balanced compositions retain neutral power.
 - Building support is typed and capped, so a defended gate matters without allowing an x99 stack to contribute unbounded virtual force.
 - The 3.5-second resolution floor guarantees visible combat; power-weighted control movement lets mismatches resolve sooner than near-even fights.

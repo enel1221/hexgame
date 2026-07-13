@@ -1,4 +1,5 @@
 import { ROOM_CODE_ALPHABET } from "./protocol";
+import { BALANCE } from "../shared/balance";
 import {
   compareProjectedCenterIds,
   placementDistanceBalance,
@@ -17,7 +18,7 @@ export const PLACEMENT_DURATION_MS = 30_000;
 // in placement long enough that no visibly provisional bot can move at start.
 export const AI_PLACEMENT_MIN_MS = 5_000;
 export const OPENING_HANDOFF_MS = 1_000;
-export const MIN_PLACEMENT_CENTER_DISTANCE = 6;
+export const MIN_PLACEMENT_CENTER_DISTANCE = BALANCE.minimumSpawnDistance;
 
 export interface PlacementSelectionInput {
   seat: number;

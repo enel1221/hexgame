@@ -2063,10 +2063,18 @@ kbd {
   background: #f3e8ff;
 }
 .battle-advantage {
-  display: block;
-  margin-top: 3px;
+  width: fit-content;
+  align-items: center;
+  margin-top: 4px;
+  padding: 2px 5px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  background: rgba(8, 17, 21, 0.72);
+  font-size: 8px;
   font-weight: 800;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.06em;
+  line-height: 1.2;
+  text-transform: uppercase;
 }
 .structure-status [role="listitem"] {
   margin-top: 7px;
@@ -2077,11 +2085,16 @@ kbd {
 .structure-status [role="listitem"] > span:not(.unit-composition) {
   display: block;
 }
+.structure-status [role="listitem"] > .battle-advantage {
+  display: inline-flex;
+}
 .battle-advantage--up {
   color: #8fe1b2;
+  background: rgba(55, 126, 91, 0.14);
 }
 .battle-advantage--down {
   color: #ffa09a;
+  background: rgba(139, 63, 61, 0.14);
 }
 .battle-advantage--even {
   color: #c8bea6;

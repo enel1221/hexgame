@@ -1,4 +1,5 @@
 import { expect, test, type Browser, type BrowserContext, type Page } from "@playwright/test";
+import { BALANCE } from "../../src/shared/balance";
 import { observeBrowserHealth, type BrowserHealth } from "./support";
 
 interface ClientSample {
@@ -110,7 +111,7 @@ async function chooseAndLockRoomPlacement(page: Page): Promise<string> {
   await expect(page.getByTestId("placement-panel")).toBeVisible({ timeout: 30_000 });
   let selected: string | null = null;
   for (let attempt = 0; attempt < 50 && !selected; attempt += 1) {
-    const candidate = await page.evaluate(() => {
+    const candidate = await page.evaluate((minimumSpawnDistance) => {
       const api = window.__HEX_DOMINION__;
       if (!api || api.phase !== "placement") return null;
       const localPlayerId = api.config.localPlayerId ?? 0;
@@ -130,11 +131,13 @@ async function chooseAndLockRoomPlacement(page: Page): Promise<string> {
           (id): id is string => {
             if (!id) return false;
             const center = byId.get(id)!;
-            return occupied.every((other) => other && distance(center, other) >= 6);
+            return occupied.every(
+              (other) => other && distance(center, other) >= minimumSpawnDistance,
+            );
           },
         ) ?? null
       );
-    });
+    }, BALANCE.minimumSpawnDistance);
     if (!candidate) {
       await page.waitForTimeout(100);
       continue;

@@ -9,6 +9,7 @@ import {
   loadDebugScenario,
   observeBrowserHealth,
   openTitle,
+  pauseSimulation,
   reinforceBattle,
   resumeSimulation,
   startSinglePlayer,
@@ -43,7 +44,7 @@ test.describe("Hex Dominion browser flows", () => {
     await expect(page.getByTestId("map-heartland")).toContainText("River Gates");
     await expect(page.getByTestId("map-broken-crown")).toContainText("Shattered Crown");
     await expect(page.getByTestId("map-highland-basin")).toContainText("Highland Passes");
-    await expect(page.getByText("312", { exact: true })).toBeVisible();
+    await expect(page.getByText("180", { exact: true })).toBeVisible();
 
     await page.getByTestId("player-name").fill("");
     await expect(page.getByTestId("start-match")).toBeDisabled();
@@ -100,7 +101,9 @@ test.describe("Hex Dominion browser flows", () => {
       );
     const choices = placement.placement.selectableCandidates.filter((id) => {
       const candidate = byId.get(id)!;
-      return occupied.every((other) => other && distance(candidate, other) >= 6);
+      return occupied.every(
+        (other) => other && distance(candidate, other) >= BALANCE.minimumSpawnDistance,
+      );
     });
     expect(choices.length).toBeGreaterThan(1);
     const clickableChoices: string[] = [];
@@ -173,13 +176,13 @@ test.describe("Hex Dominion browser flows", () => {
     expect(snapshot.players.filter((player) => player.isHuman)).toHaveLength(1);
     expect(snapshot.map.archetype).toBe("heartland");
     expect(snapshot.map.seed).toBe("E2E-THREE-AI");
-    expect(snapshot.map.landCount).toBe(208);
+    expect(snapshot.map.landCount).toBe(128);
     expect(snapshot.map.spawnClusters).toHaveLength(4);
     expect(snapshot.map.spawnClusters.every((cluster) => cluster.length === 7)).toBe(true);
     expect(snapshot.stateHash).toMatch(/^[0-9a-f]{16}$/);
 
     await expect(page.getByTestId("supply")).toContainText(/\d/);
-    await expect(page.getByTestId("land-control")).toContainText(/7\s*\/\s*208/);
+    await expect(page.getByTestId("land-control")).toContainText(/7\s*\/\s*128/);
     await expect(page.getByTestId("debug-overlay")).toContainText("FIELD TELEMETRY");
     await expect(page.getByTestId("debug-overlay")).toContainText("E2E-THREE-AI");
     await health.assertHealthy();
@@ -213,6 +216,7 @@ test.describe("Hex Dominion browser flows", () => {
     page,
   }) => {
     test.setTimeout(90_000);
+    await page.setViewportSize({ width: 800, height: 600 });
     const health = observeBrowserHealth(page);
     const snapshot = await startSinglePlayer(page, {
       aiCount: 20,
@@ -224,9 +228,34 @@ test.describe("Hex Dominion browser flows", () => {
 
     expect(snapshot.config.aiCount).toBe(20);
     expect(snapshot.players).toHaveLength(21);
-    expect(snapshot.map.landCount).toBe(1_092);
+    expect(snapshot.map.landCount).toBe(630);
     expect(snapshot.map.spawnClusters).toHaveLength(21);
     expect(snapshot.stateHash).toMatch(/^[0-9a-f]{16}$/);
+
+    await page.evaluate(() => window.__HEX_DOMINION__?.fitOverview());
+    const overviewPair = snapshot.map.spawnClusters[0]!.slice(0, 2);
+    const overviewBefore = await Promise.all(
+      overviewPair.map((tileId) => getTileClientPoint(page, tileId)),
+    );
+    const fittedDistance = Math.hypot(
+      overviewBefore[1]!.x - overviewBefore[0]!.x,
+      overviewBefore[1]!.y - overviewBefore[0]!.y,
+    );
+    const canvasBox = await page.locator("canvas.game-canvas").boundingBox();
+    if (!canvasBox) throw new Error("Canvas has no bounds");
+    await page.mouse.move(canvasBox.x + canvasBox.width / 2, canvasBox.y + canvasBox.height / 2);
+    await page.mouse.wheel(0, -500);
+    await page.mouse.wheel(0, 500);
+    const overviewAfter = await Promise.all(
+      overviewPair.map((tileId) => getTileClientPoint(page, tileId)),
+    );
+    expect(
+      Math.hypot(
+        overviewAfter[1]!.x - overviewAfter[0]!.x,
+        overviewAfter[1]!.y - overviewAfter[0]!.y,
+      ),
+    ).toBeCloseTo(fittedDistance, 1);
+
     const startingTick = snapshot.tick;
     await page.waitForFunction(
       (tick) => (window.__HEX_DOMINION__?.tick ?? 0) > tick,
@@ -236,7 +265,7 @@ test.describe("Hex Dominion browser flows", () => {
       },
     );
 
-    await expect(page.getByTestId("land-control")).toContainText(/7\s*\/\s*1092/);
+    await expect(page.getByTestId("land-control")).toContainText(/7\s*\/\s*630/);
     await expect(page.getByTestId("debug-overlay")).toContainText("E2E-TWENTY-AI");
     await health.assertHealthy();
   });
@@ -291,6 +320,7 @@ test.describe("Hex Dominion browser flows", () => {
       seed: "E2E-MULTI-SHIFT",
       playerName: "Column Warden",
     });
+    await pauseSimulation(page);
     const localPlayerId = opening.config.localPlayerId ?? 0;
     const owned = opening.map.tiles.filter(
       (tile) => tile.owner === localPlayerId && tile.troops > 1,
@@ -299,6 +329,15 @@ test.describe("Hex Dominion browser flows", () => {
       (stack) => stack.owner === localPlayerId,
     ).length;
     expect(owned.length).toBeGreaterThanOrEqual(3);
+
+    await page.evaluate(() => {
+      const focusedButton = document.querySelector<HTMLElement>("[data-testid='pause-toggle']");
+      if (!focusedButton) throw new Error("Pause control is unavailable");
+      focusedButton.focus();
+      focusedButton.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Shift" }));
+      focusedButton.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "Shift" }));
+    });
+    await page.waitForFunction(() => window.__HEX_DOMINION__?.multi.phase === "idle");
 
     await page.keyboard.down("Shift");
     await page.waitForFunction(() => window.__HEX_DOMINION__?.multi.phase === "sources");
@@ -325,6 +364,17 @@ test.describe("Hex Dominion browser flows", () => {
       clientY: cancelPoint.y,
       button: 0,
     });
+    await page.locator("canvas.game-canvas").dispatchEvent("pointermove", {
+      pointerId: 73,
+      pointerType: "mouse",
+      clientX: cancelPoint.x + 16,
+      clientY: cancelPoint.y,
+      button: 0,
+    });
+    await page.waitForFunction(
+      (id) => window.__HEX_DOMINION__?.multi.sourceIds.includes(id),
+      owned[1]!.id,
+    );
     await page.locator("canvas.game-canvas").dispatchEvent("pointercancel", {
       pointerId: 73,
       pointerType: "mouse",
@@ -335,30 +385,295 @@ test.describe("Hex Dominion browser flows", () => {
     await page.keyboard.up("Shift");
     await page.waitForFunction(() => window.__HEX_DOMINION__?.multi.phase === "idle");
 
-    await page.keyboard.down("Shift");
-    await page.waitForFunction(() => window.__HEX_DOMINION__?.multi.phase === "sources");
-    for (const source of owned.slice(0, 2)) {
-      const point = await getTileClientPoint(page, source.id);
-      await page.mouse.click(point.x, point.y);
-      await page.waitForFunction(
-        (id) => window.__HEX_DOMINION__?.multi.sourceIds.includes(id),
-        source.id,
+    const dispatchPercent = page.locator(".send-control button").filter({ hasText: "75%" });
+    await dispatchPercent.click();
+    await expect(dispatchPercent).toBeFocused();
+    const distance = (
+      left: (typeof opening.map.tiles)[number],
+      right: (typeof opening.map.tiles)[number],
+    ): number => {
+      const dq = left.q - right.q;
+      const dr = left.r - right.r;
+      return (Math.abs(dq) + Math.abs(dr) + Math.abs(dq + dr)) / 2;
+    };
+    const visibleOwned: Array<{
+      tile: (typeof opening.map.tiles)[number];
+      point: { x: number; y: number };
+    }> = [];
+    for (const tile of owned) {
+      const point = await getTileClientPoint(page, tile.id);
+      const visible = await page.evaluate(
+        ({ x, y }) => document.elementFromPoint(x, y)?.classList.contains("game-canvas") ?? false,
+        point,
       );
+      if (visible) visibleOwned.push({ tile, point });
     }
+    const firstSource = visibleOwned.find((candidate) =>
+      visibleOwned.some(
+        (other) =>
+          other.tile.id !== candidate.tile.id && distance(candidate.tile, other.tile) === 1,
+      ),
+    );
+    const secondSource = firstSource
+      ? visibleOwned.find(
+          (candidate) =>
+            candidate.tile.id !== firstSource.tile.id &&
+            distance(candidate.tile, firstSource.tile) === 1,
+        )
+      : null;
+    expect(firstSource).toBeTruthy();
+    expect(secondSource).toBeTruthy();
+    if (!firstSource || !secondSource) throw new Error("No visible adjacent Shift-drag sources");
+    const anchorBefore = await getTileClientPoint(page, firstSource.tile.id);
+    await page.mouse.move(firstSource.point.x, firstSource.point.y);
+    await page.keyboard.down("Shift");
+    await page.mouse.down();
+    await page.mouse.move(secondSource.point.x, secondSource.point.y, { steps: 8 });
     await page.keyboard.up("Shift");
+    await page.waitForTimeout(50);
+    const stagedSources = await getTestApiSnapshot(page);
+    expect(stagedSources.multi.phase).toBe("sources");
+    expect(stagedSources.multi.sourceIds).toEqual(
+      expect.arrayContaining([firstSource.tile.id, secondSource.tile.id]),
+    );
+    await page.mouse.up();
     await page.waitForFunction(() => window.__HEX_DOMINION__?.multi.phase === "targets");
-    const targetPoint = await getTileClientPoint(page, owned[2]!.id);
-    await page.mouse.click(targetPoint.x, targetPoint.y);
-    await page.waitForFunction(
+    const anchorAfter = await getTileClientPoint(page, firstSource.tile.id);
+    expect(Math.hypot(anchorAfter.x - anchorBefore.x, anchorAfter.y - anchorBefore.y)).toBeLessThan(
+      1,
+    );
+
+    const borderTargets = opening.map.tiles.filter(
+      (tile) =>
+        tile.owner !== localPlayerId &&
+        tile.terrain !== "water" &&
+        owned.some((source) => distance(source, tile) === 1),
+    );
+    const visibleTargets: Array<{
+      tile: (typeof opening.map.tiles)[number];
+      point: { x: number; y: number };
+    }> = [];
+    for (const tile of borderTargets) {
+      const point = await getTileClientPoint(page, tile.id);
+      const visible = await page.evaluate(
+        ({ x, y }) => document.elementFromPoint(x, y)?.classList.contains("game-canvas") ?? false,
+        point,
+      );
+      if (visible) visibleTargets.push({ tile, point });
+    }
+    let targetPair: typeof visibleTargets | null = null;
+    for (const target of visibleTargets) {
+      const adjacent = visibleTargets.find(
+        (candidate) =>
+          candidate.tile.id !== target.tile.id && distance(candidate.tile, target.tile) === 1,
+      );
+      if (adjacent) {
+        targetPair = [target, adjacent];
+        break;
+      }
+    }
+    expect(targetPair).not.toBeNull();
+    if (!targetPair) throw new Error("No visible adjacent Shift-drag targets");
+    const targetAnchorBefore = await getTileClientPoint(page, firstSource.tile.id);
+    await page.mouse.move(targetPair[0]!.point.x, targetPair[0]!.point.y);
+    await page.keyboard.down("Shift");
+    await page.mouse.down();
+    await page.mouse.move(targetPair[1]!.point.x, targetPair[1]!.point.y, { steps: 8 });
+    await page.keyboard.up("Shift");
+    await page.waitForTimeout(50);
+    const stagedTargets = await getTestApiSnapshot(page);
+    expect(stagedTargets.multi.phase).toBe("targets");
+    expect(stagedTargets.multi.destinationIds).toEqual(
+      expect.arrayContaining(targetPair.map(({ tile }) => tile.id)),
+    );
+    await page.mouse.up();
+    await page.waitForFunction(() => window.__HEX_DOMINION__?.multi.phase === "idle");
+    expect(
+      (await getTestApiSnapshot(page)).stacks.filter((stack) => stack.owner === localPlayerId),
+    ).toHaveLength(localStacksBefore);
+    const targetAnchorAfter = await getTileClientPoint(page, firstSource.tile.id);
+    expect(
+      Math.hypot(
+        targetAnchorAfter.x - targetAnchorBefore.x,
+        targetAnchorAfter.y - targetAnchorBefore.y,
+      ),
+    ).toBeLessThan(1);
+    await resumeSimulation(page);
+    const issuedOrderHandle = await page.waitForFunction(
       (playerId) =>
-        window.__HEX_DOMINION__?.multi.phase === "idle" &&
-        (window.__HEX_DOMINION__?.stacks.some((stack) => stack.owner === playerId) ?? false),
+        window.__HEX_DOMINION__?.events.find(
+          (event) => event.playerId === playerId && /troops ordered/i.test(event.message),
+        ) ?? false,
       localPlayerId,
     );
-    const issued = await getTestApiSnapshot(page);
-    const localStacks = issued.stacks.filter((stack) => stack.owner === localPlayerId);
-    expect(localStacks.length).toBeGreaterThan(localStacksBefore);
-    expect(localStacks.reduce((sum, stack) => sum + stack.troops, 0)).toBeGreaterThan(0);
+    const issuedOrder = await issuedOrderHandle.jsonValue();
+    expect(issuedOrder).toBeTruthy();
+    if (!issuedOrder) throw new Error("The staged Multi order was not issued");
+    expect(issuedOrder.message).toMatch(/troops ordered/i);
+    await health.assertHealthy();
+  });
+
+  test("paints desktop Multi sources and attack targets by dragging across hexes", async ({
+    page,
+  }) => {
+    test.slow();
+    const health = observeBrowserHealth(page);
+    const opening = await startSinglePlayer(page, {
+      aiCount: 3,
+      seed: "E2E-MULTI-DRAG",
+      playerName: "Drag Warden",
+    });
+    await pauseSimulation(page);
+    const localPlayerId = opening.config.localPlayerId ?? 0;
+    const canvas = page.locator("canvas.game-canvas");
+    await canvas.focus();
+    const stacksBefore = opening.stacks.filter((stack) => stack.owner === localPlayerId).length;
+    const distance = (
+      left: (typeof opening.map.tiles)[number],
+      right: (typeof opening.map.tiles)[number],
+    ): number => {
+      const dq = left.q - right.q;
+      const dr = left.r - right.r;
+      return (Math.abs(dq) + Math.abs(dr) + Math.abs(dq + dr)) / 2;
+    };
+    const visiblePoint = async (tileId: string) => {
+      const point = await getTileClientPoint(page, tileId);
+      const visible = await page.evaluate(
+        ({ x, y }) => document.elementFromPoint(x, y)?.classList.contains("game-canvas") ?? false,
+        point,
+      );
+      return visible ? point : null;
+    };
+    const dragThrough = async (points: Array<{ x: number; y: number }>) => {
+      await page.mouse.move(points[0]!.x, points[0]!.y);
+      await page.mouse.down();
+      for (const point of points.slice(1)) {
+        await page.mouse.move(point.x, point.y, { steps: 8 });
+        await page.mouse.move(point.x + 1, point.y + 1, { steps: 2 });
+        await page.mouse.move(point.x, point.y, { steps: 2 });
+      }
+      await page.mouse.up();
+    };
+
+    await page.getByRole("button", { name: "Start Multi movement selection" }).click();
+    await page.waitForFunction(() => window.__HEX_DOMINION__?.multi.phase === "sources");
+    const cluster = opening.map.spawnClusters[localPlayerId]!.map((id) =>
+      opening.map.tiles.find((tile) => tile.id === id),
+    ).filter((tile): tile is (typeof opening.map.tiles)[number] =>
+      Boolean(tile && tile.owner === localPlayerId && tile.troops > 1),
+    );
+    const visibleCluster: Array<{
+      tile: (typeof opening.map.tiles)[number];
+      point: { x: number; y: number };
+    }> = [];
+    for (const tile of cluster) {
+      const point = await visiblePoint(tile.id);
+      if (point) visibleCluster.push({ tile, point });
+    }
+    let sourceChain: typeof visibleCluster | null = null;
+    for (const middle of visibleCluster) {
+      const adjacent = visibleCluster.filter(
+        (candidate) =>
+          candidate.tile.id !== middle.tile.id && distance(candidate.tile, middle.tile) === 1,
+      );
+      if (adjacent.length >= 2) {
+        sourceChain = [adjacent[0]!, middle, adjacent[1]!];
+        break;
+      }
+    }
+    expect(sourceChain).not.toBeNull();
+    if (!sourceChain) throw new Error("No visible three-hex source chain is available");
+    expect(
+      Math.hypot(
+        sourceChain[0]!.point.x - sourceChain[2]!.point.x,
+        sourceChain[0]!.point.y - sourceChain[2]!.point.y,
+      ),
+    ).toBeGreaterThan(14);
+    const anchorBefore = await getTileClientPoint(page, sourceChain[1]!.tile.id);
+    await dragThrough(sourceChain.map(({ point }) => point));
+    const sourceIds = sourceChain.map(({ tile }) => tile.id).sort();
+    await page.waitForFunction(
+      (ids) => ids.every((id) => window.__HEX_DOMINION__?.multi.sourceIds.includes(id)),
+      sourceIds,
+    );
+    const paintedSources = (await getTestApiSnapshot(page)).multi.sourceIds.toSorted();
+    expect(paintedSources).toEqual(sourceIds);
+    const anchorAfter = await getTileClientPoint(page, sourceChain[1]!.tile.id);
+    expect(Math.hypot(anchorAfter.x - anchorBefore.x, anchorAfter.y - anchorBefore.y)).toBeLessThan(
+      1,
+    );
+    await expect(page.getByTestId("multi-panel")).toContainText("3 sources · 0 targets");
+
+    await page.getByRole("button", { name: "Choose Targets" }).click();
+    await page.waitForFunction(() => window.__HEX_DOMINION__?.multi.phase === "targets");
+    const owned = opening.map.tiles.filter((tile) => tile.owner === localPlayerId);
+    const borderTargets = opening.map.tiles.filter(
+      (tile) =>
+        tile.owner !== localPlayerId &&
+        tile.terrain !== "water" &&
+        owned.some((source) => distance(source, tile) === 1),
+    );
+    const visibleTargets: Array<{
+      tile: (typeof opening.map.tiles)[number];
+      point: { x: number; y: number };
+    }> = [];
+    for (const tile of borderTargets) {
+      const point = await visiblePoint(tile.id);
+      if (point) visibleTargets.push({ tile, point });
+    }
+    let targetPair: typeof visibleTargets | null = null;
+    for (const target of visibleTargets) {
+      const adjacent = visibleTargets.find(
+        (candidate) =>
+          candidate.tile.id !== target.tile.id && distance(candidate.tile, target.tile) === 1,
+      );
+      if (adjacent) {
+        targetPair = [target, adjacent];
+        break;
+      }
+    }
+    expect(targetPair).not.toBeNull();
+    if (!targetPair) throw new Error("No visible adjacent attack targets are available");
+    expect(
+      Math.hypot(
+        targetPair[0]!.point.x - targetPair[1]!.point.x,
+        targetPair[0]!.point.y - targetPair[1]!.point.y,
+      ),
+    ).toBeGreaterThan(14);
+
+    const targetAnchorBefore = await getTileClientPoint(page, sourceChain[1]!.tile.id);
+    await dragThrough(targetPair.map(({ point }) => point));
+    const targetIds = targetPair.map(({ tile }) => tile.id).sort();
+    await page.waitForFunction(
+      (ids) => ids.every((id) => window.__HEX_DOMINION__?.multi.destinationIds.includes(id)),
+      targetIds,
+    );
+    const staged = await getTestApiSnapshot(page);
+    expect(staged.multi.destinationIds.toSorted()).toEqual(targetIds);
+    expect(staged.stacks.filter((stack) => stack.owner === localPlayerId)).toHaveLength(
+      stacksBefore,
+    );
+    const targetAnchorAfter = await getTileClientPoint(page, sourceChain[1]!.tile.id);
+    expect(
+      Math.hypot(
+        targetAnchorAfter.x - targetAnchorBefore.x,
+        targetAnchorAfter.y - targetAnchorBefore.y,
+      ),
+    ).toBeLessThan(1);
+    await expect(page.getByTestId("multi-panel")).toContainText("3 sources · 2 targets");
+
+    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await page.waitForFunction(() => window.__HEX_DOMINION__?.multi.phase === "idle");
+    expect(
+      (await getTestApiSnapshot(page)).stacks.filter((stack) => stack.owner === localPlayerId),
+    ).toHaveLength(stacksBefore);
+    await resumeSimulation(page);
+    await page.waitForFunction(
+      ({ playerId, count }) =>
+        (window.__HEX_DOMINION__?.stacks.filter((stack) => stack.owner === playerId).length ?? 0) >
+        count,
+      { playerId: localPlayerId, count: stacksBefore },
+    );
     await health.assertHealthy();
   });
 
@@ -471,6 +786,17 @@ test.describe("Hex Dominion browser flows", () => {
       sourceIds: [],
       destinationIds: [],
     });
+    await page.evaluate(() => window.__HEX_DOMINION__?.fitOverview());
+    const visibleOwned: typeof owned = [];
+    for (const tile of owned) {
+      const point = await getTileClientPoint(page, tile.id);
+      const visible = await page.evaluate(
+        ({ x, y }) => document.elementFromPoint(x, y)?.classList.contains("game-canvas") ?? false,
+        point,
+      );
+      if (visible) visibleOwned.push(tile);
+    }
+    expect(visibleOwned.length).toBeGreaterThanOrEqual(4);
     let pointerId = 100;
     const tapTile = async (tileId: string) => {
       const point = await getTileClientPoint(page, tileId);
@@ -490,7 +816,7 @@ test.describe("Hex Dominion browser flows", () => {
         button: 0,
       });
     };
-    for (const source of owned.slice(0, 2)) {
+    for (const source of visibleOwned.slice(0, 2)) {
       await tapTile(source.id);
       await page.waitForFunction(
         (id) => window.__HEX_DOMINION__?.multi.sourceIds.includes(id),
@@ -498,7 +824,7 @@ test.describe("Hex Dominion browser flows", () => {
       );
     }
     await page.getByRole("button", { name: "Choose Targets" }).click();
-    for (const target of owned.slice(2, 4)) {
+    for (const target of visibleOwned.slice(2, 4)) {
       await tapTile(target.id);
       await page.waitForFunction(
         (id) => window.__HEX_DOMINION__?.multi.destinationIds.includes(id),
@@ -609,7 +935,7 @@ test.describe("Hex Dominion browser flows", () => {
       await expect(row).toContainText(name);
       await expect(row).toContainText(`${participant.troops} units`);
       await expect(row.getByLabel(/Melee.*Ranged.*Wizard/i)).toBeVisible();
-      await expect(row).toContainText(/Type (?:advantage|disadvantage|matchup even)/i);
+      await expect(row).toContainText(/Type x\d+\.\d{2}/i);
       await expect(row).toContainText(/\d+\.\d{2}% effective share/);
       if (participant.playerId === battle.battles[0]!.incumbentOwner) {
         await expect(row).toContainText("incumbent");
@@ -632,6 +958,15 @@ test.describe("Hex Dominion browser flows", () => {
         seam.segments?.some((segment) => segment.rpsMultiplierPermille > 1000),
       );
     }, battle.battles[0]!.id);
+    const renderedBattle = (await getPresentation(page)).battles.find(
+      (candidate) => candidate.id === battle.battles[0]!.id,
+    );
+    expect(renderedBattle).toBeTruthy();
+    for (const segment of renderedBattle?.segments ?? []) {
+      await expect(
+        page.getByTestId(`battle-type-multiplier-${segment.playerId ?? "neutral"}`),
+      ).toHaveText(`Type x${(segment.rpsMultiplierPermille / 1000).toFixed(2)}`);
+    }
 
     const reinforcement = await loadDebugScenario(page, "reinforcement");
     expect(reinforcement.battles).toHaveLength(1);

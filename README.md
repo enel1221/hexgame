@@ -88,8 +88,9 @@ The relay is an experimental deterministic command sequencer, not an authoritati
 | Click/tap a destination                 | Issue a friendly move or one final hostile step                      |
 | Hold `Shift`, then click owned tiles    | Toggle atomic Multi sources                                          |
 | Release `Shift`                         | Choose one destination, or hold `Shift` again to toggle several      |
+| Desktop drag while Multi is active      | Paint every crossed source or target hex into the current selection  |
 | Touch **Multi**                         | Use explicit Select Sources, Choose Targets, Send, and Cancel phases |
-| Drag or middle-mouse drag               | Pan the battlefield                                                  |
+| Drag outside Multi / middle-mouse drag  | Pan the battlefield                                                  |
 | Mouse wheel / pinch                     | Zoom around the pointer or touch midpoint                            |
 | WASD / arrow keys                       | Pan while the battlefield canvas is not keyboard-focused             |
 | Focus canvas, then arrows + Enter/Space | Move the hex cursor and select a source, destination, or Multi tile  |
@@ -100,7 +101,7 @@ The relay is an experimental deterministic command sequencer, not an authoritati
 | Producer **Set/Clear Rally Point**      | Route only newly trained typed units to a persistent destination     |
 | `Space`                                 | Pause/resume single-player                                           |
 
-The HUD also provides pause, 1x, 2x, and 4x controls. Barracks require an owned Muster Ground and train Melee; Archery Ranges require an owned Fertile Meadow and train Ranged; Wizard Towers train Wizards on any owned land. A tile may hold x1 through x99 completed copies of one structure type, with at most one additional copy under construction; structure types never mix on one tile. Exact M/R/W counts remain visible in the tile inspector, moving-army plates, and battle details.
+The HUD also provides pause, 1x, 2x, and 4x controls. Barracks require an owned Muster Ground and train Melee; Archery Ranges require an owned Fertile Meadow and train Ranged; Wizard Towers train Wizards on any owned land. Producers keep training without a troop cap while their ruler can pay the per-unit Supply cost. A tile may hold x1 through x99 completed copies of one structure type, with at most one additional copy under construction; structure types never mix on one tile. During combat, one faction-share bar shows overall effective strength and each wide-enough segment carries its weighted type multiplier, such as `x1.50`; exact M/R/W counts remain visible in the tile inspector, moving-army plates, and battle details.
 
 ## Test and verify
 
@@ -157,7 +158,7 @@ Read [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) before deploying; it covers creden
 - Multiplayer is a casual alpha. The relay validates identity, ordering, and message shape, but each browser simulates the match and a modified client can cheat.
 - Rooms are ephemeral and expire; there is no account system, matchmaking, spectator mode, chat, or permanent replay archive.
 - Local autosaves are browser-local, schema-versioned snapshots. Clearing site storage removes them.
-- A 21-player match still has a heavier initial generation/render cost than an ordinary 4–8-player match, although the compact cap is now 1,092 land tiles.
+- A 21-player match still has a heavier initial generation/render cost than an ordinary 4–8-player match, although the compact cap is now 630 land tiles.
 - The MVP has no teams, alliances, diplomacy, fog of war, naval units, campaign, or ranked play.
 
 Hex Dominion is available under the [MIT License](LICENSE).

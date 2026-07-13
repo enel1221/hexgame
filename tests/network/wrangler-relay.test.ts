@@ -583,7 +583,7 @@ describe("local Wrangler multiplayer relay", () => {
       hostSocket.take((message) => message.type === "placement"),
       guestSocket.take((message) => message.type === "placement"),
     ]);
-    const candidates = ["0,0", "12,0", "5,0", "6,0"];
+    const candidates = ["0,0", "12,0", "3,0", "6,0"];
     const candidateHash = stableHash({ generationAttempt: 2, candidates });
     hostSocket.send({
       type: "placement-candidates",
@@ -632,7 +632,7 @@ describe("local Wrangler multiplayer relay", () => {
       type: "placement-finalize",
       generationAttempt: 2,
       candidateHash,
-      spawnCenters: ["0,0", "5,0"],
+      spawnCenters: ["0,0", "3,0"],
       requestId: "conflicting-final",
     });
     expect(

@@ -502,7 +502,8 @@ test("captures deterministic structures, combat, capture, and victory fixtures",
     battle.battles[0]!.id,
   );
   await inspectTile(page, battle.battles[0]!.tileId);
-  await expect(page.getByTestId("battle-participant-roster")).toContainText(/Type advantage/i);
+  await expect(page.getByTestId("battle-participant-roster")).toContainText(/Type x1\.50/i);
+  await expect(page.getByTestId("battle-participant-roster")).toContainText(/Type x1\.00/i);
   await expect(
     page
       .getByTestId("battle-participant-roster")
@@ -542,6 +543,9 @@ test("captures deterministic structures, combat, capture, and victory fixtures",
   expect(nWay.battles[0]?.participants).toHaveLength(3);
   await inspectTile(page, nWay.battles[0]!.tileId);
   await expect(page.getByTestId("battle-participant-roster").getByRole("listitem")).toHaveCount(3);
+  await expect(
+    page.getByTestId("battle-participant-roster").getByText(/Type x\d+\.\d{2}/i),
+  ).toHaveCount(3);
   await expect(
     page.getByTestId("battle-participant-roster").getByLabel(/Melee.*Ranged.*Wizard/i),
   ).toHaveCount(3);

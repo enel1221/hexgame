@@ -259,6 +259,12 @@ export function projectPlacementCentersWithReservations(
 ): string[] {
   if (input.reservedSeats.length === 0) return projectSpacedPlacementCenters(input);
   const reservations = deriveReservedPlacementCenters(input);
+  if (input.fixedCenters.length === 0) {
+    return projectSpacedPlacementCenters({
+      ...input,
+      fixedCenters: [],
+    });
+  }
   const fixedBySeat = new Map(reservations.map((fixed) => [fixed.seat, fixed.centerId] as const));
   for (const fixed of input.fixedCenters) {
     const reserved = fixedBySeat.get(fixed.seat);

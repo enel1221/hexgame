@@ -28,7 +28,7 @@
     "deploy:multiplayer:production": "wrangler deploy --config wrangler.multiplayer.jsonc --env production"
   },
   "dependencies": {
-    "next": "16.2.10",
+    "next": "16.2.12",
     "pixi.js": "8.19.0",
     "react": "19.2.7",
     "react-dom": "19.2.7",
